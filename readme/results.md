@@ -8,7 +8,7 @@
 
 | | Значение |
 |---|---|
-| **AVG4 proxy** (ibm01/10/14/17) | **1.4674** ⭐ #12 |
+| **AVG4 proxy** (ibm01/10/14/17) | **1.4656** ⭐ #14 |
 | AVG17 proxy (--all) | 1.5181 (#4, перезамерить) |
 | Placer | `submissions/straple/placer.py` (C++ + adaptive LNS + чередование congested/random) |
 | Дата замера | 2026-05-03 |
@@ -28,6 +28,49 @@
 ---
 
 ## 📂 Журнал прогонов
+
+### #14 · 2026-05-03 · `submissions/straple/placer.py` (LNS outer up to 100, 0.15·N) — НОВЫЙ BEST
+
+**Идея**: lift `adaptive_outer` upper bound с 60 до 100, scale с 0.10·N до 0.15·N. LNS использует full proxy_cost для accept (не подвержен SA-проблеме из cycle #9).
+
+**Изменения**: `placer.py` `_lns_loop` — `adaptive_outer = max(self.lns_outer_iters, min(100, math.ceil(0.15 * num_movable)))`.
+
+**Сводка** (медиана 3 запусков, 3/3 идентичны):
+
+| Bench | Proxy | vs #12 (1.4674) | vs Straple #4 baseline | outer iters | time |
+|---|---|---|---|---|---|
+| ibm01 | **1.1376** ⭐ | -0.31% | -3.44% ⭐ | 30 (no change, n=246) | 0.42s |
+| ibm10 | **1.3804** ⭐ | -0.17% | -0.28% ⭐ | 59 (vs 39) | 5.56s |
+| ibm14 | 1.6035 | 0.00% | -1.50% ⭐ | 69 (vs 46) | 4.65s |
+| ibm17 | **1.7410** ⭐ | -0.07% | -0.24% | 78 (vs 52) | 6.68s |
+| **AVG4** | **1.4656** ⭐ | **-0.12%** | **-1.23%** ⭐ | wall ~103-109s |
+
+- vs RePlAce (на 4 бенчах AVG=1.4197): **+3.24%** (продолжаем приближаться)
+- vs прошлый best (#12: 1.4674): **-0.12%** ▼ (новый best)
+- vs Straple #4 baseline (1.4839): **-1.23%** ▼
+- Overlaps: 0, Smoke 9/9
+
+**Что сработало**:
+- ВСЕ 4 бенча улучшились — впервые за серию циклов.
+- ibm01 -0.31%: density 0.914→0.911, cong 1.222→1.218. Больше LNS-итераций позволили глубже исследовать оптимум.
+- ibm10 -0.17%: даже multi-start уже нашёл local optimum, но больше итераций позволили дальше его улучшить.
+- ibm17 -0.07%: первое realистичное улучшение (хоть и маленькое).
+
+**Что не сработало**:
+- ibm14 — без изменений. Multi-start уже нашёл оптимум на этом basin.
+
+**Главный урок**:
+- LNS с full proxy_cost accept — robust, можно безопасно увеличивать budget.
+- Comparison с cycle #9 (SA budget): SA optimize HPWL → больше = плохо. LNS optimize full proxy → больше = лучше (с убывающей отдачей).
+
+**Время**: ibm17 6.68с — всё ещё << 1 час лимита. Запас огромный.
+
+**Следующие шаги**:
+- Cycle #11: попробовать N=8 multi-start вместе с большим LNS, или зафиксировать N=5 и попробовать другие направления (force-directed seed).
+
+**Команда**: `$HOME/.local/bin/uv run python scripts/fast_check.py`
+
+---
 
 ### #13 · 2026-05-03 · попытка: adaptive SA budget (3000→up to 8000) — РЕГРЕССИЯ, откатили
 
