@@ -22,7 +22,6 @@ import numpy as np
 import torch
 
 from macro_place.benchmark import Benchmark
-from macro_place.objective import compute_proxy_cost
 
 
 _CPP_DIR = Path(__file__).resolve().parent / "cpp"
@@ -33,17 +32,19 @@ if str(_CPP_DIR) not in sys.path:
 def _import_native_or_build():
     try:
         import _placer_core
-        return _placer_core
+        import _proxy_cost
+        return _placer_core, _proxy_cost
     except ImportError:
         build_script = _CPP_DIR / "build.sh"
         if not build_script.exists():
             raise
         os.system(f"bash {build_script}")
         import _placer_core
-        return _placer_core
+        import _proxy_cost
+        return _placer_core, _proxy_cost
 
 
-_placer_core = _import_native_or_build()
+_placer_core, _proxy_cost = _import_native_or_build()
 
 
 def _load_plc(name):
@@ -102,6 +103,112 @@ def _extract_edges(benchmark, plc):
     return edges, weights
 
 
+_PIN_KIND_PORT = 0
+_PIN_KIND_HARD = 1
+_PIN_KIND_SOFT = 2
+
+
+def _build_proxy_evaluator(benchmark, plc):
+    hard_name_to_bidx = {}
+    for bidx, idx in enumerate(plc.hard_macro_indices):
+        hard_name_to_bidx[plc.modules_w_pins[idx].get_name()] = bidx
+    soft_name_to_sidx = {}
+    for sidx, idx in enumerate(plc.soft_macro_indices):
+        soft_name_to_sidx[plc.modules_w_pins[idx].get_name()] = sidx
+    port_name_to_pidx = {}
+    for pidx, idx in enumerate(plc.port_indices):
+        port_name_to_pidx[plc.modules_w_pins[idx].get_name()] = pidx
+
+    pin_kinds = []
+    pin_owners = []
+    pin_offsets_x = []
+    pin_offsets_y = []
+    net_starts = [0]
+    net_weights = []
+    net_source_slots = []
+
+    for driver, sinks in plc.nets.items():
+        net_pins = [driver] + sinks
+        net_pin_data = []
+        source_slot = 0
+        slot = 0
+        for pin_name in net_pins:
+            parent_name = pin_name.split("/")[0]
+            pin_idx = plc.mod_name_to_indices.get(pin_name)
+            if pin_idx is None:
+                slot += 1
+                continue
+            pin_node = plc.modules_w_pins[pin_idx]
+            pin_type = pin_node.get_type()
+            if pin_type == "PORT":
+                if parent_name not in port_name_to_pidx:
+                    slot += 1
+                    continue
+                kind = _PIN_KIND_PORT
+                owner = port_name_to_pidx[parent_name]
+                offset_x = 0.0
+                offset_y = 0.0
+            elif pin_type == "MACRO_PIN":
+                ox, oy = pin_node.get_offset()
+                if parent_name in hard_name_to_bidx:
+                    kind = _PIN_KIND_HARD
+                    owner = hard_name_to_bidx[parent_name]
+                elif parent_name in soft_name_to_sidx:
+                    kind = _PIN_KIND_SOFT
+                    owner = soft_name_to_sidx[parent_name]
+                else:
+                    slot += 1
+                    continue
+                offset_x = float(ox)
+                offset_y = float(oy)
+            else:
+                slot += 1
+                continue
+            if pin_name == driver:
+                source_slot = len(net_pin_data)
+            net_pin_data.append((kind, owner, offset_x, offset_y))
+            slot += 1
+        if not net_pin_data:
+            continue
+        driver_node = plc.modules_w_pins[plc.mod_name_to_indices[driver]]
+        weight = float(driver_node.get_weight())
+        for kind, owner, ox, oy in net_pin_data:
+            pin_kinds.append(kind)
+            pin_owners.append(owner)
+            pin_offsets_x.append(ox)
+            pin_offsets_y.append(oy)
+        net_starts.append(len(pin_kinds))
+        net_weights.append(weight)
+        net_source_slots.append(source_slot)
+
+    n_hard = benchmark.num_hard_macros
+    n_soft = benchmark.num_soft_macros
+
+    hard_sizes = benchmark.macro_sizes[:n_hard].numpy().astype(np.float64)
+    soft_sizes = benchmark.macro_sizes[n_hard:].numpy().astype(np.float64)
+    soft_positions = benchmark.macro_positions[n_hard:].numpy().astype(np.float64)
+    port_positions = benchmark.port_positions.numpy().astype(np.float64) if benchmark.port_positions.numel() > 0 else np.zeros((0, 2), dtype=np.float64)
+
+    evaluator = _proxy_cost.ProxyEvaluator()
+    evaluator.initialize(
+        n_hard, n_soft,
+        float(plc.width), float(plc.height),
+        int(plc.grid_col), int(plc.grid_row),
+        float(plc.hroutes_per_micron), float(plc.vroutes_per_micron),
+        float(plc.hrouting_alloc), float(plc.vrouting_alloc),
+        int(plc.smooth_range),
+        hard_sizes, soft_sizes, soft_positions, port_positions,
+        np.asarray(pin_kinds, dtype=np.int32),
+        np.asarray(pin_owners, dtype=np.int32),
+        np.asarray(pin_offsets_x, dtype=np.float64),
+        np.asarray(pin_offsets_y, dtype=np.float64),
+        np.asarray(net_starts, dtype=np.int32),
+        np.asarray(net_weights, dtype=np.float64),
+        np.asarray(net_source_slots, dtype=np.int32),
+    )
+    return evaluator
+
+
 class StraplePlacer:
     def __init__(
         self,
@@ -141,26 +248,22 @@ class StraplePlacer:
         state.sa_refine(self.refine_iters)
 
         if plc is not None and self.lns_outer_iters > 0:
-            self._lns_loop(state, benchmark, plc, n_hard)
+            evaluator = _build_proxy_evaluator(benchmark, plc)
+            self._lns_loop(state, evaluator)
 
         final_pos = state.current_positions()
         full = benchmark.macro_positions.clone()
         full[:n_hard] = torch.tensor(final_pos, dtype=torch.float32)
         return full
 
-    def _lns_loop(self, state, benchmark, plc, n_hard):
-        def proxy_of(positions_np):
-            full = benchmark.macro_positions.clone()
-            full[:n_hard] = torch.tensor(positions_np, dtype=torch.float32)
-            return compute_proxy_cost(full, benchmark, plc)['proxy_cost']
-
+    def _lns_loop(self, state, evaluator):
         best_pos = state.current_positions()
-        best_cost = proxy_of(best_pos)
+        best_cost = evaluator.evaluate(best_pos)
 
         for _ in range(self.lns_outer_iters):
             saved = state.current_positions()
             trial = state.destroy_and_repair(self.lns_destroy_size)
-            new_cost = proxy_of(trial)
+            new_cost = evaluator.evaluate(trial)
             if new_cost < best_cost:
                 best_cost = new_cost
                 best_pos = trial

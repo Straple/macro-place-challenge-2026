@@ -9,9 +9,9 @@
 | | Значение |
 |---|---|
 | **AVG proxy cost** | **1.5181** |
-| Placer | `submissions/straple/placer.py` (C++ core via pybind11) |
+| Placer | `submissions/straple/placer.py` (pure C++ core+proxy_cost via pybind11) |
 | Дата замера | 2026-05-03 |
-| Total runtime | 173.81s на 17 IBM benchmarks |
+| Total runtime | **16.19s** на 17 IBM benchmarks |
 | Hardware | Mac ARM (aarch64-apple-darwin), Python 3.14.4, torch 2.10.0 |
 
 **Гэп до целей:**
@@ -27,6 +27,31 @@
 ---
 
 ## 📂 Журнал прогонов
+
+### #4 · 2026-05-03 · `submissions/straple/placer.py` (pure C++: placer_core + proxy_cost)
+
+**Что менялось от #3:**
+- Реализован полный `compute_proxy_cost` на C++ (`cpp/proxy_cost.cpp`):
+  - `get_wirelength`: HPWL по pin bbox каждого нета
+  - `get_density_cost`: top-10% самых плотных grid-ячеек
+  - `get_congestion_cost`: routing 2/3/N-pin + macro-route-over-grid + smoothing + ABU top-5%
+- Python теперь только тонкая обёртка: извлекает pin connectivity из plc и передаёт в `_proxy_cost.ProxyEvaluator`
+- LNS inner loop звонит `evaluator.evaluate(positions)` напрямую в C++ — без вызовов Python plc
+
+**Результаты:**
+- AVG proxy: **1.5181** (бит-в-бит совпадает с #3, т.е. наш C++ exact replicates plc.compute_proxy_cost)
+- Total runtime: **16.19s** (vs 173.81s в #3 = **10.7× быстрее**)
+- Best ibm01: **0.34s** (vs 3.4s)
+- Slowest ibm17: 2.15s (vs 24.5s)
+
+**Как это влияет на стратегию:**
+- Раньше LNS ограничен ~30 itters (45с/bench overhead). Теперь можно гонять 300+ itters за то же время.
+- Можно делать multi-restart с 5-10 сидов за разумное время.
+- Можно делать proxy-aware SA (proxy_cost внутри inner SA loop).
+
+**Команда:** `$HOME/.local/bin/uv run evaluate submissions/straple/placer.py --all`
+
+---
 
 ### #3 · 2026-05-03 · `submissions/straple/placer.py` (C++ core via pybind11)
 
