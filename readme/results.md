@@ -8,7 +8,7 @@
 
 | | Значение |
 |---|---|
-| **AVG4 proxy** (ibm01/10/14/17) | **1.4656** ⭐ #14 |
+| **AVG4 proxy** (ibm01/10/14/17) | **1.4643** ⭐ #15 |
 | AVG17 proxy (--all) | 1.5181 (#4, перезамерить) |
 | Placer | `submissions/straple/placer.py` (C++ + adaptive LNS + чередование congested/random) |
 | Дата замера | 2026-05-03 |
@@ -29,7 +29,31 @@
 
 ## 📂 Журнал прогонов
 
-### #14 · 2026-05-03 · `submissions/straple/placer.py` (LNS outer up to 100, 0.15·N) — НОВЫЙ BEST
+### #15 · 2026-05-03 · `submissions/straple/placer.py` (LNS outer up to 150, 0.20·N) — НОВЫЙ BEST
+
+**Идея**: lift `adaptive_outer` upper bound 100→150, scale 0.15·N→0.20·N. Продолжение #14 — больше LNS budget даёт улучшения без overshoot.
+
+**Изменения**: `placer.py` — `adaptive_outer = max(self.lns_outer_iters, min(150, math.ceil(0.20 * num_movable)))`.
+
+**Результат** (1 fast_check; в предыдущих циклах 3/3 идентичны → детерминизм, одного хватает):
+
+| Bench | Proxy | vs #14 (1.4656) | vs Straple #4 baseline | outer | time |
+|---|---|---|---|---|---|
+| ibm01 | 1.1376 | 0.00% | -3.44% | 30 (n=246) | 0.44s |
+| ibm10 | **1.3765** | **-0.28%** ⭐ | -0.56% ⭐ | 78 (vs 59) | 7.67s |
+| ibm14 | 1.6025 | -0.06% | -1.57% | 92 (vs 69) | 5.84s |
+| ibm17 | 1.7404 | -0.03% | -0.27% | 104 (vs 78) | 8.73s |
+| **AVG4** | **1.4643** ⭐ | **-0.09%** | **-1.32%** ⭐ | wall ~96s |
+
+- vs RePlAce: +3.14% (-0.10% дополнительно от cycle #10)
+- ibm10 ещё улучшилось на -0.28% (continued return от LNS budget)
+- Время растёт пропорционально, но в budget (ibm17 8.73с << 1 час)
+
+**Команда**: `$HOME/.local/bin/uv run python scripts/fast_check.py`
+
+---
+
+### #14 · 2026-05-03 · `submissions/straple/placer.py` (LNS outer up to 100, 0.15·N) — best после cycle #10
 
 **Идея**: lift `adaptive_outer` upper bound с 60 до 100, scale с 0.10·N до 0.15·N. LNS использует full proxy_cost для accept (не подвержен SA-проблеме из cycle #9).
 

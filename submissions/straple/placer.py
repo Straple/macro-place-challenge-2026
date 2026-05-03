@@ -287,7 +287,7 @@ class StraplePlacer:
         congested_percent = 0.05
 
         adaptive_destroy = max(self.lns_destroy_size, min(16, math.ceil(0.025 * num_movable)))
-        adaptive_outer = max(self.lns_outer_iters, min(100, math.ceil(0.15 * num_movable)))
+        adaptive_outer = max(self.lns_outer_iters, min(150, math.ceil(0.20 * num_movable)))
 
         for iteration in range(adaptive_outer):
             saved = state.current_positions()
