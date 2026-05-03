@@ -1026,6 +1026,57 @@ bool repairMacroAware(
     return repairMacro(state, macroIndex);
 }
 
+py::array_t<double> swapTwoMacros(PlacerState& state, int numSwaps)
+{
+    std::vector<int> movableIndices;
+    movableIndices.reserve(state.numHardMacros);
+    for (int i = 0; i < state.numHardMacros; ++i)
+    {
+        if (state.movable[i])
+        {
+            movableIndices.push_back(i);
+        }
+    }
+    const int n = static_cast<int>(movableIndices.size());
+    if (n >= 2)
+    {
+        std::uniform_int_distribution<int> idxDist(0, n - 1);
+        for (int s = 0; s < numSwaps; ++s)
+        {
+            const int i = movableIndices[idxDist(state.rng)];
+            int j = movableIndices[idxDist(state.rng)];
+            if (i == j) continue;
+            const double xi = state.posX[i];
+            const double yi = state.posY[i];
+            const double xj = state.posX[j];
+            const double yj = state.posY[j];
+            state.posX[i] = clampDouble(xj, state.halfWidth[i],
+                state.canvasWidth - state.halfWidth[i]);
+            state.posY[i] = clampDouble(yj, state.halfHeight[i],
+                state.canvasHeight - state.halfHeight[i]);
+            state.posX[j] = clampDouble(xi, state.halfWidth[j],
+                state.canvasWidth - state.halfWidth[j]);
+            state.posY[j] = clampDouble(yi, state.halfHeight[j],
+                state.canvasHeight - state.halfHeight[j]);
+            if (checkSingleOverlap(state, i) || checkSingleOverlap(state, j))
+            {
+                state.posX[i] = xi;
+                state.posY[i] = yi;
+                state.posX[j] = xj;
+                state.posY[j] = yj;
+            }
+        }
+    }
+    py::array_t<double> result({state.numHardMacros, 2});
+    auto buf = result.mutable_unchecked<2>();
+    for (int i = 0; i < state.numHardMacros; ++i)
+    {
+        buf(i, 0) = state.posX[i];
+        buf(i, 1) = state.posY[i];
+    }
+    return result;
+}
+
 py::array_t<double> destroyAndRepair(PlacerState& state, int destroySize)
 {
     std::vector<int> movableIndices;
@@ -1264,6 +1315,7 @@ PYBIND11_MODULE(_placer_core, m)
         .def("sa_refine_with_stats", &simulatedAnnealingRefineWithStats,
              py::arg("num_iters"), py::arg("snapshot_every") = 0)
         .def("destroy_and_repair", &destroyAndRepair, py::arg("destroy_size"))
+        .def("swap_two_macros", &swapTwoMacros, py::arg("num_swaps") = 1)
         .def("destroy_congested_and_repair", &destroyCongestedAndRepair,
              py::arg("hot_cells_xyw"), py::arg("grid_rows"), py::arg("grid_cols"),
              py::arg("destroy_size"),

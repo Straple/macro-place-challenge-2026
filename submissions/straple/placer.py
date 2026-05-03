@@ -398,7 +398,7 @@ class StraplePlacer:
         congested_percent = 0.05
 
         adaptive_destroy = max(self.lns_destroy_size, min(16, math.ceil(0.025 * num_movable)))
-        adaptive_outer = max(self.lns_outer_iters, min(1500, math.ceil(1.5 * num_movable)))
+        adaptive_outer = max(self.lns_outer_iters, min(8000, math.ceil(8.0 * num_movable)))
 
         accepted = 0
         accepted_random = 0
@@ -407,10 +407,19 @@ class StraplePlacer:
         gain_congested = 0.0
         log_step = max(1, adaptive_outer // 10) if self.verbose else 0
 
+        accepted_swap = 0
+        gain_swap = 0.0
+        no_improve_count = 0
+        early_term_threshold = max(500, adaptive_outer // 5)
+
         for iteration in range(adaptive_outer):
             saved = state.current_positions()
             t_iter = time.time()
-            if iteration % 2 == 1:
+            mod = iteration % 3
+            if mod == 0:
+                trial = state.destroy_and_repair(adaptive_destroy)
+                op = "rand"
+            elif mod == 1:
                 evaluator.evaluate(saved)
                 hot_cells = evaluator.get_top_congested_cells(congested_percent)
                 if hot_cells.shape[0] > 0:
@@ -424,17 +433,21 @@ class StraplePlacer:
                     trial = state.destroy_and_repair(adaptive_destroy)
                     op = "rand-fb"
             else:
-                trial = state.destroy_and_repair(adaptive_destroy)
-                op = "rand"
+                trial = state.swap_two_macros(max(2, adaptive_destroy // 2))
+                op = "swap"
             new_cost = evaluator.evaluate(trial)
             if new_cost < best_cost:
                 gain = best_cost - new_cost
                 best_cost = new_cost
                 best_pos = trial
                 accepted += 1
+                no_improve_count = 0
                 if op == "rand":
                     accepted_random += 1
                     gain_random += gain
+                elif op == "swap":
+                    accepted_swap += 1
+                    gain_swap += gain
                 else:
                     accepted_congested += 1
                     gain_congested += gain
@@ -444,15 +457,22 @@ class StraplePlacer:
                               f"k={adaptive_destroy} t={(time.time()-t_iter)*1000:.0f}ms")
             else:
                 state.set_positions(saved)
+                no_improve_count += 1
                 if log_step and iteration % (log_step * 2) == 0:
                     self._log(f"[{bench_label}] start#{start_idx} LNS iter={iteration:>3} "
                               f"op={op:<7} reject (cost={new_cost:.4f} > {best_cost:.4f})")
+                if no_improve_count >= early_term_threshold:
+                    if self.verbose:
+                        self._log(f"[{bench_label}] start#{start_idx} LNS early term @ iter={iteration} "
+                                  f"({no_improve_count} consec rejects)")
+                    break
 
         state.set_positions(best_pos)
         if self.verbose:
             self._log(f"[{bench_label}] start#{start_idx} LNS summary: "
                       f"{accepted}/{adaptive_outer} accepted "
                       f"(rand: {accepted_random}, gain={gain_random:.4f} | "
-                      f"cong: {accepted_congested}, gain={gain_congested:.4f}) "
+                      f"cong: {accepted_congested}, gain={gain_congested:.4f} | "
+                      f"swap: {accepted_swap}, gain={gain_swap:.4f}) "
                       f"k={adaptive_destroy} initial={initial_cost:.4f} -> final={best_cost:.4f}")
         return {"iters": adaptive_outer, "accepted": accepted, "final_cost": best_cost}

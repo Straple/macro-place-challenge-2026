@@ -8,7 +8,7 @@
 
 | | Значение |
 |---|---|
-| **AVG4 proxy** (ibm01/10/14/17) | **1.4410** ⭐ #18 |
+| **AVG4 proxy** (ibm01/10/14/17) | **1.4268** ⭐ #19 |
 | AVG17 proxy (--all) | 1.5181 (#4, перезамерить) |
 | Placer | `submissions/straple/placer.py` (C++ + adaptive LNS + чередование congested/random) |
 | Дата замера | 2026-05-03 |
@@ -29,7 +29,38 @@
 
 ## 📂 Журнал прогонов
 
-### #18 · 2026-05-04 · Heavy LNS budget (1500 iters, scale 1.5·N) + analytical attempts + vectorize — НОВЫЙ BEST 🚀
+### #19 · 2026-05-04 · 2-opt swap operator + early termination + LNS 8000 — НОВЫЙ BEST 🏆 (vs RePlAce +0.50%)
+
+**Изменения**:
+- `placer_core.cpp`: новый `swapTwoMacros(num_swaps)` — random pair swap с overlap check.
+- `placer.py _lns_loop`: третий operator slot. Цикл по 3 операторам: rand, cong-aware, swap.
+- LNS budget: 5000 → 8000 outer iters, scale 5.0·N → 8.0·N.
+- Early termination: 500 consec rejects → break (избегает wasted compute).
+
+**Сводка** (1 fast_check):
+
+| Bench | Proxy | vs #18 (1.4410) | vs Straple #4 baseline | vs RePlAce | iters |
+|---|---|---|---|---|---|
+| ibm01 | **1.0963** ⭐ | -1.33% | -6.95% ⭐ | +9.9% | ~30 |
+| ibm10 | **1.3035** ⭐ | -2.43% | -5.84% ⭐ | **-12.7%** ⭐ | ~3000 |
+| ibm14 | **1.5763** | -0.28% | -3.18% | +2.1% | ~4000 |
+| ibm17 | **1.7309** | -0.30% | -0.81% | +5.2% | ~6000 |
+| **AVG4** | **1.4268** ⭐ | **-0.99%** | **-3.85%** ⭐ | **+0.50%** ⭐ | wall ~271s |
+
+- **vs RePlAce: +0.50%** (раньше +1.50%) — теперь почти на уровне baseline RePlAce!
+- ibm10: на **-12.7%** обходим RePlAce
+- 0 overlaps
+
+**Главные уроки**:
+- **Swap operator работает** на больших (особенно ibm10): -2.43% за один цикл
+- **Heavy LNS budget** — самый большой источник improvements за всю сессию (cycle 1-13: -2%; cycle 14-19: ещё -2.6% дополнительно)
+- Early termination предотвращает wasted compute на стагнирующих starts
+
+**Команда**: `uv run python scripts/fast_check.py`
+
+---
+
+### #18 · 2026-05-04 · Heavy LNS budget (1500 iters, scale 1.5·N) + analytical attempts + vectorize — best после cycle #18
 
 **Контекст**: Пользователь попросил автономно добить E (DREAMPlace-style analytical placer) до улучшения метрики.
 
