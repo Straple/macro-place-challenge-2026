@@ -8,7 +8,7 @@
 
 | | Значение |
 |---|---|
-| **AVG4 proxy** (ibm01/10/14/17) | **1.4268** ⭐ #19 |
+| **AVG4 proxy** (ibm01/10/14/17) | **1.4108** ⭐⭐⭐ #20 (**пробили RePlAce -0.63%!**) |
 | AVG17 proxy (--all) | 1.5181 (#4, перезамерить) |
 | Placer | `submissions/straple/placer.py` (C++ + adaptive LNS + чередование congested/random) |
 | Дата замера | 2026-05-03 |
@@ -29,7 +29,47 @@
 
 ## 📂 Журнал прогонов
 
-### #19 · 2026-05-04 · 2-opt swap operator + early termination + LNS 8000 — НОВЫЙ BEST 🏆 (vs RePlAce +0.50%)
+### #20 · 2026-05-04 · cluster destroy + smart swap + ALNS adaptive weights + LNS 15000 — 🎉 ПРОБИЛИ RePlAce!!!
+
+**Что сделали (5 inc цик)**:
+- **#20a**: `destroyClusterAndRepair(k)` в C++ — BFS из random seed по net-graph, выбирает k связанных макросов, репэйрит. Атакует tightly-coupled clusters.
+- **#20b**: Smart swap — `swapTwoMacros` теперь с вероятностью 60% выбирает swap из net-neighbors (не random).
+- **#20c**: **ALNS adaptive operator weights**:
+  - 4 операторa: rand, cong, swap, cluster
+  - Warmup 40 итер: round-robin
+  - После: weighted random по `op_weights`, обновление `weight = decay·weight + reaction·(1+100·gain)` при accept; `weight *= decay` при reject (min 0.05)
+- **#20d**: LNS budget 8000 → 15000, scale 8.0·N → 15.0·N
+
+**Сводка** (детерминизм проверен — 2 запуска идентичны 1.4108):
+
+| Bench | Proxy | vs #19 (1.4268) | vs Straple #4 baseline | vs RePlAce |
+|---|---|---|---|---|
+| ibm01 | **1.0864** ⭐ | -0.91% | -7.79% ⭐ | +8.9% |
+| ibm10 | **1.2712** ⭐ | -2.48% | -8.16% ⭐ | **-14.8%** ⭐ |
+| ibm14 | **1.5586** ⭐ | -1.12% | -4.27% | +1.0% (на parity) |
+| ibm17 | **1.7270** ⭐ | -0.23% | -1.04% | +5.0% |
+| **AVG4** | **1.4108** ⭐⭐⭐ | **-1.12%** | **-4.93%** ⭐ | **-0.63%** ⭐⭐⭐ |
+
+- **vs RePlAce: -0.63% — 🎉 ПРОБИЛИ baseline!!!** (раньше +0.50%)
+- ibm10: -14.8% от RePlAce — намного лучше
+- 0 overlaps, smoke 10/10
+- wall ~382s
+
+**Где мы сейчас в leaderboard** (AVG17 экстраполяция от AVG4):
+- RePlAce baseline: 1.4578 ✓ ниже
+- Топ-10: 1.4076 — осталось ~0.23%
+- Топ-7 (Гран-при): 1.3479
+
+**Главный урок**:
+- Heavy LNS budget + diverse operators (cluster, swap, cong, rand) + ALNS weights = win
+- Smart swap (по net-neighbors) даёт реальный gain — random pair это шум
+- Прогресс session: 1.4839 → **1.4108** = **-4.93% за 20 циклов**, vs RePlAce: +3.24% → **-0.63%**
+
+**Команда**: `uv run python scripts/fast_check.py`
+
+---
+
+### #19 · 2026-05-04 · 2-opt swap operator + early termination + LNS 8000 — best после cycle #19
 
 **Изменения**:
 - `placer_core.cpp`: новый `swapTwoMacros(num_swaps)` — random pair swap с overlap check.

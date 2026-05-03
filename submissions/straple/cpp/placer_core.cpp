@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <deque>
 #include <random>
 #include <utility>
 #include <vector>
@@ -1026,6 +1027,99 @@ bool repairMacroAware(
     return repairMacro(state, macroIndex);
 }
 
+py::array_t<double> destroyClusterAndRepair(PlacerState& state, int destroySize)
+{
+    std::vector<int> movableIndices;
+    movableIndices.reserve(state.numHardMacros);
+    for (int i = 0; i < state.numHardMacros; ++i)
+    {
+        if (state.movable[i])
+        {
+            movableIndices.push_back(i);
+        }
+    }
+    const int n = static_cast<int>(movableIndices.size());
+    if (n == 0)
+    {
+        return py::array_t<double>();
+    }
+    const int k = std::min<int>(destroySize, n);
+
+    std::uniform_int_distribution<int> idxDist(0, n - 1);
+    const int seedMacro = movableIndices[idxDist(state.rng)];
+
+    std::vector<char> visited(state.numHardMacros, 0);
+    std::vector<int> cluster;
+    cluster.reserve(k);
+    std::deque<int> bfsQueue;
+    bfsQueue.push_back(seedMacro);
+    visited[seedMacro] = 1;
+
+    while (!bfsQueue.empty() && static_cast<int>(cluster.size()) < k)
+    {
+        const int u = bfsQueue.front();
+        bfsQueue.pop_front();
+        if (state.movable[u])
+        {
+            cluster.push_back(u);
+        }
+        std::vector<int> neighbors = state.adjacencyIndex[u];
+        std::shuffle(neighbors.begin(), neighbors.end(), state.rng);
+        for (int v : neighbors)
+        {
+            if (!visited[v] && state.movable[v])
+            {
+                visited[v] = 1;
+                bfsQueue.push_back(v);
+                if (static_cast<int>(cluster.size()) >= k)
+                {
+                    break;
+                }
+            }
+        }
+    }
+
+    if (static_cast<int>(cluster.size()) < k)
+    {
+        std::vector<int> remaining;
+        remaining.reserve(n);
+        for (int i : movableIndices)
+        {
+            if (!visited[i])
+            {
+                remaining.push_back(i);
+            }
+        }
+        std::shuffle(remaining.begin(), remaining.end(), state.rng);
+        for (int i : remaining)
+        {
+            cluster.push_back(i);
+            if (static_cast<int>(cluster.size()) >= k)
+            {
+                break;
+            }
+        }
+    }
+
+    std::sort(cluster.begin(), cluster.end(), [&state](int a, int b) {
+        return state.adjacencyIndex[a].size() > state.adjacencyIndex[b].size();
+    });
+
+    for (int idx : cluster)
+    {
+        repairMacro(state, idx);
+    }
+
+    py::array_t<double> result({state.numHardMacros, 2});
+    auto buf = result.mutable_unchecked<2>();
+    for (int i = 0; i < state.numHardMacros; ++i)
+    {
+        buf(i, 0) = state.posX[i];
+        buf(i, 1) = state.posY[i];
+    }
+    return result;
+}
+
 py::array_t<double> swapTwoMacros(PlacerState& state, int numSwaps)
 {
     std::vector<int> movableIndices;
@@ -1038,13 +1132,36 @@ py::array_t<double> swapTwoMacros(PlacerState& state, int numSwaps)
         }
     }
     const int n = static_cast<int>(movableIndices.size());
+    std::uniform_real_distribution<double> uniform01(0.0, 1.0);
     if (n >= 2)
     {
         std::uniform_int_distribution<int> idxDist(0, n - 1);
         for (int s = 0; s < numSwaps; ++s)
         {
             const int i = movableIndices[idxDist(state.rng)];
-            int j = movableIndices[idxDist(state.rng)];
+            int j = -1;
+            const auto& neighbors = state.adjacencyIndex[i];
+            if (!neighbors.empty() && uniform01(state.rng) < 0.6)
+            {
+                std::vector<int> movableNeighbors;
+                movableNeighbors.reserve(neighbors.size());
+                for (int nb : neighbors)
+                {
+                    if (state.movable[nb] && nb != i)
+                    {
+                        movableNeighbors.push_back(nb);
+                    }
+                }
+                if (!movableNeighbors.empty())
+                {
+                    j = movableNeighbors[std::uniform_int_distribution<int>(
+                        0, static_cast<int>(movableNeighbors.size()) - 1)(state.rng)];
+                }
+            }
+            if (j < 0)
+            {
+                j = movableIndices[idxDist(state.rng)];
+            }
             if (i == j) continue;
             const double xi = state.posX[i];
             const double yi = state.posY[i];
@@ -1316,6 +1433,8 @@ PYBIND11_MODULE(_placer_core, m)
              py::arg("num_iters"), py::arg("snapshot_every") = 0)
         .def("destroy_and_repair", &destroyAndRepair, py::arg("destroy_size"))
         .def("swap_two_macros", &swapTwoMacros, py::arg("num_swaps") = 1)
+        .def("destroy_cluster_and_repair", &destroyClusterAndRepair,
+             py::arg("destroy_size"))
         .def("destroy_congested_and_repair", &destroyCongestedAndRepair,
              py::arg("hot_cells_xyw"), py::arg("grid_rows"), py::arg("grid_cols"),
              py::arg("destroy_size"),
