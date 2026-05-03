@@ -29,7 +29,29 @@
 
 ## 📂 Журнал прогонов
 
-### #12 · 2026-05-03 · `submissions/straple/placer.py` (multi-start N=5 для больших) — НОВЫЙ BEST
+### #13 · 2026-05-03 · попытка: adaptive SA budget (3000→up to 8000) — РЕГРЕССИЯ, откатили
+
+**Идея**: lift sa_refine с фикс 3000 до `max(3000, min(8000, 15·N_movable))`. Гипотеза: больше SA-итераций для больших дизайнов даст лучше initial.
+
+**Результат** (1 fast_check):
+
+| Bench | Proxy | vs #12 (1.4674) | Заметка |
+|---|---|---|---|
+| ibm01 | 1.1431 | +0.18% ❌ | density 0.914→0.919 |
+| ibm10 | 1.3952 | +0.90% ❌ | density 0.717→0.726, cong +0.7% |
+| ibm14 | 1.6121 | +0.54% ❌ | density 0.980→0.986 |
+| ibm17 | 1.7448 | +0.15% | cong 2.426→2.428 |
+| **AVG4** | **1.4738** | **+0.43% ❌** | — |
+
+**Что не сработало**: SA optimize ТОЛЬКО HPWL (через delta), а HPWL = ~4% от cost. Больше SA = глубже локальный минимум HPWL, который **хуже** для full proxy_cost (density/cong часто проседают). Это classical SA overshooting на wrong objective.
+
+**Урок**: SA budget 3000 — already sweet spot. Дальше — менять SA target (например, добавить density penalty в SA delta), не количество итераций.
+
+**Откат**: `git checkout placer.py`.
+
+---
+
+### #12 · 2026-05-03 · `submissions/straple/placer.py` (multi-start N=5 для больших) — best после cycle #8
 
 **Идея**: lift `num_starts` с 3 до 5. На ibm14/17 N=3 не давал diversification (basin too deep) — попробовать больше N. Runtime budget огромный.
 
