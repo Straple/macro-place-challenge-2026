@@ -240,7 +240,7 @@ class StraplePlacer:
         canvas_w = float(benchmark.canvas_width)
         canvas_h = float(benchmark.canvas_height)
 
-        num_starts = 3 if num_movable >= 300 else 1
+        num_starts = 5 if num_movable >= 300 else 1
 
         evaluator = None
         if plc is not None and self.lns_outer_iters > 0:

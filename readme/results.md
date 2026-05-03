@@ -8,7 +8,7 @@
 
 | | Значение |
 |---|---|
-| **AVG4 proxy** (ibm01/10/14/17) | **1.4688** ⭐ #11 |
+| **AVG4 proxy** (ibm01/10/14/17) | **1.4674** ⭐ #12 |
 | AVG17 proxy (--all) | 1.5181 (#4, перезамерить) |
 | Placer | `submissions/straple/placer.py` (C++ + adaptive LNS + чередование congested/random) |
 | Дата замера | 2026-05-03 |
@@ -29,7 +29,49 @@
 
 ## 📂 Журнал прогонов
 
-### #11 · 2026-05-03 · `submissions/straple/placer.py` (multi-start N=3 для больших) — НОВЫЙ BEST 🏆
+### #12 · 2026-05-03 · `submissions/straple/placer.py` (multi-start N=5 для больших) — НОВЫЙ BEST
+
+**Идея**: lift `num_starts` с 3 до 5. На ibm14/17 N=3 не давал diversification (basin too deep) — попробовать больше N. Runtime budget огромный.
+
+**Изменения**: `placer.py` — `num_starts = 5 if num_movable >= 300 else 1`.
+
+**Сводка** (медиана 3 запусков, 3/3 идентичны):
+
+| Bench | Proxy | vs #11 (1.4688) | vs Straple #4 baseline | starts | time |
+|---|---|---|---|---|---|
+| ibm01 | 1.1411 | 0.00% | -3.14% | 1 (skip) | 0.41s |
+| ibm10 | 1.3828 | 0.00% | -0.11% | 5 | 4.10s |
+| ibm14 | **1.6035** | **-0.35%** ⭐ | **-1.50%** ⭐ | 5 | 3.73s |
+| ibm17 | 1.7422 | 0.00% | -0.17% | 5 | 5.25s |
+| **AVG4** | **1.4674** ⭐ | **-0.10%** | **-1.11%** ⭐ | wall ~110-130s |
+
+- vs RePlAce (на 4 бенчах AVG=1.4197): **+3.36%**
+- vs прошлый best (#11: 1.4688): **-0.10%** ▼ (новый best)
+- vs Straple #4 baseline (1.4839): **-1.11%** ▼
+- Overlaps: 0, Smoke 9/9
+
+**Что сработало**:
+- ibm14: впервые multi-start дал улучшение, **-0.35%**. seed 4 или 5 нашёл alternative attractor. Density 0.980→0.980, Cong 2.130→2.117 (-0.6%).
+- Время роста умеренное (×1.7 для больших vs N=3).
+
+**Что не сработало**:
+- ibm17 всё равно нет улучшения. Basin attraction ОЧЕНЬ глубокий — даже 5 разных seeds сходятся в ту же точку. Возможно нужен structurally разный initial (force-directed, grid-based), не просто разный random.
+- ibm10 уже в N=3 нашёл best — N=5 не помог дальше.
+
+**Главный урок**:
+- Больше N помогает, но с убывающей отдачей. ibm14 потребовал N=5; ibm17 видимо нужно ещё больше или иной подход.
+- Стоит остановиться на оптимальном N — для ibm14 N=5 хватает, ibm17 — другая проблема.
+
+**Следующие шаги**:
+- Cycle #9: возможно N=8 для ibm17, или попробовать **structurally разные initial**: force-directed seed как один из стартов.
+- Альтернатива: **larger SA budget** (sa_refine 3000→6000 для больших).
+- Альтернатива: **lift LNS outer upper bound** (60→80 для очень больших).
+
+**Команда**: `$HOME/.local/bin/uv run python scripts/fast_check.py`
+
+---
+
+### #11 · 2026-05-03 · `submissions/straple/placer.py` (multi-start N=3 для больших) — best после cycle #7
 
 **Идея**: для больших дизайнов (`num_movable >= 300`) запустить 3 независимых старта с разными seed (42/43/44) полным циклом legalize→SA→LNS, выбрать минимальный по proxy_cost. Маленькие (ibm01) — один старт, как раньше (overhead не оправдан).
 
