@@ -8,25 +8,96 @@
 
 | | Значение |
 |---|---|
-| **AVG proxy cost** | **1.5336** |
-| Placer | `submissions/will_seed/placer.py` (reference от организаторов) |
+| **AVG proxy cost** | **1.5181** |
+| Placer | `submissions/straple/placer.py` (C++ core via pybind11) |
 | Дата замера | 2026-05-03 |
-| Total runtime | 34.74s на 17 IBM benchmarks |
+| Total runtime | 173.81s на 17 IBM benchmarks |
 | Hardware | Mac ARM (aarch64-apple-darwin), Python 3.14.4, torch 2.10.0 |
 
 **Гэп до целей:**
 
 | Цель | Score | Δ от текущего | % улучшения нужно |
 |---|---|---|---|
-| RePlAce baseline (порог) | 1.4578 | -0.0758 | **-5.2%** |
-| Топ-10 leaderboard | 1.4076 | -0.1260 | -8.9% |
-| **Топ-7 → Гран-при $20K** | **1.3479** | **-0.1857** | **-12.7%** |
-| Топ-3-5 | ~ 1.32 | -0.21 | -14% |
-| Первое место (Cezar) | 1.2224 | -0.3112 | -25.3% |
+| RePlAce baseline (порог) | 1.4578 | -0.0603 | **-4.0%** |
+| Топ-10 leaderboard | 1.4076 | -0.1105 | -7.3% |
+| **Топ-7 → Гран-при $20K** | **1.3479** | **-0.1702** | **-11.2%** |
+| Топ-3-5 | ~ 1.32 | -0.20 | -13% |
+| Первое место (Cezar) | 1.2224 | -0.2957 | -19.5% |
 
 ---
 
 ## 📂 Журнал прогонов
+
+### #3 · 2026-05-03 · `submissions/straple/placer.py` (C++ core via pybind11)
+
+**Сводка:**
+- AVG proxy: **1.5181**
+- Best: **1.1781** на `ibm01` (246 макросов)
+- Worst: **1.7944** на `ibm06` (318 макросов)
+- Total runtime: **173.81s**
+- Overlaps: 0 на всех ✅
+- vs SA baseline: **+28.6%** (better)
+- vs RePlAce baseline: **-4.1%** (хуже, но ближе чем will_seed)
+- vs will_seed: **-1.01%** (lower is better)
+
+**Архитектура:**
+- C++ ядро (`submissions/straple/cpp/placer_core.cpp`) — legalize, SA refinement, LNS destroy/repair
+- Python обёртка — extract edges из плк, оркестрирует пайплайн, оценивает proxy_cost через TILOS plc
+- pybind11 bindings, компилируется через `cpp/build.sh`
+- monkey-patch `plc.{soft,hard}_macro_pin_indices` → set (28× ускорение `compute_proxy_cost`)
+
+**Параметры:**
+- refine_iters=3000 (SA на HPWL)
+- lns_outer_iters=30
+- lns_destroy_size=8 (random destroy), repair=weighted-centroid + spiral search
+
+**Per-benchmark детали:**
+
+| Benchmark | Macros | Proxy | WL | Density | Congestion | Time | vs SA | vs RePlAce |
+|---|---|---|---|---|---|---|---|---|
+| ibm01 | 246 | **1.1781** ⭐ | 0.073 | 0.927 | 1.284 | 3.4s | +10.5% | -18.1% |
+| ibm02 | 254 | 1.6316 | 0.078 | 0.809 | 2.299 | 5.1s | +14.5% | **+11.2%** ⭐ |
+| ibm03 | 269 | 1.4148 | 0.081 | 0.841 | 1.827 | 4.6s | +18.7% | -7.0% |
+| ibm04 | 285 | 1.4092 | 0.074 | 0.874 | 1.797 | 4.6s | +6.3% | -8.2% |
+| ibm06 | 318 | 1.7944 | 0.068 | 0.834 | 2.619 | 4.5s | +28.4% | -10.9% |
+| ibm07 | 335 | 1.5736 | 0.067 | 0.948 | 2.066 | 6.3s | +22.2% | -7.5% |
+| ibm08 | 352 | 1.5037 | 0.069 | 0.871 | 1.998 | 7.0s | +21.8% | -5.3% |
+| ibm09 | 369 | 1.1928 | 0.059 | 0.944 | 1.324 | 5.4s | +14.0% | -6.6% |
+| ibm10 | 387 | 1.3843 | 0.069 | 0.716 | 1.915 | 18.1s | +34.4% | **+7.8%** ⭐ |
+| ibm11 | 405 | 1.2855 | 0.056 | 0.965 | 1.495 | 7.6s | +24.9% | -9.2% |
+| ibm12 | 423 | 1.6679 | 0.061 | 0.824 | 2.390 | 17.9s | +41.0% | **+3.4%** ⭐ |
+| ibm13 | 441 | 1.4258 | 0.055 | 0.935 | 1.808 | 9.9s | +25.5% | -6.8% |
+| ibm14 | 460 | 1.6280 | 0.053 | 1.000 | 2.150 | 16.6s | +28.4% | -5.5% |
+| ibm15 | 479 | 1.6349 | 0.060 | 0.965 | 2.185 | 11.4s | +28.9% | -7.8% |
+| ibm16 | 498 | 1.5458 | 0.050 | 0.895 | 2.097 | 15.6s | +30.8% | -4.6% |
+| ibm17 | 517 | 1.7451 | 0.054 | 0.952 | 2.430 | 24.5s | +52.5% | -6.1% |
+| ibm18 | 537 | 1.7916 | 0.054 | 1.041 | 2.435 | 11.3s | +35.5% | -1.1% |
+| **AVG** | — | **1.5181** | — | — | — | **174s total** | **+28.6%** | **-4.1%** |
+
+⭐ — обходит RePlAce baseline (3 из 17: ibm02, ibm10, ibm12). Will_seed обходил те же 3.
+
+**Что менялось от will_seed:**
+1. Та же архитектура (legalize + SA + опц. LNS) — но переписана на C++ (pybind11)
+2. Добавлена outer LNS-фаза: 30 итераций × destroy 8 random + weighted-centroid repair + accept by full proxy_cost
+3. Monkey-patch `pin_indices` → set: устранил O(N) lookup внутри `compute_proxy_cost`, дав ~28× ускорение
+
+**Что сработало:**
+- LNS post-processing спрятал ~1% улучшения над чистым SA (особенно сильно на ibm01: 1.2920 → 1.1781 = -8.8%)
+- C++ переписывание SA: ~10× быстрее inner SA loop → можем себе позволить full 30 LNS iters везде
+
+**Что не сработало (отвергнуто в ходе сессии):**
+- SA-acceptance в LNS — ломает greedy улучшения
+- Variable destroy + random repair — не консистентно
+- Soft macro centroid update — массивная регрессия (WL)
+- Spectral seed (Laplacian eigenvectors) — гораздо хуже initial
+- `plc.optimize_stdcells()` — слишком медленно даже с маленьким budget
+
+**Команда:**
+```bash
+$HOME/.local/bin/uv run evaluate submissions/straple/placer.py --all
+```
+
+---
 
 ### #2 · 2026-05-03 · `submissions/will_seed/placer.py` (reference)
 
