@@ -29,6 +29,28 @@
 
 ## 📂 Журнал прогонов
 
+### #9 · 2026-05-03 · попытка: tighter threshold (P30 вместо median) — РЕГРЕССИЯ, откатили
+
+**Идея**: В `repairMacroAware` заменить median (P50) на P30 — более жёсткий threshold. Гипотеза: на ibm10 (cong-grid гладкий) median всегда срабатывает, поведение = старое; tighter threshold заставит spiral искать действительно cool зоны.
+
+**Результат** (1 fast_check):
+
+| Bench | Proxy | vs #8 (1.4707) | Что |
+|---|---|---|---|
+| ibm01 | 1.1467 | +0.49% ❌ | density 0.914→0.921 |
+| ibm10 | 1.3902 | 0.00% | как и было |
+| ibm14 | 1.6149 | +0.35% ❌ | density 0.980→0.982 |
+| ibm17 | 1.7436 | +0.08% | нейтрал |
+| **AVG4** | **1.4739** | **+0.22% ❌** | — |
+
+**Что не сработало**: P30 слишком жёсткий — fallback на старый repair срабатывает чаще, теряем aware-эффект. На ibm10 действительно ничего не изменилось (как и предсказывали), но на ibm01/14 — регрессия.
+
+**Урок**: median (P50) — оптимальный threshold для текущей архитектуры. Жёстче = больше fallback. Реверт через `git checkout placer_core.cpp`.
+
+**Гипотеза для cycle #6**: атаковать ibm10/17 не через threshold, а другим способом — например, **wider congested-percent** (top 10% вместо top 5%, больше hot-cells → больше destroy-таргетов). Или: **scale outer iterations specifically для ibm17** (lift upper bound 60→80).
+
+---
+
 ### #8 · 2026-05-03 · `submissions/straple/placer.py` (congestion-aware repair) — НОВЫЙ BEST 🚀
 
 **Идея**: На congested-destroy ветке LNS использовать **congestion-aware spiral search** в repair: принимать non-overlap позицию ТОЛЬКО если её max-cong по перекрытым cells < median(cong-grid). Если за spiral (r∈[1..20]) не нашли — fallback на старый «слепой» repair. Random-destroy ветка не трогается (exploration сохранена).
