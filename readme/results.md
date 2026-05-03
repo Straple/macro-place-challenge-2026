@@ -8,7 +8,7 @@
 
 | | Значение |
 |---|---|
-| **AVG4 proxy** (ibm01/10/14/17) | **1.4643** ⭐ #15 |
+| **AVG4 proxy** (ibm01/10/14/17) | **1.4619** ⭐ #16 |
 | AVG17 proxy (--all) | 1.5181 (#4, перезамерить) |
 | Placer | `submissions/straple/placer.py` (C++ + adaptive LNS + чередование congested/random) |
 | Дата замера | 2026-05-03 |
@@ -29,7 +29,45 @@
 
 ## 📂 Журнал прогонов
 
-### #15 · 2026-05-03 · `submissions/straple/placer.py` (LNS outer up to 150, 0.20·N) — НОВЫЙ BEST
+### #16 · 2026-05-04 · 🚨 BUG FIX: ProxyEvaluator.evaluate() веса 1:1:1 → 1:0.5:0.5 + логирование
+
+**Корневая проблема (найдена через детальное логирование)**: `_proxy_cost.cpp::evaluate()` возвращал `wl + density + congestion` (unweighted sum), а **реальный** `proxy_cost = 1·wl + 0.5·density + 0.5·congestion` (см. macro_place/objective.py:148-162).
+
+Это значит:
+- **Multi-start выбирал best по неправильной метрике** — мог выбрать вариант с лучшим `wl+den+cong`, но худшим реальным `proxy_cost`.
+- **LNS accept/reject** работало с весами 1:1:1, переоценивая density/congestion в 2× и недооценивая wirelength в 2×.
+- Все 11 предыдущих циклов оптимизировали wrong objective.
+
+**Как нашли**: добавил подробное логирование (env `STRAPLE_VERBOSE=1`) — каждая фаза с таймингом, LNS прогресс с accept/reject, операторы random/cong, gain. На ibm17 заметил несовпадение: `evaluator.evaluate()` возвращает `3.4290`, а `compute_proxy_cost(...)["proxy_cost"]` = `1.7404`. Сложил `wl+den+cong = 0.054+0.949+2.424 = 3.427` ≈ 3.43.
+
+**Изменения**:
+- `submissions/straple/cpp/proxy_cost.cpp::evaluate()` — `return wl + 0.5*dens + 0.5*cong` (раньше `wl + dens + cong`).
+- `submissions/straple/placer.py`: добавлен `verbose` флаг (env `STRAPLE_VERBOSE`) — печатает фазы (load_plc, _extract_edges, _build_proxy_evaluator, legalize/SA/LNS на каждый seed), LNS прогресс с операторами и accept counts.
+- `submissions/straple/analytical_seed.py`: добавлены `log_every` и `log_proxy` параметры — печатает loss/grad/proxy на промежуточных шагах.
+- `test/test_smoke.py`: новый `test_straple_evaluate_returns_proxy_cost` — проверяет `evaluator.evaluate()` совпадает с `compute_proxy_cost(...)["proxy_cost"]` И что aggregate = `wl + 0.5·den + 0.5·cong`. Регрессия предотвращена.
+
+**Сводка** (1 fast_check, детерминизм подтверждался ранее):
+
+| Bench | Proxy | vs #15 (1.4643) | vs Straple #4 baseline | Что |
+|---|---|---|---|---|
+| ibm01 | **1.1282** ⭐ | **-0.83%** | -4.23% ⭐ | density 0.911→0.910, cong 1.218→1.200 |
+| ibm10 | 1.3765 | 0.00% | -0.56% | best и так был оптимальным по обеим метрикам |
+| ibm14 | 1.6025 | 0.00% | -1.57% | то же |
+| ibm17 | 1.7405 | +0.01% | -0.26% | в шуме |
+| **AVG4** | **1.4619** ⭐ | **-0.16%** | **-1.48%** ⭐ | wall ~108s |
+
+- vs RePlAce (на 4 бенчах AVG=1.4197): **+2.98%** (раньше +3.14%)
+
+**Главный урок**: 
+- **Логи раскрыли давний баг.** За 11 циклов мы tweakали алгоритм, который оптимизировал не то.
+- Теперь LNS правильно расценивает trade-off между WL/density/congestion. На ibm01 это сразу дало -0.83% — там WL улучшения раньше не accept'ились (они "терялись" на фоне Δdensity×2).
+- Тест навсегда зафиксирован — не повторим.
+
+**Команда**: `STRAPLE_VERBOSE=1 uv run python -c "..."` для отладки; `uv run python scripts/fast_check.py` для измерения.
+
+---
+
+### #15 · 2026-05-03 · `submissions/straple/placer.py` (LNS outer up to 150, 0.20·N) — best после cycle #11
 
 **Идея**: lift `adaptive_outer` upper bound 100→150, scale 0.15·N→0.20·N. Продолжение #14 — больше LNS budget даёт улучшения без overshoot.
 

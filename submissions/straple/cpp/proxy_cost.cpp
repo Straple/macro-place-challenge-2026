@@ -724,7 +724,7 @@ struct ProxyEvaluator
         const double wl = normalizedWirelength(hardX.data(), hardY.data());
         const double dens = densityCost(hardX.data(), hardY.data());
         const double cong = congestionCost(hardX.data(), hardY.data());
-        return wl + dens + cong;
+        return wl + 0.5 * dens + 0.5 * cong;
     }
 
     py::tuple evaluateBreakdown(py::array_t<double> hardPositions) const

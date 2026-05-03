@@ -194,3 +194,46 @@ def test_straple_proxy_cost_matches_plc(ibm01):
     assert abs(cpp_cong - plc_costs["congestion_cost"]) < 5e-3, (
         f"congestion mismatch: C++ {cpp_cong:.6f} vs plc {plc_costs['congestion_cost']:.6f}"
     )
+
+
+def test_straple_evaluate_returns_proxy_cost(ibm01):
+    """ProxyEvaluator.evaluate() must return the SAME number as compute_proxy_cost
+    (i.e. wl + 0.5*density + 0.5*congestion).
+
+    Past bug (caught 2026-05-04): evaluate() returned wl + density + congestion
+    (unweighted sum), so multi-start picked best by wrong metric and LNS accepted
+    moves on wrong gradient. Both compute paths agree on components but the
+    aggregate must use the official 1:0.5:0.5 weights.
+    """
+    import importlib.util
+
+    placer_path = Path("submissions/straple/placer.py")
+    if not placer_path.exists():
+        pytest.skip("submissions/straple/placer.py not present")
+
+    spec = importlib.util.spec_from_file_location("straple_placer", str(placer_path))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    benchmark, plc = ibm01
+    mod._accelerate_plc(plc)
+    evaluator = mod._build_proxy_evaluator(benchmark, plc)
+
+    n_hard = benchmark.num_hard_macros
+    hard_pos = benchmark.macro_positions[:n_hard].numpy().astype('float64').copy()
+
+    cpp_aggregate = evaluator.evaluate(hard_pos)
+    plc_proxy = compute_proxy_cost(benchmark.macro_positions, benchmark, plc)["proxy_cost"]
+
+    assert abs(cpp_aggregate - plc_proxy) < 5e-3, (
+        f"ProxyEvaluator.evaluate() must equal compute_proxy_cost (1·wl + 0.5·density + 0.5·congestion). "
+        f"Got C++ {cpp_aggregate:.6f} vs plc {plc_proxy:.6f} (delta {cpp_aggregate - plc_proxy:+.4f}). "
+        f"If components agree but aggregate doesn't, the weights are wrong inside evaluate()."
+    )
+
+    cpp_breakdown_total, cpp_wl, cpp_den, cpp_cong = evaluator.evaluate_breakdown(hard_pos)
+    expected_aggregate = cpp_wl + 0.5 * cpp_den + 0.5 * cpp_cong
+    assert abs(cpp_aggregate - expected_aggregate) < 1e-6, (
+        f"evaluate() must return wl + 0.5·density + 0.5·congestion. "
+        f"Got {cpp_aggregate:.6f}, expected {expected_aggregate:.6f}."
+    )

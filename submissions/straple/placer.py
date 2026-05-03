@@ -218,20 +218,38 @@ class StraplePlacer:
         refine_iters: int = 3000,
         lns_outer_iters: int = 30,
         lns_destroy_size: int = 8,
+        verbose: int = 0,
     ):
         self.seed = seed
         self.refine_iters = refine_iters
         self.lns_outer_iters = lns_outer_iters
         self.lns_destroy_size = lns_destroy_size
+        self.verbose = verbose if verbose else int(os.environ.get("STRAPLE_VERBOSE", "0"))
+
+    def _log(self, msg):
+        if self.verbose:
+            print(msg, flush=True)
 
     def place(self, benchmark: Benchmark) -> torch.Tensor:
+        import time
+        t_place_start = time.time()
+        bench_label = getattr(benchmark, "name", "?")
+        self._log(f"[{bench_label}] === StraplePlacer.place() ===")
+
         n_hard = benchmark.num_hard_macros
         plc = _load_plc(benchmark.name)
+        t_after_plc = time.time()
+        self._log(f"[{bench_label}] _load_plc: {t_after_plc - t_place_start:.2f}s "
+                  f"(n_hard={n_hard})")
+
         if plc is not None:
             edges, edge_weights = _extract_edges(benchmark, plc)
         else:
             edges = np.zeros((0, 2), dtype=np.int32)
             edge_weights = np.zeros(0, dtype=np.float64)
+        t_after_edges = time.time()
+        self._log(f"[{bench_label}] _extract_edges: {t_after_edges - t_after_plc:.2f}s "
+                  f"(edges={len(edges)})")
 
         initial_pos = benchmark.macro_positions[:n_hard].numpy().astype(np.float64).copy()
         sizes = benchmark.macro_sizes[:n_hard].numpy().astype(np.float64)
@@ -239,18 +257,22 @@ class StraplePlacer:
         num_movable = int(movable_mask.sum())
         canvas_w = float(benchmark.canvas_width)
         canvas_h = float(benchmark.canvas_height)
+        self._log(f"[{bench_label}] num_movable={num_movable} canvas={canvas_w:.0f}x{canvas_h:.0f}")
 
         num_starts = 5 if num_movable >= 300 else 1
 
         evaluator = None
         if plc is not None and self.lns_outer_iters > 0:
+            t0 = time.time()
             evaluator = _build_proxy_evaluator(benchmark, plc)
+            self._log(f"[{bench_label}] _build_proxy_evaluator: {time.time()-t0:.2f}s")
 
         best_pos = None
         best_cost = float("inf")
 
         for start_idx in range(num_starts):
             seed = self.seed + start_idx
+            t_start_iter = time.time()
             state = _placer_core.PlacerState()
             state.initialize(
                 initial_pos, sizes, movable_mask,
@@ -258,11 +280,28 @@ class StraplePlacer:
                 canvas_w, canvas_h, int(seed),
             )
 
+            t0 = time.time()
             state.legalize()
+            t_legalize = time.time() - t0
+            cost_after_legal = evaluator.evaluate(state.current_positions()) if evaluator else 0.0
+
+            t0 = time.time()
             state.sa_refine(self.refine_iters)
+            t_sa = time.time() - t0
+            cost_after_sa = evaluator.evaluate(state.current_positions()) if evaluator else 0.0
+
+            self._log(f"[{bench_label}] start#{start_idx} seed={seed}: "
+                      f"legalize={t_legalize:.2f}s cost={cost_after_legal:.4f} | "
+                      f"sa_refine({self.refine_iters})={t_sa:.2f}s cost={cost_after_sa:.4f}")
 
             if evaluator is not None:
-                self._lns_loop(state, evaluator, plc, num_movable)
+                t0 = time.time()
+                lns_log = self._lns_loop(state, evaluator, plc, num_movable, bench_label, start_idx)
+                t_lns = time.time() - t0
+                self._log(f"[{bench_label}] start#{start_idx} LNS: {t_lns:.2f}s "
+                          f"iters={lns_log['iters']} accepted={lns_log['accepted']} "
+                          f"cost {cost_after_sa:.4f} -> {lns_log['final_cost']:.4f} "
+                          f"(delta {lns_log['final_cost']-cost_after_sa:+.4f})")
 
             trial_pos = state.current_positions()
             if evaluator is not None:
@@ -273,14 +312,23 @@ class StraplePlacer:
             if trial_cost < best_cost:
                 best_cost = trial_cost
                 best_pos = trial_pos
+                self._log(f"[{bench_label}] start#{start_idx} new best={trial_cost:.4f} "
+                          f"(iter_total={time.time()-t_start_iter:.2f}s)")
+            else:
+                self._log(f"[{bench_label}] start#{start_idx} cost={trial_cost:.4f} "
+                          f"(not best, current best={best_cost:.4f})")
 
         full = benchmark.macro_positions.clone()
         full[:n_hard] = torch.tensor(best_pos, dtype=torch.float32)
+        self._log(f"[{bench_label}] === DONE total={time.time()-t_place_start:.2f}s "
+                  f"final_cost={best_cost:.4f} ===")
         return full
 
-    def _lns_loop(self, state, evaluator, plc, num_movable):
+    def _lns_loop(self, state, evaluator, plc, num_movable, bench_label="?", start_idx=0):
+        import time
         best_pos = state.current_positions()
         best_cost = evaluator.evaluate(best_pos)
+        initial_cost = best_cost
 
         grid_rows = int(plc.grid_row)
         grid_cols = int(plc.grid_col)
@@ -289,8 +337,16 @@ class StraplePlacer:
         adaptive_destroy = max(self.lns_destroy_size, min(16, math.ceil(0.025 * num_movable)))
         adaptive_outer = max(self.lns_outer_iters, min(150, math.ceil(0.20 * num_movable)))
 
+        accepted = 0
+        accepted_random = 0
+        accepted_congested = 0
+        gain_random = 0.0
+        gain_congested = 0.0
+        log_step = max(1, adaptive_outer // 10) if self.verbose else 0
+
         for iteration in range(adaptive_outer):
             saved = state.current_positions()
+            t_iter = time.time()
             if iteration % 2 == 1:
                 evaluator.evaluate(saved)
                 hot_cells = evaluator.get_top_congested_cells(congested_percent)
@@ -300,15 +356,40 @@ class StraplePlacer:
                         hot_cells, grid_rows, grid_cols, adaptive_destroy,
                         cong_grid, grid_rows, grid_cols,
                     )
+                    op = "cong"
                 else:
                     trial = state.destroy_and_repair(adaptive_destroy)
+                    op = "rand-fb"
             else:
                 trial = state.destroy_and_repair(adaptive_destroy)
+                op = "rand"
             new_cost = evaluator.evaluate(trial)
             if new_cost < best_cost:
+                gain = best_cost - new_cost
                 best_cost = new_cost
                 best_pos = trial
+                accepted += 1
+                if op == "rand":
+                    accepted_random += 1
+                    gain_random += gain
+                else:
+                    accepted_congested += 1
+                    gain_congested += gain
+                if log_step and (iteration % log_step == 0 or iteration == adaptive_outer - 1):
+                    self._log(f"[{bench_label}] start#{start_idx} LNS iter={iteration:>3} "
+                              f"op={op:<7} ACCEPT cost={new_cost:.4f} (-{gain:.4f}) "
+                              f"k={adaptive_destroy} t={(time.time()-t_iter)*1000:.0f}ms")
             else:
                 state.set_positions(saved)
+                if log_step and iteration % (log_step * 2) == 0:
+                    self._log(f"[{bench_label}] start#{start_idx} LNS iter={iteration:>3} "
+                              f"op={op:<7} reject (cost={new_cost:.4f} > {best_cost:.4f})")
 
         state.set_positions(best_pos)
+        if self.verbose:
+            self._log(f"[{bench_label}] start#{start_idx} LNS summary: "
+                      f"{accepted}/{adaptive_outer} accepted "
+                      f"(rand: {accepted_random}, gain={gain_random:.4f} | "
+                      f"cong: {accepted_congested}, gain={gain_congested:.4f}) "
+                      f"k={adaptive_destroy} initial={initial_cost:.4f} -> final={best_cost:.4f}")
+        return {"iters": adaptive_outer, "accepted": accepted, "final_cost": best_cost}

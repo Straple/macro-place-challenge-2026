@@ -98,8 +98,29 @@ def _density_penalty(pos, sizes, canvas_w, canvas_h, grid_rows, grid_cols, targe
     return (excess ** 2).sum()
 
 
+def _count_pairwise_overlaps(pos, sizes, n_hard):
+    half_w = sizes[:, 0] / 2
+    half_h = sizes[:, 1] / 2
+    overlaps = 0
+    overlap_area = 0.0
+    for i in range(n_hard):
+        for j in range(i + 1, n_hard):
+            dx = abs(pos[i, 0] - pos[j, 0])
+            dy = abs(pos[i, 1] - pos[j, 1])
+            sep_x = (sizes[i, 0] + sizes[j, 0]) / 2
+            sep_y = (sizes[i, 1] + sizes[j, 1]) / 2
+            if dx < sep_x and dy < sep_y:
+                overlaps += 1
+                overlap_area += (sep_x - dx) * (sep_y - dy)
+    return overlaps, overlap_area
+
+
 def analytical_seed(benchmark: Benchmark, plc, num_steps=200, lr=0.5,
-                    lambda_density=0.0, gamma_frac=0.05, target_util=0.6):
+                    lambda_density=0.0, gamma_frac=0.05, target_util=0.6,
+                    log_every=0, log_proxy=False, label=""):
+    import time
+    t_start = time.time()
+
     n_hard = benchmark.num_hard_macros
     canvas_w = float(benchmark.canvas_width)
     canvas_h = float(benchmark.canvas_height)
@@ -112,10 +133,19 @@ def analytical_seed(benchmark: Benchmark, plc, num_steps=200, lr=0.5,
     pos = fixed_pos.clone().requires_grad_(True)
     optimizer = torch.optim.Adam([pos], lr=lr)
 
+    t_setup0 = time.time()
     net_macro_idx, net_pin_offsets = _build_net_pin_tensors(benchmark, plc)
     gamma = max(canvas_w, canvas_h) * gamma_frac
+    setup_time = time.time() - t_setup0
+
+    if log_every > 0:
+        print(f"  [analytical {label}] n_hard={n_hard} n_nets={len(net_macro_idx)} "
+              f"canvas={canvas_w:.0f}x{canvas_h:.0f} gamma={gamma:.1f} "
+              f"lr={lr} ld={lambda_density} steps={num_steps} setup={setup_time:.2f}s",
+              flush=True)
 
     for step in range(num_steps):
+        t_step = time.time()
         optimizer.zero_grad()
         wl = _smooth_hpwl(pos, net_macro_idx, net_pin_offsets, gamma)
         if lambda_density > 0:
@@ -125,14 +155,44 @@ def analytical_seed(benchmark: Benchmark, plc, num_steps=200, lr=0.5,
             )
             loss = wl + lambda_density * dpen
         else:
+            dpen = pos.new_zeros(())
             loss = wl
         loss.backward()
+        grad_norm = pos.grad.norm().item() if pos.grad is not None else 0.0
         optimizer.step()
 
         with torch.no_grad():
             pos[:, 0].clamp_(min=half_w, max=canvas_w - half_w)
             pos[:, 1].clamp_(min=half_h, max=canvas_h - half_h)
             pos[~movable] = fixed_pos[~movable]
+
+        if log_every > 0 and (step % log_every == 0 or step == num_steps - 1):
+            with torch.no_grad():
+                wl_v = wl.item()
+                dpen_v = dpen.item() if lambda_density > 0 else 0.0
+            elapsed = time.time() - t_start
+            step_time = time.time() - t_step
+            extra = ""
+            if log_proxy and (step == num_steps - 1 or step % (log_every * 5) == 0):
+                from macro_place.objective import compute_proxy_cost
+                with torch.no_grad():
+                    full = benchmark.macro_positions.clone()
+                    full[:n_hard] = pos.detach()
+                    cost = compute_proxy_cost(full, benchmark, plc)
+                    extra = (f" proxy={cost['proxy_cost']:.4f}"
+                             f" wl_real={cost['wirelength_cost']:.3f}"
+                             f" den={cost['density_cost']:.3f}"
+                             f" cong={cost['congestion_cost']:.3f}"
+                             f" ovrlp={cost['overlap_count']}")
+            print(f"  [analytical {label}] step={step:>4} wl_smooth={wl_v:>10.1f} "
+                  f"dpen={dpen_v:>8.4f} loss={loss.item():>10.1f} "
+                  f"|grad|={grad_norm:>8.2f} step_t={step_time*1000:.0f}ms "
+                  f"total_t={elapsed:.1f}s{extra}", flush=True)
+
+    if log_every > 0:
+        total = time.time() - t_start
+        print(f"  [analytical {label}] DONE in {total:.2f}s ({total/num_steps*1000:.1f}ms/step)",
+              flush=True)
 
     return pos.detach().cpu().numpy().astype(np.float64)
 
