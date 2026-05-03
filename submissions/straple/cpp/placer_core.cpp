@@ -257,6 +257,26 @@ void legalize(PlacerState& state)
     }
 }
 
+struct SAStats
+{
+    int numIters = 0;
+    int numAccepted = 0;
+    int numRejected = 0;
+    int numAcceptedBoltzmann = 0;
+    int numRejectedOverlap = 0;
+    int numSwap = 0;
+    int numShift = 0;
+    int numTowardNeighbor = 0;
+    int bestStep = 0;
+    double initialCost = 0.0;
+    double bestCost = 0.0;
+    double finalCost = 0.0;
+    std::vector<double> trajectoryWL;
+    std::vector<int> trajectorySteps;
+};
+
+py::dict simulatedAnnealingRefineWithStats(PlacerState& state, int numIters, int snapshotEvery);
+
 void simulatedAnnealingRefine(PlacerState& state, int numIters)
 {
     if (numIters <= 0 || state.edgeA.empty())
@@ -447,6 +467,265 @@ void simulatedAnnealingRefine(PlacerState& state, int numIters)
 
     state.posX = bestPosX;
     state.posY = bestPosY;
+}
+
+py::dict simulatedAnnealingRefineWithStats(PlacerState& state, int numIters, int snapshotEvery)
+{
+    py::dict result;
+    if (numIters <= 0 || state.edgeA.empty())
+    {
+        result["skipped"] = true;
+        result["reason"] = state.edgeA.empty() ? "no_edges" : "no_iters";
+        return result;
+    }
+
+    std::vector<int> movableIndices;
+    movableIndices.reserve(state.numHardMacros);
+    for (int i = 0; i < state.numHardMacros; ++i)
+    {
+        if (state.movable[i])
+        {
+            movableIndices.push_back(i);
+        }
+    }
+    if (movableIndices.empty())
+    {
+        result["skipped"] = true;
+        result["reason"] = "no_movable";
+        return result;
+    }
+
+    std::vector<double> bestPosX = state.posX;
+    std::vector<double> bestPosY = state.posY;
+    double currentCost = computeWirelength(state);
+    double bestCost = currentCost;
+    const double initialCost = currentCost;
+
+    const double maxCanvas = std::max(state.canvasWidth, state.canvasHeight);
+    const double tStart = maxCanvas * 0.15;
+    const double tEnd = maxCanvas * 0.001;
+
+    std::uniform_real_distribution<double> uniform01(0.0, 1.0);
+    std::normal_distribution<double> standardNormal(0.0, 1.0);
+
+    int numAccepted = 0;
+    int numRejected = 0;
+    int numAcceptedBoltzmann = 0;
+    int numRejectedOverlap = 0;
+    int numSwap = 0;
+    int numShift = 0;
+    int numTowardNeighbor = 0;
+    int bestStep = 0;
+    std::vector<double> trajWL;
+    std::vector<int> trajSteps;
+    std::vector<double> trajTemp;
+
+    for (int step = 0; step < numIters; ++step)
+    {
+        const double frac = static_cast<double>(step) / numIters;
+        const double temperature = tStart * std::pow(tEnd / tStart, frac);
+
+        const int chosen = movableIndices[std::uniform_int_distribution<int>(
+            0, static_cast<int>(movableIndices.size()) - 1)(state.rng)];
+        const double oldX = state.posX[chosen];
+        const double oldY = state.posY[chosen];
+
+        const double moveType = uniform01(state.rng);
+        bool isSwap = false;
+        int swapPartner = -1;
+        double oldPartnerX = 0.0;
+        double oldPartnerY = 0.0;
+
+        if (moveType < 0.5)
+        {
+            ++numShift;
+            const double shift = temperature * (0.3 + 0.7 * (1.0 - frac));
+            state.posX[chosen] = clampDouble(
+                oldX + standardNormal(state.rng) * shift,
+                state.halfWidth[chosen],
+                state.canvasWidth - state.halfWidth[chosen]);
+            state.posY[chosen] = clampDouble(
+                oldY + standardNormal(state.rng) * shift,
+                state.halfHeight[chosen],
+                state.canvasHeight - state.halfHeight[chosen]);
+        }
+        else if (moveType < 0.8)
+        {
+            ++numSwap;
+            const auto& neighborList = state.adjacencyIndex[chosen];
+            int partner = -1;
+            if (!neighborList.empty() && uniform01(state.rng) < 0.7)
+            {
+                std::vector<int> movableNeighbors;
+                movableNeighbors.reserve(neighborList.size());
+                for (int n : neighborList)
+                {
+                    if (state.movable[n])
+                    {
+                        movableNeighbors.push_back(n);
+                    }
+                }
+                if (!movableNeighbors.empty())
+                {
+                    partner = movableNeighbors[std::uniform_int_distribution<int>(
+                        0, static_cast<int>(movableNeighbors.size()) - 1)(state.rng)];
+                }
+            }
+            if (partner < 0)
+            {
+                partner = movableIndices[std::uniform_int_distribution<int>(
+                    0, static_cast<int>(movableIndices.size()) - 1)(state.rng)];
+            }
+            if (partner == chosen)
+            {
+                continue;
+            }
+            isSwap = true;
+            swapPartner = partner;
+            oldPartnerX = state.posX[partner];
+            oldPartnerY = state.posY[partner];
+            state.posX[chosen] = clampDouble(
+                oldPartnerX,
+                state.halfWidth[chosen],
+                state.canvasWidth - state.halfWidth[chosen]);
+            state.posY[chosen] = clampDouble(
+                oldPartnerY,
+                state.halfHeight[chosen],
+                state.canvasHeight - state.halfHeight[chosen]);
+            state.posX[partner] = clampDouble(
+                oldX,
+                state.halfWidth[partner],
+                state.canvasWidth - state.halfWidth[partner]);
+            state.posY[partner] = clampDouble(
+                oldY,
+                state.halfHeight[partner],
+                state.canvasHeight - state.halfHeight[partner]);
+            if (checkSingleOverlap(state, chosen) || checkSingleOverlap(state, partner))
+            {
+                state.posX[chosen] = oldX;
+                state.posY[chosen] = oldY;
+                state.posX[partner] = oldPartnerX;
+                state.posY[partner] = oldPartnerY;
+                ++numRejectedOverlap;
+                ++numRejected;
+                continue;
+            }
+        }
+        else
+        {
+            ++numTowardNeighbor;
+            const auto& neighborList = state.adjacencyIndex[chosen];
+            if (!neighborList.empty())
+            {
+                int partner = neighborList[std::uniform_int_distribution<int>(
+                    0, static_cast<int>(neighborList.size()) - 1)(state.rng)];
+                const double alpha = 0.1 + 0.4 * uniform01(state.rng);
+                state.posX[chosen] = clampDouble(
+                    oldX + alpha * (state.posX[partner] - oldX),
+                    state.halfWidth[chosen],
+                    state.canvasWidth - state.halfWidth[chosen]);
+                state.posY[chosen] = clampDouble(
+                    oldY + alpha * (state.posY[partner] - oldY),
+                    state.halfHeight[chosen],
+                    state.canvasHeight - state.halfHeight[chosen]);
+            }
+        }
+
+        if (!isSwap)
+        {
+            if (checkSingleOverlap(state, chosen))
+            {
+                state.posX[chosen] = oldX;
+                state.posY[chosen] = oldY;
+                ++numRejectedOverlap;
+                ++numRejected;
+                continue;
+            }
+        }
+
+        const double newCost = computeWirelength(state);
+        const double delta = newCost - currentCost;
+        bool accept = false;
+        bool boltzmann = false;
+        if (delta < 0.0)
+        {
+            accept = true;
+        }
+        else
+        {
+            const double probability = std::exp(-delta / std::max(temperature, 1e-12));
+            accept = uniform01(state.rng) < probability;
+            if (accept)
+            {
+                boltzmann = true;
+            }
+        }
+        if (accept)
+        {
+            ++numAccepted;
+            if (boltzmann)
+            {
+                ++numAcceptedBoltzmann;
+            }
+            currentCost = newCost;
+            if (currentCost < bestCost)
+            {
+                bestCost = currentCost;
+                bestPosX = state.posX;
+                bestPosY = state.posY;
+                bestStep = step;
+            }
+        }
+        else
+        {
+            ++numRejected;
+            if (isSwap)
+            {
+                state.posX[chosen] = oldX;
+                state.posY[chosen] = oldY;
+                state.posX[swapPartner] = oldPartnerX;
+                state.posY[swapPartner] = oldPartnerY;
+            }
+            else
+            {
+                state.posX[chosen] = oldX;
+                state.posY[chosen] = oldY;
+            }
+        }
+
+        if (snapshotEvery > 0 && (step % snapshotEvery == 0 || step == numIters - 1))
+        {
+            trajSteps.push_back(step);
+            trajWL.push_back(currentCost);
+            trajTemp.push_back(temperature);
+        }
+    }
+
+    state.posX = bestPosX;
+    state.posY = bestPosY;
+
+    result["skipped"] = false;
+    result["num_iters"] = numIters;
+    result["num_accepted"] = numAccepted;
+    result["num_rejected"] = numRejected;
+    result["num_accepted_boltzmann"] = numAcceptedBoltzmann;
+    result["num_rejected_overlap"] = numRejectedOverlap;
+    result["num_shift"] = numShift;
+    result["num_swap"] = numSwap;
+    result["num_toward_neighbor"] = numTowardNeighbor;
+    result["best_step"] = bestStep;
+    result["initial_wl"] = initialCost;
+    result["best_wl"] = bestCost;
+    result["final_wl"] = currentCost;
+    result["t_start"] = tStart;
+    result["t_end"] = tEnd;
+    if (snapshotEvery > 0)
+    {
+        result["trajectory_steps"] = trajSteps;
+        result["trajectory_wl"] = trajWL;
+        result["trajectory_temp"] = trajTemp;
+    }
+    return result;
 }
 
 bool repairMacro(PlacerState& state, int macroIndex)
@@ -900,6 +1179,8 @@ PYBIND11_MODULE(_placer_core, m)
              py::arg("canvas_width"), py::arg("canvas_height"), py::arg("seed"))
         .def("legalize", &legalize)
         .def("sa_refine", &simulatedAnnealingRefine, py::arg("num_iters"))
+        .def("sa_refine_with_stats", &simulatedAnnealingRefineWithStats,
+             py::arg("num_iters"), py::arg("snapshot_every") = 0)
         .def("destroy_and_repair", &destroyAndRepair, py::arg("destroy_size"))
         .def("destroy_congested_and_repair", &destroyCongestedAndRepair,
              py::arg("hot_cells_xyw"), py::arg("grid_rows"), py::arg("grid_cols"),

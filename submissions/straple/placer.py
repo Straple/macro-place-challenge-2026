@@ -285,14 +285,45 @@ class StraplePlacer:
             t_legalize = time.time() - t0
             cost_after_legal = evaluator.evaluate(state.current_positions()) if evaluator else 0.0
 
+            sa_iters_to_run = self.refine_iters if num_movable < 300 else 0
             t0 = time.time()
-            state.sa_refine(self.refine_iters)
+            if self.verbose and sa_iters_to_run > 0:
+                snap = max(1, sa_iters_to_run // 10)
+                sa_stats = state.sa_refine_with_stats(sa_iters_to_run, snap)
+            elif sa_iters_to_run > 0:
+                state.sa_refine(sa_iters_to_run)
+                sa_stats = None
+            else:
+                sa_stats = None
             t_sa = time.time() - t0
             cost_after_sa = evaluator.evaluate(state.current_positions()) if evaluator else 0.0
 
             self._log(f"[{bench_label}] start#{start_idx} seed={seed}: "
-                      f"legalize={t_legalize:.2f}s cost={cost_after_legal:.4f} | "
-                      f"sa_refine({self.refine_iters})={t_sa:.2f}s cost={cost_after_sa:.4f}")
+                      f"legalize={t_legalize:.2f}s proxy={cost_after_legal:.4f} | "
+                      f"sa_refine({sa_iters_to_run})={t_sa*1000:.1f}ms proxy={cost_after_sa:.4f} "
+                      f"(delta {cost_after_sa-cost_after_legal:+.4f})")
+            if sa_stats and not sa_stats.get("skipped", True):
+                acc = sa_stats["num_accepted"]
+                rej = sa_stats["num_rejected"]
+                bolt = sa_stats["num_accepted_boltzmann"]
+                rej_ovr = sa_stats["num_rejected_overlap"]
+                ni = sa_stats["num_iters"]
+                self._log(f"[{bench_label}] start#{start_idx} SA stats: "
+                          f"iters={ni} acc={acc} ({acc*100//ni}%) "
+                          f"acc_boltzmann={bolt} ({bolt*100//max(acc,1)}% of acc) "
+                          f"rej={rej} (rej_overlap={rej_ovr}) "
+                          f"shift={sa_stats['num_shift']} swap={sa_stats['num_swap']} "
+                          f"toward={sa_stats['num_toward_neighbor']} "
+                          f"WL: init={sa_stats['initial_wl']:.4f} -> "
+                          f"best@step{sa_stats['best_step']}={sa_stats['best_wl']:.4f} "
+                          f"final={sa_stats['final_wl']:.4f} "
+                          f"T: {sa_stats['t_start']:.2f}->{sa_stats['t_end']:.4f}")
+                if "trajectory_steps" in sa_stats:
+                    traj_s = sa_stats["trajectory_steps"]
+                    traj_w = sa_stats["trajectory_wl"]
+                    snapshots_str = " ".join(
+                        f"step{s}={w:.4f}" for s, w in zip(traj_s, traj_w))
+                    self._log(f"[{bench_label}] start#{start_idx} SA trajectory: {snapshots_str}")
 
             if evaluator is not None:
                 t0 = time.time()

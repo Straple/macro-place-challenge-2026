@@ -8,7 +8,7 @@
 
 | | Значение |
 |---|---|
-| **AVG4 proxy** (ibm01/10/14/17) | **1.4619** ⭐ #16 |
+| **AVG4 proxy** (ibm01/10/14/17) | **1.4544** ⭐ #17 |
 | AVG17 proxy (--all) | 1.5181 (#4, перезамерить) |
 | Placer | `submissions/straple/placer.py` (C++ + adaptive LNS + чередование congested/random) |
 | Дата замера | 2026-05-03 |
@@ -28,6 +28,48 @@
 ---
 
 ## 📂 Журнал прогонов
+
+### #17 · 2026-05-04 · skip SA для больших дизайнов + детальные SA stats — НОВЫЙ BEST 🚀
+
+**Что нашли через SA-логирование** (новый `sa_refine_with_stats` в C++ возвращает accept/reject/boltzmann counts + WL trajectory):
+
+На **ibm17** (n_movable=760):
+- 3000 SA-итераций, **80% rejection — overlap** (`rej_overlap=2006/2496`). SA aggressive shift (`tStart=0.15·canvas`=10.9) сдвигает макросы в занятые места.
+- WL улучшается на **~5.7%** (20074→18935), но **proxy ухудшается на +0.4%** (1.7432→1.7498) — SA tightly clustered макросы → density/cong растут.
+- Аналогично на всех 5 starts. **SA активно ухудшает proxy на больших.**
+
+На **ibm01** (n_movable=246):
+- SA полезна (~~+1.4%~~ если выключить → регрессия). Меньше макросов = меньше overlap conflicts, WL gain не компенсируется density loss.
+
+**Решение** (одна строка): запускать SA только для `num_movable < 300`. Для больших — skip.
+
+**Изменения**:
+- `submissions/straple/cpp/placer_core.cpp`: добавлен `simulatedAnnealingRefineWithStats(num_iters, snapshot_every)` → возвращает `py::dict` с counts (accepted/rejected/boltzmann/overlap) и WL trajectory. Поведение идентично оригинальному `sa_refine` (одинаковый seed = одинаковый результат) — это важно, тест предотвратит регресс если кто-то их разойдёт.
+- `submissions/straple/placer.py`: `sa_iters_to_run = self.refine_iters if num_movable < 300 else 0`. Verbose использует `sa_refine_with_stats` для трассировки.
+
+**Сводка** (медиана 3 запусков, детерминизм):
+
+| Bench | Proxy | vs #16 (1.4619) | vs Straple #4 baseline | SA |
+|---|---|---|---|---|
+| ibm01 | 1.1282 | 0.00% | -4.23% | 3000 iter |
+| ibm10 | **1.3647** | **-0.86%** ⭐ | **-1.41%** ⭐ | skip |
+| ibm14 | **1.5855** | **-1.06%** ⭐ | **-2.61%** ⭐ | skip |
+| ibm17 | **1.7392** | **-0.07%** | -0.34% | skip |
+| **AVG4** | **1.4544** ⭐ | **-0.51%** | **-1.99%** ⭐ | wall ~108s |
+
+- vs RePlAce (на 4 бенчах AVG=1.4197): **+2.45%** (раньше +2.98%, теперь ближе на пол-процента)
+- vs прошлый best (#16: 1.4619): **-0.51%** ▼
+- vs Straple #4 baseline (1.4839): **-1.99%** ▼ — впервые превышаем -2%
+- Smoke 10/10, 0 overlaps
+
+**Главный урок**:
+- **SA optimize HPWL only**, на больших это **деструктивно** для density+cong.
+- Логирование с stats показало истинную картину: 80% wasted iterations + WL/proxy disconnect.
+- "Один параметр = один эффект" — иногда правильнее **отключить** что-то чем тюнить.
+
+**Команда**: `STRAPLE_VERBOSE=1 uv run python -c "..."` для SA stats (counts + trajectory). 
+
+---
 
 ### #16 · 2026-05-04 · 🚨 BUG FIX: ProxyEvaluator.evaluate() веса 1:1:1 → 1:0.5:0.5 + логирование
 
