@@ -8,7 +8,7 @@
 
 | | Значение |
 |---|---|
-| **AVG4 proxy** (ibm01/10/14/17) | **1.4707** ⭐ #8 |
+| **AVG4 proxy** (ibm01/10/14/17) | **1.4688** ⭐ #11 |
 | AVG17 proxy (--all) | 1.5181 (#4, перезамерить) |
 | Placer | `submissions/straple/placer.py` (C++ + adaptive LNS + чередование congested/random) |
 | Дата замера | 2026-05-03 |
@@ -28,6 +28,61 @@
 ---
 
 ## 📂 Журнал прогонов
+
+### #11 · 2026-05-03 · `submissions/straple/placer.py` (multi-start N=3 для больших) — НОВЫЙ BEST 🏆
+
+**Идея**: для больших дизайнов (`num_movable >= 300`) запустить 3 независимых старта с разными seed (42/43/44) полным циклом legalize→SA→LNS, выбрать минимальный по proxy_cost. Маленькие (ibm01) — один старт, как раньше (overhead не оправдан).
+
+**Источник**: ALNS / SA literature — multi-start как стандарт diversification. На больших дизайнах разные seed → разные attractor'ы.
+
+**Изменения**:
+- `submissions/straple/placer.py` `StraplePlacer.place()`: цикл по `num_starts = 3 if num_movable >= 300 else 1`. `_build_proxy_evaluator` строится один раз и переиспользуется. Best по trial_cost.
+
+**Сводка** (медиана 3 запусков, 3/3 идентичны):
+
+| Bench | Proxy | vs #8 (1.4707) | vs Straple #4 baseline | starts |
+|---|---|---|---|---|
+| ibm01 | 1.1411 | 0.00% | -3.14% ⭐ | 1 (skip multi-start) |
+| ibm10 | **1.3828** | **-0.53%** | -0.11% ⭐ | 3 (best of 3) |
+| ibm14 | 1.6092 | 0.00% | -1.15% ⭐ | 3 (1st seed = best) |
+| ibm17 | 1.7422 | 0.00% | -0.17% | 3 (1st seed = best) |
+| **AVG4** | **1.4688** ⭐ | **-0.13%** | **-1.02%** ⭐ | wall ~88-96s |
+
+- vs RePlAce (на 4 бенчах AVG=1.4197): **+3.46%** (хуже, продолжаем приближаться)
+- vs прошлый best AVG4 (#8: 1.4707): **-0.13%** ▼ (новый best)
+- vs Straple #4 baseline (1.4839): **-1.02%** ▼ — впервые превышаем -1%
+- Overlaps: 0, Smoke 9/9
+
+**Что сработало**:
+- ibm10 (387 макросов) — впервые улучшение, **теперь меньше baseline**: 1.3828 vs RePlAce 1.4928 (-7.4% от RePlAce!) — обходим RePlAce на этом бенче.
+- Реализация чистая: один общий evaluator, минимальный overhead.
+- Время растёт пропорционально (ibm10/14/17 ×3). На fast_check всё ещё <100с total wall (parallel).
+
+**Что не сработало**:
+- ibm14 и ibm17: первый seed оказался best (или все 3 сходятся в одну точку). Multi-start не дал diversification. Гипотеза: на ibm14/17 локальный минимум очень глубокий (basin of attraction большой), все 3 seeds валятся в него.
+
+**Главный урок**:
+- Multi-start работает на ibm10, но не на ibm14/17. На очень больших дизайнах одного multi-start недостаточно — нужно больше N или structurally разные initial configurations (например, force-directed + grid-based).
+- Размер basin of attraction зависит от netlist — на ibm10 он маленький, easy to escape.
+
+**Следующие шаги**:
+- Cycle #8: попробовать N=5 или больше (runtime budget огромный).
+- Или: structurally разные seeds — random scatter vs grid vs centroid-based initial.
+- Или: best result оставить + ещё короткий run проксированный с heavy LNS.
+
+**Команда**: `$HOME/.local/bin/uv run python scripts/fast_check.py`
+
+---
+
+### #10 · 2026-05-03 · попытка: wider congested_percent 5%→10% — НЕЙТРАЛ, откатили
+
+**Идея**: расширить top-N% hot-cells с 5% до 10%, дать destroy-оператору больше таргетов.
+
+**Результат**: AVG4 1.4712 (vs #8 1.4707, +0.03% — нейтрал, в шуме). ibm01-17 без значимых изменений.
+
+**Урок**: ширина hot-cells не bottleneck — даже с 10% top хватает destroy-таргетов. Реальный bottleneck в чём-то другом (структурном). Откатили.
+
+---
 
 ### #9 · 2026-05-03 · попытка: tighter threshold (P30 вместо median) — РЕГРЕССИЯ, откатили
 

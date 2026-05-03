@@ -240,23 +240,42 @@ class StraplePlacer:
         canvas_w = float(benchmark.canvas_width)
         canvas_h = float(benchmark.canvas_height)
 
-        state = _placer_core.PlacerState()
-        state.initialize(
-            initial_pos, sizes, movable_mask,
-            edges, edge_weights,
-            canvas_w, canvas_h, int(self.seed),
-        )
+        num_starts = 3 if num_movable >= 300 else 1
 
-        state.legalize()
-        state.sa_refine(self.refine_iters)
-
+        evaluator = None
         if plc is not None and self.lns_outer_iters > 0:
             evaluator = _build_proxy_evaluator(benchmark, plc)
-            self._lns_loop(state, evaluator, plc, num_movable)
 
-        final_pos = state.current_positions()
+        best_pos = None
+        best_cost = float("inf")
+
+        for start_idx in range(num_starts):
+            seed = self.seed + start_idx
+            state = _placer_core.PlacerState()
+            state.initialize(
+                initial_pos, sizes, movable_mask,
+                edges, edge_weights,
+                canvas_w, canvas_h, int(seed),
+            )
+
+            state.legalize()
+            state.sa_refine(self.refine_iters)
+
+            if evaluator is not None:
+                self._lns_loop(state, evaluator, plc, num_movable)
+
+            trial_pos = state.current_positions()
+            if evaluator is not None:
+                trial_cost = evaluator.evaluate(trial_pos)
+            else:
+                trial_cost = 0.0 if num_starts == 1 else float(start_idx)
+
+            if trial_cost < best_cost:
+                best_cost = trial_cost
+                best_pos = trial_pos
+
         full = benchmark.macro_positions.clone()
-        full[:n_hard] = torch.tensor(final_pos, dtype=torch.float32)
+        full[:n_hard] = torch.tensor(best_pos, dtype=torch.float32)
         return full
 
     def _lns_loop(self, state, evaluator, plc, num_movable):
