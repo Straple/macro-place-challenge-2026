@@ -8,10 +8,11 @@
 
 | | Значение |
 |---|---|
-| **AVG proxy cost** | **1.5181** |
-| Placer | `submissions/straple/placer.py` (pure C++ core+proxy_cost via pybind11) |
+| **AVG4 proxy** (ibm01/10/14/17) | **1.4795** ⭐ #7 |
+| AVG17 proxy (--all) | 1.5181 (#4, перезамерить) |
+| Placer | `submissions/straple/placer.py` (C++ + adaptive LNS + чередование congested/random) |
 | Дата замера | 2026-05-03 |
-| Total runtime | **16.19s** на 17 IBM benchmarks |
+| Wall time (fast_check) | ~90-115с на 4 бенчах parallel |
 | Hardware | Mac ARM (aarch64-apple-darwin), Python 3.14.4, torch 2.10.0 |
 
 **Гэп до целей:**
@@ -27,6 +28,55 @@
 ---
 
 ## 📂 Журнал прогонов
+
+### #7 · 2026-05-03 · `submissions/straple/placer.py` (adaptive LNS + чередование) — НОВЫЙ BEST 🏆
+
+**Идея**: Минимальный фикс к #6. Вернуть чередование random/congested (exploration важна, особенно для ibm01), но СОХРАНИТЬ adaptive_destroy и adaptive_outer от #6.
+
+**Источник**: прямой вывод из cycle #6 (где удаление чередования дало +2.5% регрессии на ibm01).
+
+**Изменения**:
+- `submissions/straple/placer.py` `_lns_loop`: восстановлено `if iteration % 2 == 1:` для congested branch, на чётных — random destroy. `adaptive_destroy=clamp(8, ceil(0.025·N), 16)` и `adaptive_outer=clamp(30, ceil(0.10·N), 60)` остались от #6.
+
+**Сводка** (медиана 3 запусков, 3/3 идентичны — детерминизм):
+
+| Bench | Proxy | vs #5 (1.4822) | vs Straple #4 baseline | params (k, outer) |
+|---|---|---|---|---|
+| ibm01 | **1.1633** | **-0.37%** | -1.26% ⭐ | k=8, outer=30 |
+| ibm10 | 1.3902 | +0.09% | +0.43% | k=10, outer=39 |
+| ibm14 | **1.6207** | **-0.45%** ⭐ | -0.45% ⭐ | k=12, outer=46 |
+| ibm17 | 1.7437 | -0.03% | -0.08% | k=13, outer=52 |
+| **AVG4** | **1.4795** | **-0.18%** | **-0.30%** ⭐ | wall=88-115s |
+
+- vs RePlAce (на 4 бенчах AVG=1.4197): **+4.21%** (хуже, но ближе всех)
+- vs прошлый best AVG4 (#5: 1.4822): **-0.18%** ▼ (новый best)
+- vs Straple #4 baseline (AVG4=1.4839): **-0.30%** ▼ (превосходит исходный)
+- Overlaps: 0
+- Smoke 9/9 PASS, build OK без warnings
+
+**Что сработало**:
+- Чередование сохранило exploration на маленьких (ibm01: 1.1676 → 1.1633, ещё -0.37%).
+- Adaptive params на больших дали реальный эффект **впервые на ibm14** (-0.45%): congestion 2.150 → 2.140. Большее число итераций (46 vs 30) позволяет глубже разрабатывать area.
+- ibm17 нейтрал (-0.03%) — adaptive params не повредили, но и не помогли. Возможно нужен ещё больший budget, или проблема не в количестве итераций.
+- Время растёт умеренно: ibm17 2.64s vs 2.59s в #5 (+1.9%) — wall ~88-115с (variability fork).
+
+**Что не сработало**:
+- ibm10 +0.09% (микро-регрессия, в шуме). Гипотеза: для ibm10 (387 макросов, k=10) лимит 0.025 даёт мало преимущества, а 0.10 outer = 39 уже близко к минимуму 30. Возможно стоит выше lower bound для outer.
+- На ibm17 эффект минимальный — возможно нужен другой подход (repair-aware-of-hot, multi-start).
+
+**Главный урок**:
+- Чередование + adaptive — комбинация работает.
+- Adaptive params **сами по себе** дают эффект ТОЛЬКО при сохранении exploration (random destroy).
+- Подтверждена ALNS-литература: domain-aware operators хорошо работают в комбинации с random для diversification.
+
+**Следующие шаги**:
+- Cycle #4: попробовать **repair-aware-of-hot** — в spiral search избегать high-cong cells (адресует ibm17).
+- Или: multi-start с 3-5 разных seed'ов на больших.
+- Или: tune adaptive lower bounds (выше floor для outer на средних).
+
+**Команда**: `$HOME/.local/bin/uv run python scripts/fast_check.py`
+
+---
 
 ### #6 · 2026-05-03 · `submissions/straple/placer.py` (adaptive LNS, без чередования) — РЕГРЕССИЯ
 

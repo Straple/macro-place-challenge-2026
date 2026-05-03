@@ -272,12 +272,15 @@ class StraplePlacer:
 
         for iteration in range(adaptive_outer):
             saved = state.current_positions()
-            evaluator.evaluate(saved)
-            hot_cells = evaluator.get_top_congested_cells(congested_percent)
-            if hot_cells.shape[0] > 0:
-                trial = state.destroy_congested_and_repair(
-                    hot_cells, grid_rows, grid_cols, adaptive_destroy
-                )
+            if iteration % 2 == 1:
+                evaluator.evaluate(saved)
+                hot_cells = evaluator.get_top_congested_cells(congested_percent)
+                if hot_cells.shape[0] > 0:
+                    trial = state.destroy_congested_and_repair(
+                        hot_cells, grid_rows, grid_cols, adaptive_destroy
+                    )
+                else:
+                    trial = state.destroy_and_repair(adaptive_destroy)
             else:
                 trial = state.destroy_and_repair(adaptive_destroy)
             new_cost = evaluator.evaluate(trial)
