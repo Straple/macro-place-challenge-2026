@@ -636,23 +636,32 @@ py::array_t<double> destroyCongestedAndRepair(
         overlapScore[mIdx] = score;
     }
 
-    std::vector<int> sortedMovable = movableIndices;
-    std::sort(sortedMovable.begin(), sortedMovable.end(), [&overlapScore](int a, int b) {
-        return overlapScore[a] > overlapScore[b];
-    });
-
-    std::vector<int> destroyed;
-    destroyed.reserve(k);
-    for (int idx : sortedMovable)
+    std::vector<int> candidateMovable;
+    candidateMovable.reserve(movableIndices.size());
+    for (int idx : movableIndices)
     {
         if (overlapScore[idx] > 0.0)
         {
-            destroyed.push_back(idx);
-            if (static_cast<int>(destroyed.size()) >= k)
-            {
-                break;
-            }
+            candidateMovable.push_back(idx);
         }
+    }
+
+    std::vector<int> destroyed;
+    destroyed.reserve(k);
+    if (static_cast<int>(candidateMovable.size()) <= k)
+    {
+        destroyed = candidateMovable;
+    }
+    else
+    {
+        std::nth_element(
+            candidateMovable.begin(),
+            candidateMovable.begin() + k,
+            candidateMovable.end(),
+            [&overlapScore](int a, int b) {
+                return overlapScore[a] > overlapScore[b];
+            });
+        destroyed.assign(candidateMovable.begin(), candidateMovable.begin() + k);
     }
 
     if (destroyed.empty())

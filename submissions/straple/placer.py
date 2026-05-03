@@ -14,6 +14,7 @@ Build the native module once (or after editing the C++ source):
     submissions/straple/cpp/build.sh
 """
 
+import math
 import os
 import sys
 from pathlib import Path
@@ -235,6 +236,7 @@ class StraplePlacer:
         initial_pos = benchmark.macro_positions[:n_hard].numpy().astype(np.float64).copy()
         sizes = benchmark.macro_sizes[:n_hard].numpy().astype(np.float64)
         movable_mask = benchmark.get_movable_mask()[:n_hard].numpy().astype(np.bool_)
+        num_movable = int(movable_mask.sum())
         canvas_w = float(benchmark.canvas_width)
         canvas_h = float(benchmark.canvas_height)
 
@@ -250,14 +252,14 @@ class StraplePlacer:
 
         if plc is not None and self.lns_outer_iters > 0:
             evaluator = _build_proxy_evaluator(benchmark, plc)
-            self._lns_loop(state, evaluator, plc)
+            self._lns_loop(state, evaluator, plc, num_movable)
 
         final_pos = state.current_positions()
         full = benchmark.macro_positions.clone()
         full[:n_hard] = torch.tensor(final_pos, dtype=torch.float32)
         return full
 
-    def _lns_loop(self, state, evaluator, plc):
+    def _lns_loop(self, state, evaluator, plc, num_movable):
         best_pos = state.current_positions()
         best_cost = evaluator.evaluate(best_pos)
 
@@ -265,19 +267,19 @@ class StraplePlacer:
         grid_cols = int(plc.grid_col)
         congested_percent = 0.05
 
-        for iteration in range(self.lns_outer_iters):
+        adaptive_destroy = max(self.lns_destroy_size, min(16, math.ceil(0.025 * num_movable)))
+        adaptive_outer = max(self.lns_outer_iters, min(60, math.ceil(0.10 * num_movable)))
+
+        for iteration in range(adaptive_outer):
             saved = state.current_positions()
-            if iteration % 2 == 1:
-                evaluator.evaluate(saved)
-                hot_cells = evaluator.get_top_congested_cells(congested_percent)
-                if hot_cells.shape[0] > 0:
-                    trial = state.destroy_congested_and_repair(
-                        hot_cells, grid_rows, grid_cols, self.lns_destroy_size
-                    )
-                else:
-                    trial = state.destroy_and_repair(self.lns_destroy_size)
+            evaluator.evaluate(saved)
+            hot_cells = evaluator.get_top_congested_cells(congested_percent)
+            if hot_cells.shape[0] > 0:
+                trial = state.destroy_congested_and_repair(
+                    hot_cells, grid_rows, grid_cols, adaptive_destroy
+                )
             else:
-                trial = state.destroy_and_repair(self.lns_destroy_size)
+                trial = state.destroy_and_repair(adaptive_destroy)
             new_cost = evaluator.evaluate(trial)
             if new_cost < best_cost:
                 best_cost = new_cost

@@ -28,6 +28,46 @@
 
 ## 📂 Журнал прогонов
 
+### #6 · 2026-05-03 · `submissions/straple/placer.py` (adaptive LNS, без чередования) — РЕГРЕССИЯ
+
+**Идея**: На больших дизайнах дать LNS реальную мощность по разгрузке congestion: (1) убрать чередование random/congested — всегда congested (random — fallback в C++ при пустом overlap); (2) `adaptive_destroy = clamp(8, ceil(0.025·N), 16)`; (3) `adaptive_outer = clamp(30, ceil(0.10·N), 60)`. Бонус: `nth_element` вместо `sort` в C++ для top-k.
+
+**Источник**: собственная гипотеза + 2 из 3 follow-up'ов из #5.
+
+**Результаты** (1 fast_check):
+
+| Bench | Proxy | vs #5 (1.4822 baseline) | params (k, outer) |
+|---|---|---|---|
+| ibm01 | 1.1964 | **+2.47%** ⬆ ❌ | k=8, outer=30 |
+| ibm10 | 1.3940 | +0.36% | k=10, outer=39 |
+| ibm14 | 1.6286 | +0.03% | k=12, outer=46 |
+| ibm17 | 1.7441 | -0.01% | k=13, outer=52 |
+| **AVG4** | **1.4908** | **+0.58%** | — |
+
+- vs Straple #4 baseline (AVG4=1.4839): **+0.46%** (хуже)
+- vs RePlAce: +5.01% (хуже)
+
+**Что сработало**:
+- Реализация технически корректная, build OK, smoke 9/9, 0 overlaps.
+- Даже на ibm17 60×13 итераций успевают за 2.82с (раньше было 30×8 за 2.59с) — масштабирование adekvatное.
+
+**Что не сработало**:
+- **ibm01: -0.89% улучшение #5 → +2.47% регрессия** (= откат на хуже-чем-baseline). Параметры на ibm01 не изменились (k=8, outer=30 — те же), значит **виновник — удаление чередования**. Random destroy служил exploration; congested-only застрял в локальном.
+- На ibm10/14/17 increased k/outer **не помог** — гипотеза «больше work на больших → лучше» опровергнута. Скорее всего: (а) при k=12-13 разрушается слишком много макросов одновременно, repair (centroid+spiral) не успевает качественно переразместить; (б) congested-only без exploration легко зацикливается на одних и тех же hot-cells.
+
+**Главный урок**:
+- **Чередование random/congested оказалось важной диверсификацией** — нельзя убирать.
+- Adaptive params БЕЗ exploration не дают эффекта.
+- На больших нужны другие подходы — может быть multi-start или repair-aware-of-hot, не наращивание выборки.
+
+**Следующие шаги**:
+- Cycle #3: вернуть чередование, попробовать только adaptive params (k и outer).
+- Альтернатива: repair-aware-of-hot (в spiral search избегать high-cong cells).
+
+**Команда**: `$HOME/.local/bin/uv run python scripts/fast_check.py`
+
+---
+
 ### #5 · 2026-05-03 · `submissions/straple/placer.py` (congestion-aware destroy в LNS)
 
 **Идея**: чередовать в LNS-петле два destroy-оператора — старый random и новый **congestion-aware**: выбирать k макросов, которые перекрывают top-5% самых перегруженных congestion-ячеек (взвешено по площади перекрытия и ценности ячейки).
