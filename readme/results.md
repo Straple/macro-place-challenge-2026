@@ -8,7 +8,7 @@
 
 | | Значение |
 |---|---|
-| **AVG4 proxy** (ibm01/10/14/17) | **1.4108** ⭐⭐⭐ #20 (**пробили RePlAce -0.63%!**) |
+| **AVG4 proxy** (ibm01/10/14/17) | **1.4055** ⭐⭐⭐ #21 (**vs RePlAce -1.00%, ниже Top-10!**) |
 | AVG17 proxy (--all) | 1.5181 (#4, перезамерить) |
 | Placer | `submissions/straple/placer.py` (C++ + adaptive LNS + чередование congested/random) |
 | Дата замера | 2026-05-03 |
@@ -29,7 +29,40 @@
 
 ## 📂 Журнал прогонов
 
-### #20 · 2026-05-04 · cluster destroy + smart swap + ALNS adaptive weights + LNS 15000 — 🎉 ПРОБИЛИ RePlAce!!!
+### #21 · 2026-05-04 · 3 starts × 25000 LNS iters — 🏆 НИЖЕ TOP-10 LEADERBOARD!
+
+**Изменения**:
+- num_orig_starts: 5 → 3 (меньше parallel starts, больше iterations per start)
+- adaptive_outer: 15000 → 25000, scale 15·N → 25·N
+
+**Идея**: deeper exploration per start вместо более широкого. Выигрыш от ALNS наибольший в long runs (operator weights успевают сойтись).
+
+**Сводка** (детерминизм, 2 запуска идентичны):
+
+| Bench | Proxy | vs #20 (1.4108) | vs Straple #4 baseline | vs RePlAce |
+|---|---|---|---|---|
+| ibm01 | **1.0748** ⭐ | -1.07% | -8.78% ⭐ | +7.7% |
+| ibm10 | **1.2652** ⭐ | -0.47% | -8.59% ⭐ | **-15.2%** ⭐ |
+| ibm14 | **1.5562** ⭐ | -0.15% | -4.41% | +0.8% (parity) |
+| ibm17 | **1.7257** ⭐ | -0.08% | -1.11% | +4.9% |
+| **AVG4** | **1.4055** ⭐⭐⭐ | **-0.38%** | **-5.28%** ⭐ | **-1.00%** ⭐⭐⭐ |
+
+- **vs RePlAce: -1.00%** ⭐ (раньше -0.63%)
+- **vs Top-10 (1.4076): -0.15% ⭐** — мы ниже Top-10 на AVG4!
+- ibm10: **-15.2% от RePlAce**
+- 0 overlaps, smoke 10/10
+- wall 384s
+
+**Прогресс session**:
+- Старт: AVG4=1.4839 (vs RePlAce +3.24%)
+- **Сейчас: AVG4=1.4055 (vs RePlAce -1.00%)**
+- Δ = **-5.28%** за 21 цикл
+
+**Команда**: `uv run python scripts/fast_check.py`
+
+---
+
+### #20 · 2026-05-04 · cluster destroy + smart swap + ALNS adaptive weights + LNS 15000 — best после cycle #20
 
 **Что сделали (5 inc цик)**:
 - **#20a**: `destroyClusterAndRepair(k)` в C++ — BFS из random seed по net-graph, выбирает k связанных макросов, репэйрит. Атакует tightly-coupled clusters.

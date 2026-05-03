@@ -287,7 +287,7 @@ class StraplePlacer:
             self._log(f"[{bench_label}] analytical_seed({self.analytical_steps} steps): "
                       f"{time.time()-t0:.2f}s")
 
-        num_orig_starts = 5 if num_movable >= 300 else 1
+        num_orig_starts = 3 if num_movable >= 300 else 1
         num_starts = num_orig_starts + (1 if analytical_pos is not None else 0)
 
         evaluator = None
@@ -398,7 +398,7 @@ class StraplePlacer:
         congested_percent = 0.05
 
         adaptive_destroy = max(self.lns_destroy_size, min(16, math.ceil(0.025 * num_movable)))
-        adaptive_outer = max(self.lns_outer_iters, min(15000, math.ceil(15.0 * num_movable)))
+        adaptive_outer = max(self.lns_outer_iters, min(25000, math.ceil(25.0 * num_movable)))
 
         accepted = 0
         accepted_random = 0
