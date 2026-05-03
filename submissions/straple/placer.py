@@ -250,20 +250,34 @@ class StraplePlacer:
 
         if plc is not None and self.lns_outer_iters > 0:
             evaluator = _build_proxy_evaluator(benchmark, plc)
-            self._lns_loop(state, evaluator)
+            self._lns_loop(state, evaluator, plc)
 
         final_pos = state.current_positions()
         full = benchmark.macro_positions.clone()
         full[:n_hard] = torch.tensor(final_pos, dtype=torch.float32)
         return full
 
-    def _lns_loop(self, state, evaluator):
+    def _lns_loop(self, state, evaluator, plc):
         best_pos = state.current_positions()
         best_cost = evaluator.evaluate(best_pos)
 
-        for _ in range(self.lns_outer_iters):
+        grid_rows = int(plc.grid_row)
+        grid_cols = int(plc.grid_col)
+        congested_percent = 0.05
+
+        for iteration in range(self.lns_outer_iters):
             saved = state.current_positions()
-            trial = state.destroy_and_repair(self.lns_destroy_size)
+            if iteration % 2 == 1:
+                evaluator.evaluate(saved)
+                hot_cells = evaluator.get_top_congested_cells(congested_percent)
+                if hot_cells.shape[0] > 0:
+                    trial = state.destroy_congested_and_repair(
+                        hot_cells, grid_rows, grid_cols, self.lns_destroy_size
+                    )
+                else:
+                    trial = state.destroy_and_repair(self.lns_destroy_size)
+            else:
+                trial = state.destroy_and_repair(self.lns_destroy_size)
             new_cost = evaluator.evaluate(trial)
             if new_cost < best_cost:
                 best_cost = new_cost

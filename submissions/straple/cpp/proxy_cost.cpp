@@ -52,10 +52,11 @@ struct ProxyEvaluator
     std::vector<double> portPosY;
 
     std::vector<double> gridOccupied;
-    std::vector<double> hRoutingCong;
-    std::vector<double> vRoutingCong;
-    std::vector<double> hMacroCong;
-    std::vector<double> vMacroCong;
+    mutable std::vector<double> cachedHRoutingCong;
+    mutable std::vector<double> cachedVRoutingCong;
+    mutable std::vector<double> cachedHMacroCong;
+    mutable std::vector<double> cachedVMacroCong;
+    mutable bool congestionCacheValid = false;
 
     void initialize(
         int numHardMacrosIn,
@@ -688,6 +689,12 @@ struct ProxyEvaluator
             hRoutingCong[i] += hMacroCong[i];
         }
 
+        cachedVRoutingCong = vRoutingCong;
+        cachedHRoutingCong = hRoutingCong;
+        cachedVMacroCong = vMacroCong;
+        cachedHMacroCong = hMacroCong;
+        congestionCacheValid = true;
+
         std::vector<double> combined;
         combined.reserve(2 * totalCells);
         combined.insert(combined.end(), vRoutingCong.begin(), vRoutingCong.end());
@@ -735,6 +742,63 @@ struct ProxyEvaluator
         const double cong = congestionCost(hardX.data(), hardY.data());
         return py::make_tuple(wl + dens + cong, wl, dens, cong);
     }
+
+    py::array_t<double> getTopCongestedCells(double percent) const
+    {
+        if (!congestionCacheValid)
+        {
+            return py::array_t<double>({0, 3});
+        }
+        const int totalCells = gridCols * gridRows;
+        std::vector<double> combinedPerCell(totalCells, 0.0);
+        for (int i = 0; i < totalCells; ++i)
+        {
+            const double v = cachedVRoutingCong[i];
+            const double h = cachedHRoutingCong[i];
+            combinedPerCell[i] = v + h;
+        }
+
+        std::vector<int> order(totalCells);
+        for (int i = 0; i < totalCells; ++i)
+        {
+            order[i] = i;
+        }
+        std::sort(order.begin(), order.end(), [&combinedPerCell](int a, int b) {
+            return combinedPerCell[a] > combinedPerCell[b];
+        });
+
+        double clampedPercent = percent;
+        if (clampedPercent < 0.0)
+        {
+            clampedPercent = 0.0;
+        }
+        if (clampedPercent > 1.0)
+        {
+            clampedPercent = 1.0;
+        }
+        int cnt = static_cast<int>(std::floor(totalCells * clampedPercent));
+        if (cnt < 1)
+        {
+            cnt = 1;
+        }
+        if (cnt > totalCells)
+        {
+            cnt = totalCells;
+        }
+
+        py::array_t<double> result({cnt, 3});
+        auto buf = result.mutable_unchecked<2>();
+        for (int i = 0; i < cnt; ++i)
+        {
+            const int cellIdx = order[i];
+            const int row = cellIdx / gridCols;
+            const int col = cellIdx % gridCols;
+            buf(i, 0) = static_cast<double>(row);
+            buf(i, 1) = static_cast<double>(col);
+            buf(i, 2) = combinedPerCell[cellIdx];
+        }
+        return result;
+    }
 };
 
 }  // namespace
@@ -757,5 +821,6 @@ PYBIND11_MODULE(_proxy_cost, m)
              py::arg("net_starts"), py::arg("net_weights"),
              py::arg("net_source_slots"))
         .def("evaluate", &ProxyEvaluator::evaluate, py::arg("hard_positions"))
-        .def("evaluate_breakdown", &ProxyEvaluator::evaluateBreakdown, py::arg("hard_positions"));
+        .def("evaluate_breakdown", &ProxyEvaluator::evaluateBreakdown, py::arg("hard_positions"))
+        .def("get_top_congested_cells", &ProxyEvaluator::getTopCongestedCells, py::arg("percent"));
 }

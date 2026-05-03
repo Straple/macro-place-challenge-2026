@@ -28,6 +28,52 @@
 
 ## 📂 Журнал прогонов
 
+### #5 · 2026-05-03 · `submissions/straple/placer.py` (congestion-aware destroy в LNS)
+
+**Идея**: чередовать в LNS-петле два destroy-оператора — старый random и новый **congestion-aware**: выбирать k макросов, которые перекрывают top-5% самых перегруженных congestion-ячеек (взвешено по площади перекрытия и ценности ячейки).
+
+**Источник**: собственная гипотеза, опираясь на декомпозицию cost (congestion = 66% AVG) и на принцип Ropke & Pisinger 2006 (ALNS — domain-aware destroy operators).
+
+**Изменения**:
+- `submissions/straple/cpp/proxy_cost.cpp` — кэш cong-grid после `evaluate()`, новый метод `getTopCongestedCells(percent)` возвращает Nx3 (row, col, weight).
+- `submissions/straple/cpp/placer_core.cpp` — новый `destroyCongestedAndRepair(positions, hot_cells, gridRows, gridCols, k)`: считает overlap каждого movable макроса с hot-cells, выбирает top-k и репэйрит существующим weighted-centroid + spiral search. Fallback на random если ни один макрос не перекрывает hot-зону.
+- `submissions/straple/placer.py` — `_lns_loop` чередует random/congested destroy по чётности итерации; congested_percent=0.05.
+
+**Сводка** (медиана из 3 fast_check запусков, ibm01/10/14/17, parallel 4 workers):
+
+| Bench | Proxy | WL | Density | Cong | Time | vs Straple #4 |
+|---|---|---|---|---|---|---|
+| ibm01 | **1.1676** ⭐ | 0.073 | 0.927 | 1.262 | 0.40s | **-0.89%** |
+| ibm10 | 1.3890 | 0.070 | 0.717 | 1.921 | 1.74s | +0.34% |
+| ibm14 | 1.6281 | 0.053 | 1.000 | 2.150 | 1.92s | +0.01% |
+| ibm17 | 1.7442 | 0.054 | 0.952 | 2.428 | 2.59s | -0.05% |
+| **AVG4** | **1.4822** | — | — | — | wall=105s | **-0.11%** |
+
+- vs RePlAce (на 4 бенчах AVG=1.4197): **+4.40%** (хуже)
+- vs Straple #4 baseline (AVG4=1.4839): **-0.11%** ▼ (микроулучшение, в пределах шума 0.5%)
+- Overlaps: 0
+- Bounds-violations: pre-existing на ibm10/14/17 (есть и в baseline, не наша регрессия — см. "Известные проблемы" в [improve.md](improve.md))
+
+**Что сработало**:
+- Заметное улучшение на **ibm01** (-0.89%): congestion=1.284→1.262 (-1.7%), density=без изменения, WL=без изменения. Congestion действительно снижается на маленьком дизайне, где hot-cells более локализованы.
+- Build чистый, smoke 9/9, 0 overlaps, fallback на random при отсутствии overlap корректно работает.
+- Реализация **детерминирована** (3 запуска идентичны).
+
+**Что не сработало**:
+- На больших ibm10/14/17 эффект **в шуме (~±0.05%)**. Гипотеза: при большом количестве макросов (387-517) top-5% hot-cells не локализуют bottleneck — 30 LNS-итераций × 4 destroy = 120 макросов перемещено из ~500, недостаточно для глобальной разгрузки.
+- Чередование с random может разводить улучшения (random destroy «возвращает» макросы обратно в hot-зону).
+
+**Что попробовать дальше**:
+- Чисто congestion destroy (не чередовать). Сравнить.
+- Увеличить destroy_size для больших дизайнов (4 → 8-12).
+- Larger LNS budget на больших (60-100 итераций вместо 30).
+- "Repair away from hot": в spiral search избегать high-cong cells, не просто двигать в любую non-overlap позицию.
+
+**Команда**: `$HOME/.local/bin/uv run python scripts/fast_check.py`
+**Reviewer verdict**: ACK (5 minor notes — кэш macroCong неиспользуется, nth_element вместо sort, namedconst для 0.05, last_was_accepted флаг, унификация fallback shape).
+
+---
+
 ### #4 · 2026-05-03 · `submissions/straple/placer.py` (pure C++: placer_core + proxy_cost)
 
 **Что менялось от #3:**

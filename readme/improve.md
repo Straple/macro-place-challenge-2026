@@ -66,22 +66,25 @@
 │     ───  если NACK с обоснованием: новый coder-итерация       │
 │     ───  если ACK: дальше                                    │
 │                                                              │
-│  5) BENCHMARK на --all                                       │
-│     ───  $HOME/.local/bin/uv run evaluate                    │
-│              submissions/straple/placer.py --all              │
-│     ───  записать AVG, per-bench numbers, runtime            │
-│     ───  запустить ТРИ раза (для noise floor); медиана =     │
-│              отчётный AVG                                     │
+│  5) FAST-CHECK на 4 представительных бенчах (параллельно)     │
+│     ───  $HOME/.local/bin/uv run python                      │
+│              scripts/fast_check.py                            │
+│     ───  4 бенча (ibm01/ibm10/ibm14/ibm17) в 4 fork-worker'ах│
+│              по 1 ядру каждый. Wall ~100с (vs --all = 360с)  │
+│     ───  записать AVG4, per-bench numbers, time              │
+│     ───  ТРИ раза для noise floor; медиана = отчётный AVG4   │
+│     ───  --all НЕ запускать ВООБЩЕ — слишком медленно        │
 │                                                              │
 │  6) ЛОГ в results.md                                         │
 │     ───  append-only, новая секция в существующий файл       │
 │     ───  по шаблону "#N · YYYY-MM-DD · variant_name"         │
 │     ───  включая что менялось, что сработало, что не         │
+│     ───  AVG4 как основной показатель (НЕ AVG17)             │
 │                                                              │
 │  7) COMMIT                                                   │
 │     ───  все попытки коммитим, даже регрессии                │
 │     ───  историю коммитов НЕ переписывать (rebase запрещён)  │
-│     ───  message: "<идея краткое>: AVG X.XXXX (Δ ±X.X%)"     │
+│     ───  message: "<идея краткое>: AVG4 X.XXXX (Δ ±X.X%)"    │
 │     ───  локальный коммит, push не делать                    │
 │                                                              │
 │  8) ВЕРНУТЬСЯ К 1                                            │
@@ -118,21 +121,23 @@
 **Источник**: <paper / leaderboard team / собственная гипотеза>
 **Изменения**: <список файлов + 1-2 предложения сути>
 
-**Сводка** (медиана из 3 запусков):
-- AVG proxy: X.XXXX (Δ от прошлого best: ±X.XX%)
+**Сводка** (медиана из 3 fast_check запусков на ibm01/10/14/17):
+- AVG4 proxy: X.XXXX (Δ от прошлого best AVG4=1.4839: ±X.XX%)
 - Best: X.XXXX на ibmXX
 - Worst: X.XXXX на ibmXX
-- Total runtime: X.XXs
+- Wall time: X.Xs (parallel, 4 workers)
 - Overlaps: 0
-- vs RePlAce: ±X.X%
+- vs RePlAce (на тех же 4 бенчах, AVG=1.4197): ±X.X%
 
 **Что сработало**: ...
 **Что не сработало**: ...
-**Per-benchmark детали**: <таблица>
+**Per-benchmark детали**: <таблица из 4 бенчей>
 
-**Команда**: `uv run evaluate submissions/straple/placer.py --all`
+**Команда**: `uv run python scripts/fast_check.py`
 **Commit**: <SHA>
 ```
+
+> **Зачем 4 бенча, а не 17?** Один прогон --all = ~6 минут wall-time, fast_check на 4 параллельных = ~100с. За одно «время на --all» успеваем сделать 3.6× итераций. ibm01/10/14/17 покрывают small/medium/large/largest и ibm10 — единственный mid-bench где Straple обходит RePlAce, любая регрессия там сразу видна.
 
 ## Источники идей (что искать)
 
@@ -166,6 +171,7 @@
 
 ### F. LNS budget
 - **Time-budget LNS**: 300с на бенчмарк (вместо 30 фикс. итераций). Адаптивно: маленькие 60с, средние 180с, большие 300с. На --all это ~85 минут — внутри 1-часового лимита на каждый.
+- ⚠ Если такой тяжёлый LNS использовать в fast_check — wall на ibm17 будет ~300с (≈5 мин). Тогда сократить fast_check до 60с/bench, или скоринг на --all отдельным редким батчем.
 
 ## Запрещено
 
@@ -185,14 +191,19 @@ bash submissions/straple/cpp/build.sh
 # Smoke tests (9/9 must pass)
 $HOME/.local/bin/uv run pytest test/test_smoke.py -v
 
-# Single benchmark (для debug, ≤1 минута)
+# Fast-check: 4 представительных бенча параллельно (ibm01/10/14/17)
+# Wall ~100с, в 3.6× быстрее --all. Это основной отчётный гон.
+$HOME/.local/bin/uv run python scripts/fast_check.py
+
+# Кастомный fast_check: другие бенчи или другой placer
+$HOME/.local/bin/uv run python scripts/fast_check.py submissions/will_seed/placer.py
+$HOME/.local/bin/uv run python scripts/fast_check.py --benches ibm01 ibm17
+
+# Single benchmark (для debug)
 $HOME/.local/bin/uv run evaluate submissions/straple/placer.py -b ibm01
 
-# Full Tier 1 (отчётный AVG)
-$HOME/.local/bin/uv run evaluate submissions/straple/placer.py --all
-
-# С 4 ядрами
-OMP_NUM_THREADS=4 $HOME/.local/bin/uv run evaluate submissions/straple/placer.py --all
+# !!! НЕ ИСПОЛЬЗОВАТЬ в цикле — слишком медленно (~6 мин wall):
+# $HOME/.local/bin/uv run evaluate submissions/straple/placer.py --all
 
 # Git: посмотреть последний коммит
 git log -1 --stat
@@ -200,6 +211,10 @@ git log -1 --stat
 # Git: откатить последний коммит файлов (не самой истории)
 git revert HEAD --no-edit
 ```
+
+## Известные проблемы
+
+- **bounds-violations в существующем placer**: на ibm10/ibm14/ibm17 (вероятно и других больших) макросы вылетают за canvas. Это pre-existing баг — `evaluate.py` его маскирует (печатает "VALID" только по overlaps==0, игнорирует out-of-bounds). На leaderboard оценщики могут это поймать → DQ-риск. Чинить отдельной задачей. fast_check печатает WARN но не fail-exit (чтобы не блокировать цикл).
 
 ## Цикл начинается СЕЙЧАС
 

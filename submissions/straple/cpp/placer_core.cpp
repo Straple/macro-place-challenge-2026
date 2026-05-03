@@ -562,6 +562,123 @@ py::array_t<double> destroyAndRepair(PlacerState& state, int destroySize)
     return result;
 }
 
+py::array_t<double> destroyCongestedAndRepair(
+    PlacerState& state,
+    py::array_t<double> hotCellsXYW,
+    int gridRows,
+    int gridCols,
+    int destroySize)
+{
+    std::vector<int> movableIndices;
+    movableIndices.reserve(state.numHardMacros);
+    for (int i = 0; i < state.numHardMacros; ++i)
+    {
+        if (state.movable[i])
+        {
+            movableIndices.push_back(i);
+        }
+    }
+    const int k = std::min<int>(destroySize, static_cast<int>(movableIndices.size()));
+    if (k <= 0)
+    {
+        py::array_t<double> emptyResult({state.numHardMacros, 2});
+        auto bufEmpty = emptyResult.mutable_unchecked<2>();
+        for (int i = 0; i < state.numHardMacros; ++i)
+        {
+            bufEmpty(i, 0) = state.posX[i];
+            bufEmpty(i, 1) = state.posY[i];
+        }
+        return emptyResult;
+    }
+
+    auto hotBuf = hotCellsXYW.unchecked<2>();
+    const int numHotCells = static_cast<int>(hotBuf.shape(0));
+
+    if (numHotCells == 0 || gridRows <= 0 || gridCols <= 0
+        || state.canvasWidth <= 0.0 || state.canvasHeight <= 0.0)
+    {
+        return destroyAndRepair(state, destroySize);
+    }
+
+    const double cellW = state.canvasWidth / gridCols;
+    const double cellH = state.canvasHeight / gridRows;
+
+    std::vector<double> overlapScore(state.numHardMacros, 0.0);
+
+    for (int mIdx : movableIndices)
+    {
+        const double mx = state.posX[mIdx];
+        const double my = state.posY[mIdx];
+        const double hwx = state.halfWidth[mIdx];
+        const double hwy = state.halfHeight[mIdx];
+        const double xMin = mx - hwx;
+        const double xMax = mx + hwx;
+        const double yMin = my - hwy;
+        const double yMax = my + hwy;
+
+        double score = 0.0;
+        for (int h = 0; h < numHotCells; ++h)
+        {
+            const int row = static_cast<int>(hotBuf(h, 0));
+            const int col = static_cast<int>(hotBuf(h, 1));
+            const double weight = hotBuf(h, 2);
+            const double cellXMin = col * cellW;
+            const double cellXMax = (col + 1) * cellW;
+            const double cellYMin = row * cellH;
+            const double cellYMax = (row + 1) * cellH;
+            const double xOverlap = std::min(cellXMax, xMax) - std::max(cellXMin, xMin);
+            const double yOverlap = std::min(cellYMax, yMax) - std::max(cellYMin, yMin);
+            if (xOverlap > 0.0 && yOverlap > 0.0)
+            {
+                score += weight * xOverlap * yOverlap;
+            }
+        }
+        overlapScore[mIdx] = score;
+    }
+
+    std::vector<int> sortedMovable = movableIndices;
+    std::sort(sortedMovable.begin(), sortedMovable.end(), [&overlapScore](int a, int b) {
+        return overlapScore[a] > overlapScore[b];
+    });
+
+    std::vector<int> destroyed;
+    destroyed.reserve(k);
+    for (int idx : sortedMovable)
+    {
+        if (overlapScore[idx] > 0.0)
+        {
+            destroyed.push_back(idx);
+            if (static_cast<int>(destroyed.size()) >= k)
+            {
+                break;
+            }
+        }
+    }
+
+    if (destroyed.empty())
+    {
+        return destroyAndRepair(state, destroySize);
+    }
+
+    std::sort(destroyed.begin(), destroyed.end(), [&state](int a, int b) {
+        return state.adjacencyIndex[a].size() > state.adjacencyIndex[b].size();
+    });
+
+    for (int idx : destroyed)
+    {
+        repairMacro(state, idx);
+    }
+
+    py::array_t<double> result({state.numHardMacros, 2});
+    auto buf = result.mutable_unchecked<2>();
+    for (int i = 0; i < state.numHardMacros; ++i)
+    {
+        buf(i, 0) = state.posX[i];
+        buf(i, 1) = state.posY[i];
+    }
+    return result;
+}
+
 py::array_t<double> currentPositions(const PlacerState& state)
 {
     py::array_t<double> result({state.numHardMacros, 2});
@@ -597,6 +714,9 @@ PYBIND11_MODULE(_placer_core, m)
         .def("legalize", &legalize)
         .def("sa_refine", &simulatedAnnealingRefine, py::arg("num_iters"))
         .def("destroy_and_repair", &destroyAndRepair, py::arg("destroy_size"))
+        .def("destroy_congested_and_repair", &destroyCongestedAndRepair,
+             py::arg("hot_cells_xyw"), py::arg("grid_rows"), py::arg("grid_cols"),
+             py::arg("destroy_size"))
         .def("current_positions", &currentPositions)
         .def("set_positions", &setPositions, py::arg("positions"));
 }
