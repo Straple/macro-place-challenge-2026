@@ -523,6 +523,150 @@ bool repairMacro(PlacerState& state, int macroIndex)
     return false;
 }
 
+double computeCongScoreForBox(
+    double xMin, double xMax, double yMin, double yMax,
+    const double* congGrid, int gridRows, int gridCols,
+    double canvasWidth, double canvasHeight)
+{
+    const double cellW = canvasWidth / gridCols;
+    const double cellH = canvasHeight / gridRows;
+    int colMin = static_cast<int>(std::floor(xMin / cellW));
+    int colMax = static_cast<int>(std::floor(xMax / cellW));
+    int rowMin = static_cast<int>(std::floor(yMin / cellH));
+    int rowMax = static_cast<int>(std::floor(yMax / cellH));
+    if (colMin < 0)
+    {
+        colMin = 0;
+    }
+    if (colMax >= gridCols)
+    {
+        colMax = gridCols - 1;
+    }
+    if (rowMin < 0)
+    {
+        rowMin = 0;
+    }
+    if (rowMax >= gridRows)
+    {
+        rowMax = gridRows - 1;
+    }
+    if (colMin > colMax || rowMin > rowMax)
+    {
+        return 0.0;
+    }
+    double maxCong = 0.0;
+    for (int row = rowMin; row <= rowMax; ++row)
+    {
+        for (int col = colMin; col <= colMax; ++col)
+        {
+            const double value = congGrid[row * gridCols + col];
+            if (value > maxCong)
+            {
+                maxCong = value;
+            }
+        }
+    }
+    return maxCong;
+}
+
+bool repairMacroAware(
+    PlacerState& state, int macroIndex,
+    const double* congGrid, int gridRows, int gridCols,
+    double threshold)
+{
+    const auto& neighborList = state.adjacencyIndex[macroIndex];
+    const auto& neighborWeights = state.adjacencyWeight[macroIndex];
+
+    double centroidX = state.posX[macroIndex];
+    double centroidY = state.posY[macroIndex];
+
+    if (!neighborList.empty())
+    {
+        double totalWeight = 0.0;
+        double sumX = 0.0;
+        double sumY = 0.0;
+        for (std::size_t k = 0; k < neighborList.size(); ++k)
+        {
+            const int j = neighborList[k];
+            const double w = neighborWeights[k];
+            sumX += state.posX[j] * w;
+            sumY += state.posY[j] * w;
+            totalWeight += w;
+        }
+        if (totalWeight > 0.0)
+        {
+            centroidX = sumX / totalWeight;
+            centroidY = sumY / totalWeight;
+        }
+    }
+
+    centroidX = clampDouble(centroidX, state.halfWidth[macroIndex], state.canvasWidth - state.halfWidth[macroIndex]);
+    centroidY = clampDouble(centroidY, state.halfHeight[macroIndex], state.canvasHeight - state.halfHeight[macroIndex]);
+
+    const double oldX = state.posX[macroIndex];
+    const double oldY = state.posY[macroIndex];
+
+    const double hwx = state.halfWidth[macroIndex];
+    const double hwy = state.halfHeight[macroIndex];
+
+    state.posX[macroIndex] = centroidX;
+    state.posY[macroIndex] = centroidY;
+    if (!checkSingleOverlap(state, macroIndex))
+    {
+        const double cong = computeCongScoreForBox(
+            centroidX - hwx, centroidX + hwx,
+            centroidY - hwy, centroidY + hwy,
+            congGrid, gridRows, gridCols,
+            state.canvasWidth, state.canvasHeight);
+        if (cong < threshold)
+        {
+            return true;
+        }
+    }
+
+    const double step = std::max(state.sizeX[macroIndex], state.sizeY[macroIndex]) * 0.25;
+    for (int r = 1; r <= 20; ++r)
+    {
+        for (int dxm = -r; dxm <= r; ++dxm)
+        {
+            for (int dym = -r; dym <= r; ++dym)
+            {
+                if (std::abs(dxm) != r && std::abs(dym) != r)
+                {
+                    continue;
+                }
+                const double trialX = clampDouble(
+                    centroidX + dxm * step,
+                    state.halfWidth[macroIndex],
+                    state.canvasWidth - state.halfWidth[macroIndex]);
+                const double trialY = clampDouble(
+                    centroidY + dym * step,
+                    state.halfHeight[macroIndex],
+                    state.canvasHeight - state.halfHeight[macroIndex]);
+                state.posX[macroIndex] = trialX;
+                state.posY[macroIndex] = trialY;
+                if (checkSingleOverlap(state, macroIndex))
+                {
+                    continue;
+                }
+                const double cong = computeCongScoreForBox(
+                    trialX - hwx, trialX + hwx,
+                    trialY - hwy, trialY + hwy,
+                    congGrid, gridRows, gridCols,
+                    state.canvasWidth, state.canvasHeight);
+                if (cong < threshold)
+                {
+                    return true;
+                }
+            }
+        }
+    }
+
+    state.posX[macroIndex] = oldX;
+    state.posY[macroIndex] = oldY;
+    return repairMacro(state, macroIndex);
+}
+
 py::array_t<double> destroyAndRepair(PlacerState& state, int destroySize)
 {
     std::vector<int> movableIndices;
@@ -567,7 +711,10 @@ py::array_t<double> destroyCongestedAndRepair(
     py::array_t<double> hotCellsXYW,
     int gridRows,
     int gridCols,
-    int destroySize)
+    int destroySize,
+    py::array_t<double> congGridArr,
+    int congGridRows,
+    int congGridCols)
 {
     std::vector<int> movableIndices;
     movableIndices.reserve(state.numHardMacros);
@@ -673,9 +820,40 @@ py::array_t<double> destroyCongestedAndRepair(
         return state.adjacencyIndex[a].size() > state.adjacencyIndex[b].size();
     });
 
-    for (int idx : destroyed)
+    const bool useAware = congGridArr.size() > 0
+        && congGridRows > 0 && congGridCols > 0
+        && congGridArr.ndim() == 2
+        && congGridArr.shape(0) == congGridRows
+        && congGridArr.shape(1) == congGridCols;
+
+    if (useAware)
     {
-        repairMacro(state, idx);
+        const int totalCongCells = congGridRows * congGridCols;
+        std::vector<double> congFlat(totalCongCells, 0.0);
+        auto congBuf = congGridArr.unchecked<2>();
+        for (int row = 0; row < congGridRows; ++row)
+        {
+            for (int col = 0; col < congGridCols; ++col)
+            {
+                congFlat[row * congGridCols + col] = congBuf(row, col);
+            }
+        }
+        std::vector<double> sortBuffer = congFlat;
+        const std::size_t medianPos = sortBuffer.size() / 2;
+        std::nth_element(sortBuffer.begin(), sortBuffer.begin() + medianPos, sortBuffer.end());
+        const double threshold = sortBuffer[medianPos];
+
+        for (int idx : destroyed)
+        {
+            repairMacroAware(state, idx, congFlat.data(), congGridRows, congGridCols, threshold);
+        }
+    }
+    else
+    {
+        for (int idx : destroyed)
+        {
+            repairMacro(state, idx);
+        }
     }
 
     py::array_t<double> result({state.numHardMacros, 2});
@@ -725,7 +903,10 @@ PYBIND11_MODULE(_placer_core, m)
         .def("destroy_and_repair", &destroyAndRepair, py::arg("destroy_size"))
         .def("destroy_congested_and_repair", &destroyCongestedAndRepair,
              py::arg("hot_cells_xyw"), py::arg("grid_rows"), py::arg("grid_cols"),
-             py::arg("destroy_size"))
+             py::arg("destroy_size"),
+             py::arg("cong_grid") = py::array_t<double>(),
+             py::arg("cong_grid_rows") = 0,
+             py::arg("cong_grid_cols") = 0)
         .def("current_positions", &currentPositions)
         .def("set_positions", &setPositions, py::arg("positions"));
 }

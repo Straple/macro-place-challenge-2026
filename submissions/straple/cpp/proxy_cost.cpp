@@ -743,6 +743,25 @@ struct ProxyEvaluator
         return py::make_tuple(wl + dens + cong, wl, dens, cong);
     }
 
+    py::array_t<double> getCongestionGrid() const
+    {
+        if (!congestionCacheValid)
+        {
+            return py::array_t<double>({0, 0});
+        }
+        py::array_t<double> result({gridRows, gridCols});
+        auto buf = result.mutable_unchecked<2>();
+        for (int row = 0; row < gridRows; ++row)
+        {
+            for (int col = 0; col < gridCols; ++col)
+            {
+                const int cellIdx = row * gridCols + col;
+                buf(row, col) = cachedVRoutingCong[cellIdx] + cachedHRoutingCong[cellIdx];
+            }
+        }
+        return result;
+    }
+
     py::array_t<double> getTopCongestedCells(double percent) const
     {
         if (!congestionCacheValid)
@@ -822,5 +841,6 @@ PYBIND11_MODULE(_proxy_cost, m)
              py::arg("net_source_slots"))
         .def("evaluate", &ProxyEvaluator::evaluate, py::arg("hard_positions"))
         .def("evaluate_breakdown", &ProxyEvaluator::evaluateBreakdown, py::arg("hard_positions"))
-        .def("get_top_congested_cells", &ProxyEvaluator::getTopCongestedCells, py::arg("percent"));
+        .def("get_top_congested_cells", &ProxyEvaluator::getTopCongestedCells, py::arg("percent"))
+        .def("get_congestion_grid", &ProxyEvaluator::getCongestionGrid);
 }

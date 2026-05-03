@@ -8,7 +8,7 @@
 
 | | Значение |
 |---|---|
-| **AVG4 proxy** (ibm01/10/14/17) | **1.4795** ⭐ #7 |
+| **AVG4 proxy** (ibm01/10/14/17) | **1.4707** ⭐ #8 |
 | AVG17 proxy (--all) | 1.5181 (#4, перезамерить) |
 | Placer | `submissions/straple/placer.py` (C++ + adaptive LNS + чередование congested/random) |
 | Дата замера | 2026-05-03 |
@@ -29,7 +29,55 @@
 
 ## 📂 Журнал прогонов
 
-### #7 · 2026-05-03 · `submissions/straple/placer.py` (adaptive LNS + чередование) — НОВЫЙ BEST 🏆
+### #8 · 2026-05-03 · `submissions/straple/placer.py` (congestion-aware repair) — НОВЫЙ BEST 🚀
+
+**Идея**: На congested-destroy ветке LNS использовать **congestion-aware spiral search** в repair: принимать non-overlap позицию ТОЛЬКО если её max-cong по перекрытым cells < median(cong-grid). Если за spiral (r∈[1..20]) не нашли — fallback на старый «слепой» repair. Random-destroy ветка не трогается (exploration сохранена).
+
+**Источник**: прямой follow-up из #5 («repair away from hot»). Теория ALNS: destroy + domain-aware repair > destroy + blind repair.
+
+**Изменения**:
+- `submissions/straple/cpp/proxy_cost.cpp` — новый pybind метод `getCongestionGrid()` экспонирует кэш cong-grid (hRouting+vRouting) как np.array shape [gridRows, gridCols].
+- `submissions/straple/cpp/placer_core.cpp` — новый `repairMacroAware(state, idx, congGrid, threshold)` — клон существующего `repairMacro` со cong-проверкой trial-позиций. Spiral ограничен r∈[1..20] (вместо 80) для перформанса. Fallback на repairMacro при non-найдено. `destroyCongestedAndRepair` принимает новые параметры congGrid и зовёт repairMacroAware.
+- `submissions/straple/placer.py` `_lns_loop` — на нечётной (congested) итерации передаёт `cong_grid` в C++; на чётной (random) не трогает.
+
+**Сводка** (медиана 3 запусков, 3/3 идентичны):
+
+| Bench | Proxy | vs #7 (1.4795) | vs Straple #4 (1.4839) | Что улучшилось |
+|---|---|---|---|---|
+| ibm01 | **1.1411** ⭐ | **-1.91%** | **-3.14%** ⭐ | density 0.923→0.914, cong 1.258→1.222 |
+| ibm10 | 1.3902 | 0.00% | +0.43% | нейтрал (random ветка не менялась) |
+| ibm14 | **1.6092** | **-0.71%** | **-1.15%** ⭐ | density 0.995→0.980, cong 2.140→2.130 |
+| ibm17 | 1.7422 | -0.09% | -0.17% | cong 2.427→2.425 |
+| **AVG4** | **1.4707** | **-0.59%** ⭐ | **-0.89%** ⭐ | wall ~88-91s |
+
+- vs RePlAce (на 4 бенчах AVG=1.4197): **+3.59%** (хуже, но впервые ближе чем +4%)
+- vs прошлый best AVG4 (#7: 1.4795): **-0.59%** ▼ — большой шаг
+- Overlaps: 0, Smoke 9/9, Build OK без warnings
+
+**Что сработало**:
+- ibm01 -1.91% и ibm14 -0.71% — congestion-aware repair размещает макросы в зоны с реально низкой нагрузкой, не «первое же свободное место рядом». Параллельно падает density (макросы распределяются равномернее).
+- Fallback архитектура работает: на ibm01 (где hot-зон мало, threshold редко срабатывает) репэйр в нужный момент откатывается на старое поведение.
+- Минимальный runtime overhead (+1-3%).
+
+**Что не сработало**:
+- ibm10 0% (нейтрал): congested-итерации возможно вообще не находили threshold-удовлетворяющие позиции, fallback'или на старое. Гипотеза: cong-grid у ibm10 более «гладкий» (cong=1.92, низкий) — median high, threshold почти любой trial проходит → behavior идентичен старому.
+- ibm17 -0.09% — почти ничего. Главный bottleneck: на ibm17 макросов 517, congested-destroy на 26 итерациях × 13 = 338 переразмещений; если каждое placeholder в hot-зоне даёт лишь 1-2% локального улучшения, на global proxy эффект -0.5-1%. Возможно нужны ДВЕ вещи: (1) больше congested-итераций на больших, (2) более узкий threshold (quantile 0.7 вместо median).
+
+**Главный урок**:
+- Domain-aware repair > blind repair (как в ALNS-литературе).
+- Fallback архитектура ключевая для robustness — не ломает маленькие, помогает большим.
+- ibm01 и ibm14 теперь **в зоне RePlAce-level** (на ibm01 наш 1.14, RePlAce 1.00 → +14%; на ibm14 наш 1.61, RePlAce 1.54 → +4.4%).
+
+**Следующие шаги**:
+- Cycle #5: попробовать **более узкий threshold** (quantile 0.7 / 0.6 вместо median) — для ibm10/17, где median не срабатывает.
+- Или: scale congested-percent (топ 5% → топ 10%) для большей разрядки на ibm17.
+- Или: multi-start для ibm17.
+
+**Команда**: `$HOME/.local/bin/uv run python scripts/fast_check.py`
+
+---
+
+### #7 · 2026-05-03 · `submissions/straple/placer.py` (adaptive LNS + чередование) — best после cycle #3
 
 **Идея**: Минимальный фикс к #6. Вернуть чередование random/congested (exploration важна, особенно для ibm01), но СОХРАНИТЬ adaptive_destroy и adaptive_outer от #6.
 

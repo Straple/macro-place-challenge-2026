@@ -276,8 +276,10 @@ class StraplePlacer:
                 evaluator.evaluate(saved)
                 hot_cells = evaluator.get_top_congested_cells(congested_percent)
                 if hot_cells.shape[0] > 0:
+                    cong_grid = evaluator.get_congestion_grid()
                     trial = state.destroy_congested_and_repair(
-                        hot_cells, grid_rows, grid_cols, adaptive_destroy
+                        hot_cells, grid_rows, grid_cols, adaptive_destroy,
+                        cong_grid, grid_rows, grid_cols,
                     )
                 else:
                     trial = state.destroy_and_repair(adaptive_destroy)
