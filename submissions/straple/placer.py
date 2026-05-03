@@ -197,6 +197,7 @@ def _build_proxy_evaluator(benchmark, plc):
         float(plc.hroutes_per_micron), float(plc.vroutes_per_micron),
         float(plc.hrouting_alloc), float(plc.vrouting_alloc),
         int(plc.smooth_range),
+        float(plc.net_cnt) if plc.net_cnt > 0 else 1.0,
         hard_sizes, soft_sizes, soft_positions, port_positions,
         np.asarray(pin_kinds, dtype=np.int32),
         np.asarray(pin_owners, dtype=np.int32),

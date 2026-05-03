@@ -132,3 +132,65 @@ def test_greedy_row_placer(ibm01):
     assert placement.shape == (benchmark.num_macros, 2)
     costs = compute_proxy_cost(placement, benchmark, plc)
     assert costs["overlap_count"] == 0, f"Greedy placer has {costs['overlap_count']} overlaps"
+
+
+def test_straple_placer(ibm01):
+    """Straple placer (C++ core) loads, runs, and produces a zero-overlap placement on ibm01."""
+    import importlib.util
+
+    placer_path = Path("submissions/straple/placer.py")
+    if not placer_path.exists():
+        pytest.skip("submissions/straple/placer.py not present")
+
+    spec = importlib.util.spec_from_file_location("straple_placer", str(placer_path))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    benchmark, plc = ibm01
+    placer = mod.StraplePlacer()
+    placement = placer.place(benchmark)
+
+    assert placement.shape == (benchmark.num_macros, 2)
+    assert not torch.isnan(placement).any(), "Placement contains NaN"
+    assert not torch.isinf(placement).any(), "Placement contains Inf"
+
+    costs = compute_proxy_cost(placement, benchmark, plc)
+    assert costs["overlap_count"] == 0, f"Straple placer has {costs['overlap_count']} overlaps"
+    assert costs["proxy_cost"] < 1.5, (
+        f"Straple proxy_cost {costs['proxy_cost']:.4f} suspicious "
+        f"(expected ≲ 1.30 on ibm01 with C++ LNS)"
+    )
+
+
+def test_straple_proxy_cost_matches_plc(ibm01):
+    """C++ proxy_cost (`_proxy_cost.ProxyEvaluator`) should match plc.compute_proxy_cost
+    bit-for-bit on the initial placement — that's how we verify the C++ port is faithful."""
+    import importlib.util
+
+    placer_path = Path("submissions/straple/placer.py")
+    if not placer_path.exists():
+        pytest.skip("submissions/straple/placer.py not present")
+
+    spec = importlib.util.spec_from_file_location("straple_placer", str(placer_path))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    benchmark, plc = ibm01
+    mod._accelerate_plc(plc)
+    evaluator = mod._build_proxy_evaluator(benchmark, plc)
+
+    n_hard = benchmark.num_hard_macros
+    hard_pos = benchmark.macro_positions[:n_hard].numpy().astype('float64').copy()
+
+    cpp_cost, cpp_wl, cpp_den, cpp_cong = evaluator.evaluate_breakdown(hard_pos)
+    plc_costs = compute_proxy_cost(benchmark.macro_positions, benchmark, plc)
+
+    assert abs(cpp_wl - plc_costs["wirelength_cost"]) < 1e-4, (
+        f"WL mismatch: C++ {cpp_wl:.6f} vs plc {plc_costs['wirelength_cost']:.6f}"
+    )
+    assert abs(cpp_den - plc_costs["density_cost"]) < 1e-4, (
+        f"density mismatch: C++ {cpp_den:.6f} vs plc {plc_costs['density_cost']:.6f}"
+    )
+    assert abs(cpp_cong - plc_costs["congestion_cost"]) < 5e-3, (
+        f"congestion mismatch: C++ {cpp_cong:.6f} vs plc {plc_costs['congestion_cost']:.6f}"
+    )

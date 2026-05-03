@@ -31,6 +31,7 @@ struct ProxyEvaluator
     double hRoutingAlloc = 0.0;
     double vRoutingAlloc = 0.0;
     int smoothRange = 0;
+    double netCntNorm = 0.0;
 
     std::vector<double> hardWidth;
     std::vector<double> hardHeight;
@@ -68,6 +69,7 @@ struct ProxyEvaluator
         double hRoutingAllocIn,
         double vRoutingAllocIn,
         int smoothRangeIn,
+        double netCntIn,
         py::array_t<double> hardSizes,
         py::array_t<double> softSizes,
         py::array_t<double> softPositions,
@@ -91,6 +93,7 @@ struct ProxyEvaluator
         hRoutingAlloc = hRoutingAllocIn;
         vRoutingAlloc = vRoutingAllocIn;
         smoothRange = smoothRangeIn;
+        netCntNorm = netCntIn > 0.0 ? netCntIn : 1.0;
 
         auto hardSizeBuf = hardSizes.unchecked<2>();
         hardWidth.resize(numHardMacros);
@@ -215,9 +218,7 @@ struct ProxyEvaluator
     double normalizedWirelength(const double* hardX, const double* hardY) const
     {
         const double total = computeWirelength(hardX, hardY);
-        const int numNets = static_cast<int>(netWeight.size());
-        const int netCount = std::max(1, numNets);
-        return total / ((canvasWidth + canvasHeight) * netCount);
+        return total / ((canvasWidth + canvasHeight) * netCntNorm);
     }
 
     inline std::pair<int, int> gridLocation(double xPos, double yPos) const
@@ -748,7 +749,7 @@ PYBIND11_MODULE(_proxy_cost, m)
              py::arg("grid_cols"), py::arg("grid_rows"),
              py::arg("h_routes_per_micron"), py::arg("v_routes_per_micron"),
              py::arg("h_routing_alloc"), py::arg("v_routing_alloc"),
-             py::arg("smooth_range"),
+             py::arg("smooth_range"), py::arg("net_cnt"),
              py::arg("hard_sizes"), py::arg("soft_sizes"),
              py::arg("soft_positions"), py::arg("port_positions"),
              py::arg("net_pin_kinds"), py::arg("net_pin_owners"),
