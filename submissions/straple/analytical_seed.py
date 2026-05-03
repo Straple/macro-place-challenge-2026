@@ -56,6 +56,45 @@ def _build_net_pin_tensors(benchmark, plc):
     return net_macro_idx, net_pin_offsets
 
 
+def _build_padded_net_tensors(net_macro_idx, net_pin_offsets):
+    num_nets = len(net_macro_idx)
+    if num_nets == 0:
+        return None
+    max_pins = max(int(t.numel()) for t in net_macro_idx)
+
+    macro_idx_padded = torch.zeros((num_nets, max_pins), dtype=torch.long)
+    offsets_padded = torch.zeros((num_nets, max_pins, 2), dtype=torch.float32)
+    mask = torch.zeros((num_nets, max_pins), dtype=torch.bool)
+
+    for n, (macros, offsets) in enumerate(zip(net_macro_idx, net_pin_offsets)):
+        p = int(macros.numel())
+        macro_idx_padded[n, :p] = macros
+        offsets_padded[n, :p] = offsets
+        mask[n, :p] = True
+
+    return macro_idx_padded, offsets_padded, mask
+
+
+def _smooth_hpwl_padded(pos, padded_data, gamma):
+    macro_idx, offsets, mask = padded_data
+    pin_xy = pos[macro_idx] + offsets
+    x = pin_xy[..., 0]
+    y = pin_xy[..., 1]
+
+    neg_inf = torch.finfo(pos.dtype).min
+    x_for_max = torch.where(mask, x, x.new_full((), neg_inf))
+    x_for_min = torch.where(mask, -x, x.new_full((), neg_inf))
+    y_for_max = torch.where(mask, y, y.new_full((), neg_inf))
+    y_for_min = torch.where(mask, -y, y.new_full((), neg_inf))
+
+    max_x = gamma * torch.logsumexp(x_for_max / gamma, dim=1)
+    min_x = -gamma * torch.logsumexp(x_for_min / gamma, dim=1)
+    max_y = gamma * torch.logsumexp(y_for_max / gamma, dim=1)
+    min_y = -gamma * torch.logsumexp(y_for_min / gamma, dim=1)
+
+    return ((max_x - min_x) + (max_y - min_y)).sum()
+
+
 def _smooth_hpwl(pos, net_macro_idx, net_pin_offsets, gamma):
     total = pos.new_zeros(())
     for macros, offsets in zip(net_macro_idx, net_pin_offsets):
@@ -117,7 +156,21 @@ def _count_pairwise_overlaps(pos, sizes, n_hard):
 
 def analytical_seed(benchmark: Benchmark, plc, num_steps=200, lr=0.5,
                     lambda_density=0.0, gamma_frac=0.05, target_util=0.6,
-                    log_every=0, log_proxy=False, label=""):
+                    log_every=0, log_proxy=False, label="",
+                    lambda_schedule=None, gamma_schedule=None):
+    """DREAMPlace-style analytical placer.
+
+    lambda_schedule: optional list of (step_fraction, lambda_value). At each
+        Adam step, lambda is interpolated linearly through the schedule.
+        Example: [(0.0, 0.01), (0.3, 1.0), (0.7, 50.0), (1.0, 200.0)]
+        — cold start (WL only), then ramp up density penalty.
+        If None, constant `lambda_density` is used.
+
+    gamma_schedule: optional list of (step_fraction, gamma_factor). gamma is
+        multiplied by gamma_factor at each step (linear interp).
+        Example: [(0.0, 1.0), (1.0, 0.2)] — cool down gamma over time for
+        sharper convergence near the end.
+    """
     import time
     t_start = time.time()
 
@@ -135,25 +188,53 @@ def analytical_seed(benchmark: Benchmark, plc, num_steps=200, lr=0.5,
 
     t_setup0 = time.time()
     net_macro_idx, net_pin_offsets = _build_net_pin_tensors(benchmark, plc)
-    gamma = max(canvas_w, canvas_h) * gamma_frac
+    padded_data = _build_padded_net_tensors(net_macro_idx, net_pin_offsets)
+    gamma_base = max(canvas_w, canvas_h) * gamma_frac
     setup_time = time.time() - t_setup0
 
+    def _interp_schedule(schedule, frac, default):
+        if not schedule:
+            return default
+        for i in range(len(schedule) - 1):
+            f0, v0 = schedule[i]
+            f1, v1 = schedule[i + 1]
+            if f0 <= frac <= f1:
+                if f1 == f0:
+                    return v1
+                t = (frac - f0) / (f1 - f0)
+                return v0 + t * (v1 - v0)
+        return schedule[-1][1]
+
     if log_every > 0:
-        print(f"  [analytical {label}] n_hard={n_hard} n_nets={len(net_macro_idx)} "
-              f"canvas={canvas_w:.0f}x{canvas_h:.0f} gamma={gamma:.1f} "
-              f"lr={lr} ld={lambda_density} steps={num_steps} setup={setup_time:.2f}s",
+        n_nets = len(net_macro_idx)
+        max_pins = padded_data[0].shape[1] if padded_data is not None else 0
+        ls = lambda_schedule or [("const", lambda_density)]
+        gs = gamma_schedule or [("const", 1.0)]
+        print(f"  [analytical {label}] n_hard={n_hard} n_nets={n_nets} "
+              f"max_pins/net={max_pins} canvas={canvas_w:.0f}x{canvas_h:.0f} "
+              f"gamma_base={gamma_base:.1f} lr={lr} steps={num_steps} "
+              f"lambda_sched={ls} gamma_sched={gs} setup={setup_time:.2f}s",
               flush=True)
 
     for step in range(num_steps):
         t_step = time.time()
+        frac = step / max(1, num_steps - 1)
+
+        cur_lambda = _interp_schedule(lambda_schedule, frac, lambda_density)
+        cur_gamma_factor = _interp_schedule(gamma_schedule, frac, 1.0)
+        gamma = gamma_base * cur_gamma_factor
+
         optimizer.zero_grad()
-        wl = _smooth_hpwl(pos, net_macro_idx, net_pin_offsets, gamma)
-        if lambda_density > 0:
+        if padded_data is not None:
+            wl = _smooth_hpwl_padded(pos, padded_data, gamma)
+        else:
+            wl = pos.new_zeros(())
+        if cur_lambda > 0:
             dpen = _density_penalty(
                 pos, sizes, canvas_w, canvas_h,
                 benchmark.grid_rows, benchmark.grid_cols, target_util,
             )
-            loss = wl + lambda_density * dpen
+            loss = wl + cur_lambda * dpen
         else:
             dpen = pos.new_zeros(())
             loss = wl
@@ -169,7 +250,7 @@ def analytical_seed(benchmark: Benchmark, plc, num_steps=200, lr=0.5,
         if log_every > 0 and (step % log_every == 0 or step == num_steps - 1):
             with torch.no_grad():
                 wl_v = wl.item()
-                dpen_v = dpen.item() if lambda_density > 0 else 0.0
+                dpen_v = dpen.item() if cur_lambda > 0 else 0.0
             elapsed = time.time() - t_start
             step_time = time.time() - t_step
             extra = ""
@@ -184,8 +265,9 @@ def analytical_seed(benchmark: Benchmark, plc, num_steps=200, lr=0.5,
                              f" den={cost['density_cost']:.3f}"
                              f" cong={cost['congestion_cost']:.3f}"
                              f" ovrlp={cost['overlap_count']}")
-            print(f"  [analytical {label}] step={step:>4} wl_smooth={wl_v:>10.1f} "
-                  f"dpen={dpen_v:>8.4f} loss={loss.item():>10.1f} "
+            print(f"  [analytical {label}] step={step:>4} ld={cur_lambda:>7.2f} "
+                  f"gamma={gamma:>5.2f} wl_smooth={wl_v:>10.1f} "
+                  f"dpen={dpen_v:>10.4f} loss={loss.item():>10.1f} "
                   f"|grad|={grad_norm:>8.2f} step_t={step_time*1000:.0f}ms "
                   f"total_t={elapsed:.1f}s{extra}", flush=True)
 

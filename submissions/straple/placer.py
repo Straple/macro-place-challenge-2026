@@ -219,12 +219,20 @@ class StraplePlacer:
         lns_outer_iters: int = 30,
         lns_destroy_size: int = 8,
         verbose: int = 0,
+        analytical_steps: int = 0,
+        analytical_lr: float = 0.3,
+        analytical_lambda_density: float = 50000.0,
+        analytical_target_util: float = 0.2,
     ):
         self.seed = seed
         self.refine_iters = refine_iters
         self.lns_outer_iters = lns_outer_iters
         self.lns_destroy_size = lns_destroy_size
         self.verbose = verbose if verbose else int(os.environ.get("STRAPLE_VERBOSE", "0"))
+        self.analytical_steps = analytical_steps
+        self.analytical_lr = analytical_lr
+        self.analytical_lambda_density = analytical_lambda_density
+        self.analytical_target_util = analytical_target_util
 
     def _log(self, msg):
         if self.verbose:
@@ -259,7 +267,28 @@ class StraplePlacer:
         canvas_h = float(benchmark.canvas_height)
         self._log(f"[{bench_label}] num_movable={num_movable} canvas={canvas_w:.0f}x{canvas_h:.0f}")
 
-        num_starts = 5 if num_movable >= 300 else 1
+        analytical_pos = None
+        if plc is not None and self.analytical_steps > 0:
+            _STRAPLE_DIR = str(Path(__file__).resolve().parent)
+            if _STRAPLE_DIR not in sys.path:
+                sys.path.insert(0, _STRAPLE_DIR)
+            from analytical_seed import analytical_seed
+            t0 = time.time()
+            analytical_pos = analytical_seed(
+                benchmark, plc,
+                num_steps=self.analytical_steps,
+                lr=self.analytical_lr,
+                lambda_density=self.analytical_lambda_density,
+                target_util=self.analytical_target_util,
+                log_every=(max(1, self.analytical_steps // 5) if self.verbose else 0),
+                log_proxy=bool(self.verbose),
+                label=bench_label,
+            )
+            self._log(f"[{bench_label}] analytical_seed({self.analytical_steps} steps): "
+                      f"{time.time()-t0:.2f}s")
+
+        num_orig_starts = 5 if num_movable >= 300 else 1
+        num_starts = num_orig_starts + (1 if analytical_pos is not None else 0)
 
         evaluator = None
         if plc is not None and self.lns_outer_iters > 0:
@@ -271,11 +300,14 @@ class StraplePlacer:
         best_cost = float("inf")
 
         for start_idx in range(num_starts):
+            is_analytical_start = (analytical_pos is not None
+                                   and start_idx == num_starts - 1)
             seed = self.seed + start_idx
             t_start_iter = time.time()
             state = _placer_core.PlacerState()
+            seed_pos = analytical_pos if is_analytical_start else initial_pos
             state.initialize(
-                initial_pos, sizes, movable_mask,
+                seed_pos, sizes, movable_mask,
                 edges, edge_weights,
                 canvas_w, canvas_h, int(seed),
             )
@@ -285,7 +317,7 @@ class StraplePlacer:
             t_legalize = time.time() - t0
             cost_after_legal = evaluator.evaluate(state.current_positions()) if evaluator else 0.0
 
-            sa_iters_to_run = self.refine_iters if num_movable < 300 else 0
+            sa_iters_to_run = self.refine_iters if (num_movable < 300 and not is_analytical_start) else 0
             t0 = time.time()
             if self.verbose and sa_iters_to_run > 0:
                 snap = max(1, sa_iters_to_run // 10)
@@ -366,7 +398,7 @@ class StraplePlacer:
         congested_percent = 0.05
 
         adaptive_destroy = max(self.lns_destroy_size, min(16, math.ceil(0.025 * num_movable)))
-        adaptive_outer = max(self.lns_outer_iters, min(150, math.ceil(0.20 * num_movable)))
+        adaptive_outer = max(self.lns_outer_iters, min(1500, math.ceil(1.5 * num_movable)))
 
         accepted = 0
         accepted_random = 0

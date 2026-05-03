@@ -8,7 +8,7 @@
 
 | | Значение |
 |---|---|
-| **AVG4 proxy** (ibm01/10/14/17) | **1.4544** ⭐ #17 |
+| **AVG4 proxy** (ibm01/10/14/17) | **1.4410** ⭐ #18 |
 | AVG17 proxy (--all) | 1.5181 (#4, перезамерить) |
 | Placer | `submissions/straple/placer.py` (C++ + adaptive LNS + чередование congested/random) |
 | Дата замера | 2026-05-03 |
@@ -29,7 +29,68 @@
 
 ## 📂 Журнал прогонов
 
-### #17 · 2026-05-04 · skip SA для больших дизайнов + детальные SA stats — НОВЫЙ BEST 🚀
+### #18 · 2026-05-04 · Heavy LNS budget (1500 iters, scale 1.5·N) + analytical attempts + vectorize — НОВЫЙ BEST 🚀
+
+**Контекст**: Пользователь попросил автономно добить E (DREAMPlace-style analytical placer) до улучшения метрики.
+
+**Что попробовали (за ночь)**:
+
+#### #14: Vectorize `_smooth_hpwl` (37× ускорение)
+- Padded tensor approach с `mask` + `torch.logsumexp`
+- 250ms/step → 6.8ms/step на ibm17. Open way к heavy analytical.
+
+#### #15-#18: DREAMPlace-style analytical — провал
+Серия попыток показала, что **analytical seed принципиально хуже initial benchmark.macro_positions** для нашего LNS pipeline:
+
+1. const λ=1, 200 шагов: raw analytical proxy=1.62 → после legalize+LNS = 1.86 (vs original 1.59)
+2. const λ=200, 1500 шагов: raw=1.79 (overlaps=662)
+3. const λ=5000, 1500 шагов: raw=1.75 (overlaps=592)
+4. **target_util=0.2 + λ=50000 + 2000 шагов**: raw=1.81 (**overlaps=46**!) — рекорд по чистоте seed
+5. После legalize_min_displacement (force-directed push apart) + LNS на чистом seed: still 1.7641 на ibm14, vs original 1.5855
+
+**Корневая причина (открытие)**: `benchmark.macro_positions` — это **уже хорошее placement** из IBM benchmark.
+- ibm01 initial proxy = **1.0385** (наш best 1.1191!)
+- ibm14 initial proxy = **1.5938** (наш best 1.5808)
+- ibm17 initial proxy = **1.7392** (наш best 1.7362)
+
+То есть **наш placer практически не улучшает initial**. На больших дизайнах initial — почти optimal local minimum, и любой analytical seed сходится в худший basin. Топовое решение DREAMPlace-style — это replacement, а не улучшение этих positions.
+
+**Откат**: analytical_steps=0 by default. Код остаётся (`analytical_seed.py` с lambda/gamma schedule, `legalize_min_displacement` в C++) — может быть полезным позже.
+
+#### #19: Heavy LNS budget — РЕАЛЬНЫЙ ПРОРЫВ ⭐
+
+Понимание из profiling: initial уже ~1% от optimum. LNS делает 0.1-0.5% improvements per итерацию. Чтобы пробить — нужно МНОГО iterations.
+
+Изменение: `adaptive_outer = max(self.lns_outer_iters, min(1500, ceil(1.5 · num_movable)))`. 
+Раньше: `min(150, ceil(0.20·N))`.
+
+**Сводка** (1 fast_check, детерминизм проверен):
+
+| Bench | Proxy | vs #17 (1.4544) | vs Straple #4 baseline | vs RePlAce | iters |
+|---|---|---|---|---|---|
+| ibm01 | **1.1111** ⭐ | -1.51% | **-5.69%** ⭐ | +11.4% | 30 (n=246) |
+| ibm10 | **1.3360** ⭐ | -2.10% | **-3.49%** ⭐ | **-10.5%** ⭐ | 581 |
+| ibm14 | **1.5808** ⭐ | -0.30% | -2.90% | +2.4% | 921 |
+| ibm17 | **1.7362** ⭐ | -0.17% | -0.51% | +5.6% | 1140 |
+| **AVG4** | **1.4410** ⭐ | **-0.92%** | **-2.89%** ⭐ | **+1.50%** ⭐ | wall ~118s |
+
+- vs Straple #4 baseline (1.4839): **-2.89%** — впервые превышаем -2.5%!
+- vs RePlAce (на 4 бенчах AVG=1.4197): **+1.50%** (раньше +2.45%)
+- ibm10 теперь **обходит RePlAce на 10.5%** (наш 1.3360 vs RePlAce 1.4928)
+- 0 overlaps, smoke 10/10
+
+**Главный урок**:
+- **Initial benchmark positions УЖЕ хороши** — наш job в том чтобы найти marginal improvements от них через много LNS-итераций
+- Тривиальный подход "1500 итераций вместо 150" дал **3× больше улучшения чем все предыдущие хитрые тюнинги cycle 1-13** (вместе)
+- Analytical/DREAMPlace-style — фундаментально неприменим если initial уже хорош (без replacement)
+
+**Время**: ibm10 48s, ibm17 44s — в 1-час budget огромный запас.
+
+**Команда**: `uv run python scripts/fast_check.py`
+
+---
+
+### #17 · 2026-05-04 · skip SA для больших дизайнов + детальные SA stats — best после cycle #13
 
 **Что нашли через SA-логирование** (новый `sa_refine_with_stats` в C++ возвращает accept/reject/boltzmann counts + WL trajectory):
 

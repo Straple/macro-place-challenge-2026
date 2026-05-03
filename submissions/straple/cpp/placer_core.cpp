@@ -257,6 +257,86 @@ void legalize(PlacerState& state)
     }
 }
 
+int legalizeMinDisplacement(PlacerState& state, int maxIters)
+{
+    const int n = state.numHardMacros;
+    int totalMoves = 0;
+
+    for (int iter = 0; iter < maxIters; ++iter)
+    {
+        bool anyConflict = false;
+        for (int i = 0; i < n; ++i)
+        {
+            if (!state.movable[i])
+            {
+                continue;
+            }
+            const double xi = state.posX[i];
+            const double yi = state.posY[i];
+            for (int j = 0; j < n; ++j)
+            {
+                if (j == i)
+                {
+                    continue;
+                }
+                const double sepX = (state.sizeX[i] + state.sizeX[j]) * 0.5 + kOverlapGap;
+                const double sepY = (state.sizeY[i] + state.sizeY[j]) * 0.5 + kOverlapGap;
+                const double dx = xi - state.posX[j];
+                const double dy = yi - state.posY[j];
+                const double absdx = std::fabs(dx);
+                const double absdy = std::fabs(dy);
+                if (absdx < sepX && absdy < sepY)
+                {
+                    anyConflict = true;
+                    const double overlapX = sepX - absdx;
+                    const double overlapY = sepY - absdy;
+                    if (overlapX < overlapY)
+                    {
+                        const double sign = (dx >= 0.0) ? 1.0 : -1.0;
+                        const double push = overlapX * 0.5 + 1e-6;
+                        if (state.movable[j])
+                        {
+                            state.posX[i] = clampDouble(xi + sign * push,
+                                state.halfWidth[i], state.canvasWidth - state.halfWidth[i]);
+                            state.posX[j] = clampDouble(state.posX[j] - sign * push,
+                                state.halfWidth[j], state.canvasWidth - state.halfWidth[j]);
+                        }
+                        else
+                        {
+                            state.posX[i] = clampDouble(xi + sign * (overlapX + 1e-6),
+                                state.halfWidth[i], state.canvasWidth - state.halfWidth[i]);
+                        }
+                    }
+                    else
+                    {
+                        const double sign = (dy >= 0.0) ? 1.0 : -1.0;
+                        const double push = overlapY * 0.5 + 1e-6;
+                        if (state.movable[j])
+                        {
+                            state.posY[i] = clampDouble(yi + sign * push,
+                                state.halfHeight[i], state.canvasHeight - state.halfHeight[i]);
+                            state.posY[j] = clampDouble(state.posY[j] - sign * push,
+                                state.halfHeight[j], state.canvasHeight - state.halfHeight[j]);
+                        }
+                        else
+                        {
+                            state.posY[i] = clampDouble(yi + sign * (overlapY + 1e-6),
+                                state.halfHeight[i], state.canvasHeight - state.halfHeight[i]);
+                        }
+                    }
+                    ++totalMoves;
+                    break;
+                }
+            }
+        }
+        if (!anyConflict)
+        {
+            break;
+        }
+    }
+    return totalMoves;
+}
+
 struct SAStats
 {
     int numIters = 0;
@@ -1178,6 +1258,8 @@ PYBIND11_MODULE(_placer_core, m)
              py::arg("edges"), py::arg("edge_weights"),
              py::arg("canvas_width"), py::arg("canvas_height"), py::arg("seed"))
         .def("legalize", &legalize)
+        .def("legalize_min_displacement", &legalizeMinDisplacement,
+             py::arg("max_iters") = 50)
         .def("sa_refine", &simulatedAnnealingRefine, py::arg("num_iters"))
         .def("sa_refine_with_stats", &simulatedAnnealingRefineWithStats,
              py::arg("num_iters"), py::arg("snapshot_every") = 0)
