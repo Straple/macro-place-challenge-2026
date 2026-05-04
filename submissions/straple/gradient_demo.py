@@ -75,6 +75,18 @@ def gradient_demo(benchmark, plc, recorder=None, num_steps: int = 300,
     lr = float(os.environ.get("STRAPLE_DEMO_LR", "0.3"))
     optimizer = torch.optim.Adam([pos], lr=lr)
 
+    use_plateau = os.environ.get("STRAPLE_DEMO_LR_PLATEAU", "0") == "1"
+    plateau_factor = float(os.environ.get("STRAPLE_DEMO_PLATEAU_FACTOR", "0.5"))
+    plateau_patience = int(os.environ.get("STRAPLE_DEMO_PLATEAU_PATIENCE", "30"))
+    plateau_min_lr = float(os.environ.get("STRAPLE_DEMO_PLATEAU_MIN_LR", "0.001"))
+    if use_plateau:
+        from torch.optim.lr_scheduler import ReduceLROnPlateau
+        plateau_sched = ReduceLROnPlateau(
+            optimizer, mode="min", factor=plateau_factor,
+            patience=plateau_patience, threshold=1e-4,
+            min_lr=plateau_min_lr,
+        )
+
     print(f"[gradient_demo] building net tensors...", flush=True)
     net_macro_idx, net_pin_offsets = _build_net_pin_tensors(benchmark, plc)
     padded = _build_padded_net_tensors(net_macro_idx, net_pin_offsets)
@@ -219,9 +231,12 @@ def gradient_demo(benchmark, plc, recorder=None, num_steps: int = 300,
 
         cur_density_weight = density_weight
 
-        cur_lr = lr * (1.0 + (lr_end_factor - 1.0) * progress)
-        for g in optimizer.param_groups:
-            g["lr"] = cur_lr
+        if use_plateau:
+            cur_lr = optimizer.param_groups[0]["lr"]
+        else:
+            cur_lr = lr * (1.0 + (lr_end_factor - 1.0) * progress)
+            for g in optimizer.param_groups:
+                g["lr"] = cur_lr
 
         if cong_weight > 0 and padded is not None:
             macro_idx, offsets, mask = padded
@@ -253,6 +268,8 @@ def gradient_demo(benchmark, plc, recorder=None, num_steps: int = 300,
                 + cong_weight * cong_loss)
         loss.backward()
         optimizer.step()
+        if use_plateau:
+            plateau_sched.step(loss.item())
 
         with torch.no_grad():
             pos[:, 0].clamp_(min=half_w, max=canvas_w - half_w)
