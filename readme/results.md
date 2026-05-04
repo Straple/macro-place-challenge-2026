@@ -8,7 +8,7 @@
 
 | | Значение |
 |---|---|
-| **AVG4 proxy** (ibm01/10/14/17) | **1.3921** ⭐⭐⭐ #23 (**vs RePlAce -1.94%, ниже Top-10 -1.10%!**) |
+| **AVG4 proxy** (ibm01/10/14/17) | **1.3886** ⭐⭐⭐⭐ #24 (**vs RePlAce -2.19%, ниже Top-10 -1.35%!**) |
 | AVG17 proxy (--all) | 1.5181 (#4, перезамерить) |
 | Placer | `submissions/straple/placer.py` (C++ + adaptive LNS + чередование congested/random) |
 | Дата замера | 2026-05-03 |
@@ -29,7 +29,39 @@
 
 ## 📂 Журнал прогонов
 
-### #23 · 2026-05-04 · Refine pass на best (intensification phase) — НОВЫЙ BEST 🏆 vs RePlAce -1.94%
+### #24 · 2026-05-04 · Multiple refine passes (3) — FINAL BEST 🏆🏆 AVG4=1.3886 (vs RePlAce -2.19%)
+
+**Идея**: вместо одного refine pass, делать до 3 passes (с early termination если refine не улучшил).
+
+**Изменения**: цикл `for refine_iter in range(3)`, `break` если new cost ≥ best.
+
+**Сводка** (1 fast_check):
+
+| Bench | Proxy | vs #23 (1.3921) | vs Straple #4 baseline | vs RePlAce |
+|---|---|---|---|---|
+| ibm01 | **1.0584** ⭐ | -0.12% | -10.16% ⭐ | +6.1% |
+| ibm10 | **1.2282** ⭐ | -0.84% | -11.27% ⭐ | **-17.7%** ⭐ |
+| ibm14 | **1.5454** | -0.10% | -5.07% | +0.1% (parity!) |
+| ibm17 | **1.7223** | -0.05% | -1.31% | +4.7% |
+| **AVG4** | **1.3886** ⭐⭐⭐⭐ | **-0.25%** | **-6.42%** ⭐ | **-2.19%** ⭐⭐⭐ |
+
+- **vs RePlAce: -2.19%**
+- **vs Top-10 (1.4076): -1.35%**
+- **ibm14 на parity с RePlAce (+0.1%)** — почти доделали!
+- ibm10: **-17.7% от RePlAce**
+- 0 overlaps, smoke 10/10
+- wall 1657s (ibm17 1585s, ibm10 1280s) — близко к 1ч/bench limit
+
+**Прогресс session за 24 цикла**:
+- Старт: AVG4=1.4839 (vs RePlAce **+3.24%**)
+- **Финал: AVG4=1.3886 (vs RePlAce -2.19%)**
+- **Δ = -6.42% от старта**
+
+**Команда**: `uv run python scripts/fast_check.py`
+
+---
+
+### #23 · 2026-05-04 · Refine pass на best (intensification phase) — best после cycle #23
 
 **Идея**: после finishing all multi-start LNS, взять best position и сделать **дополнительный full LNS pass** с другим RNG seed. Это даёт второй "intensification" — ALNS weights пересоберутся с новым context, shake-up triggered более intense, поскольку basin уже глубокий.
 

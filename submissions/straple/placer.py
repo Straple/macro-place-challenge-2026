@@ -382,23 +382,27 @@ class StraplePlacer:
                           f"(not best, current best={best_cost:.4f})")
 
         if evaluator is not None and best_pos is not None:
-            t0 = time.time()
-            state2 = _placer_core.PlacerState()
-            state2.initialize(
-                best_pos, sizes, movable_mask,
-                edges, edge_weights,
-                canvas_w, canvas_h, int(self.seed + 9999),
-            )
-            lns2_log = self._lns_loop(state2, evaluator, plc, num_movable,
-                                      bench_label, 99)
-            refined_pos = state2.current_positions()
-            refined_cost = evaluator.evaluate(refined_pos)
-            self._log(f"[{bench_label}] REFINE pass: {time.time()-t0:.2f}s "
-                      f"cost {best_cost:.4f} -> {refined_cost:.4f} "
-                      f"(delta {refined_cost-best_cost:+.4f})")
-            if refined_cost < best_cost:
-                best_cost = refined_cost
-                best_pos = refined_pos
+            for refine_iter in range(3):
+                t0 = time.time()
+                state_r = _placer_core.PlacerState()
+                state_r.initialize(
+                    best_pos, sizes, movable_mask,
+                    edges, edge_weights,
+                    canvas_w, canvas_h, int(self.seed + 9999 + refine_iter * 100),
+                )
+                self._lns_loop(state_r, evaluator, plc, num_movable,
+                               bench_label, 99 + refine_iter)
+                refined_pos = state_r.current_positions()
+                refined_cost = evaluator.evaluate(refined_pos)
+                self._log(f"[{bench_label}] REFINE pass#{refine_iter}: "
+                          f"{time.time()-t0:.2f}s "
+                          f"cost {best_cost:.4f} -> {refined_cost:.4f} "
+                          f"(delta {refined_cost-best_cost:+.4f})")
+                if refined_cost < best_cost:
+                    best_cost = refined_cost
+                    best_pos = refined_pos
+                else:
+                    break
 
         full = benchmark.macro_positions.clone()
         full[:n_hard] = torch.tensor(best_pos, dtype=torch.float32)
