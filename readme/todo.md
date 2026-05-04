@@ -435,3 +435,189 @@ STRAPLE_DEMO_SCORE_SAMPLE_S=1.0          # sampling interval for score
 - `vis/*.html`, `vis/*.png`, `vis/*.mp4` — артефакты экспериментов
 
 Все три demo файла — **только для визуализации**, не используются submitted placer'ом. Default behavior `evaluate submissions/straple/placer.py` без env vars = baseline ALNS pipeline (1.4445 AVG17).
+
+---
+
+## 9. Сессия 2026-05-04 → 2026-05-05 (gradient deep dive + критический инсайт про soft macros)
+
+### 🚨 ГЛАВНОЕ ОТКРЫТИЕ: soft macros можно (и нужно) двигать
+
+Перечитали [PROBLEM.md](PROBLEM.md) — спецификация ясно говорит:
+- Размещение `P ∈ ℝ^(n×2)` где **n = num_macros = ВСЕ макросы (hard + soft)**
+- Constraint #4 запрещает менять **размеры** soft, не позиции
+- Только `macro_fixed[i] = 1` блокирует движение
+- Для ibm01 все 1140 макросов имеют `fixed=0` (никто не зафиксирован)
+
+**Подтверждение** в `macro_place/objective.py::_set_placement` (lines 200-218): функция явно вызывает `node.set_pos(x, y)` и для hard, и для soft макросов из переданного `placement[num_macros, 2]`. Если мы передаём только обновлённые hard позиции — soft остаются на исходных. Это **наш bug**, а не constraint.
+
+**Наш текущий submitted placer** (LNS-based) обновляет только `pos[:n_hard]`, оставляет soft на initial positions. **Мы 894 из 1140 макросов не оптимизировали** (78% переменных). Это критический пробел.
+
+### Подтверждение через MTK видео
+
+Пользователь поделился MP4 от MTK (3 место, 1.2818): кадры iter=5 → iter=185 → iter=470 показывают:
+- **iter=5**: ВСЕ макросы (включая мелкие salt-зелёные = soft) сгруппированы в одну точку (anchor cluster)
+- **iter=470**: финал, **rainbow colors** — hard и soft равномерно заполняют весь canvas, разные цвета = разные кластеры
+- Промежуточные кадры — gradient unfolding кластеров
+
+**Их recipe (из видео + публичного коммента)**:
+1. **ANCHOR_SOFT init**: pre-clustering макросов по netlist topology, в каждом кластере anchor + members компактно вокруг
+2. **Optimize ALL macros** (1140 для ibm01) — gradient двигает hard И soft
+3. **Multi-phase**: spreading (high gamma, low lambda) → settling (low gamma, high lambda)
+4. **Cluster-colored visualization** — видно сохранение структуры
+
+### Реализованная инфраструктура
+
+#### `submissions/straple/gradient_demo.py` (новое)
+
+Полноценный gradient placer "a-la DREAMPlace":
+- **Adam** optimizer с adaptive density_weight (растёт когда overflow > stop_overflow)
+- **Cooling gamma** в WL_smooth (LSE)
+- **Cooling LR** + опциональный `ReduceLROnPlateau` scheduler
+- **Multiple overlap forms** (env `STRAPLE_DEMO_OVERLAP_FORM`):
+  - `linear`: `Σ overlap_area` (sharp gradient, дёргается)
+  - `quadratic`: `Σ overlap_area²` (smooth, не закрывает 0)
+  - `gauss`: `Σ exp(-(dx²/σ_x² + dy²/σ_y²))` (бесконечно гладко, прилипает к стенам)
+  - **`gauss_overlap`**: gauss + 5× boost по реальной overlap area (✅ best для visual + 0 overlaps)
+  - `coulomb`: `Σ 1/(dist² + soft²)` (сильный push на близких)
+  - `huber`: гибрид quadratic/linear
+- **Lagrangian update**: `λ_o += ρ × overlap` (additive, теоретически convergent — но требует тонкой настройки ρ, иначе расходится)
+- **Plateau-triggered ops**: после N steps без улучшения loss срабатывает random op (teleport / swap / shake / scatter_cluster) — заимствуется из force_demo
+- **Multi-restart on plateau**: альтернатива ops — полный re-init с нового random seed, tracking global best across restarts
+- **Congestion-aware loss** (env `STRAPLE_DEMO_CONG_W`): smooth bbox per net (LSE) → cell demand → top-10% mean. **Эмпирически не помог** — surrogate не коррелирует с TILOS L-shape routing model.
+- **`STRAPLE_DEMO_PLACE_ALL=1`** (default ON): оптимизирует ВСЕ макросы, не только hard. Overlap penalty только между hard pairs (soft могут пересекаться). C++ legalize применяется только к первым n_hard.
+
+#### `submissions/straple/visualizer.py` (новое)
+
+Универсальный visualizer 2×2 layout:
+- Формат определяется по расширению output: `.mp4` (ffmpeg), `.gif` (ffmpeg), `.html` (canvas + JS)
+- **HTML mode**: hover на макрос → tooltip с именем/координатами, ←/→ переключают кадры, space play/pause, slider seek
+- 4 панели: placement / density / congestion / score history с loss components
+- Score chart показывает real cost (proxy/WL/D/C) И gradient loss (WL_smooth + λ_d×density + λ_o×overlap_term)
+- Поддерживает variable pos size (как `[n_hard]`, так и `[n_total]`)
+
+#### `submissions/straple/force_demo.py` (новое)
+
+Force-directed физический демо (для сравнения с gradient):
+- Random/center init
+- Repulsion (overlap) + spring (нет) + spread (Coulomb)
+- Random ops каждые N шагов: teleport / swap / pull / shake / scatter_cluster
+- Bounce от стен с damping
+- Cooling damping schedule
+
+### Измеренные результаты (ibm01)
+
+| Конфигурация | proxy | WL | D | C | overlaps | comment |
+|---|---|---|---|---|---|---|
+| Submitted ALNS (hard only) | 1.0584 | 0.072 | 0.840 | 1.133 | 0 ✅ | submission baseline |
+| Force physics demo | 1.5582 | 0.133 | 1.046 | 1.804 | 0 ✅ | без attraction по нетам |
+| Gradient (hard only) + legalize | 1.4288 | 0.098 | 1.026 | 1.635 | 0 ✅ | до открытия про soft |
+| Gradient + Lagrangian (rho=0.05) | 1.6991 | 0.111 | 1.184 | 2.045 | 0 ✅ | без legalize, valid pure-gradient |
+| Gradient + gauss_overlap | 1.5800 | 0.133 | 1.036 | 1.858 | 0 ✅ | gauss кастомный — visually smooth |
+| **Gradient PLACE_ALL=1 + legalize** | **1.5288** | **0.142** | **0.774** | 2.000 | 0 ✅ | **+all macros, density -28%** |
+| Gradient + restart (best of 23) | 1.5359 | 0.134 | 1.040 | 1.763 | 0 ✅ | multi-restart with legalize-each |
+| MTK DreamPlace++ (видео) | ~0.91 | — | — | — | 0 ✅ | их submission, для референса |
+
+**Ключевое наблюдение**: даже наивное PLACE_ALL=1 без других тюнов даёт density 0.774 vs 1.04 (-28%). Доступ к 894 дополнительным переменным даёт огромный manoeuvring room. Trade-off: WL и cong подросли, потому что soft пины тоже распределились — bbox-ы нетов стали шире.
+
+### План для следующей сессии (важнейший)
+
+**Приоритет 0: применить PLACE_ALL=1 в submitted placer** (не только в demo)
+- Текущий `placer.py::place()` обновляет `full[:n_hard]` — заменить на `full[:n_total]`
+- Расширить C++ pipeline (`PlacerState`) на soft макросы:
+  - Overlap check только между hard
+  - SA / LNS / refine двигают и hard, и soft
+  - Edges включают пары с soft endpoints (через `_extract_edges_full`)
+- **Ожидание**: -5..-20% на AVG17 ТОЛЬКО за счёт исправления этого пробела. Возможно сразу пробьёт топ-10.
+
+**Приоритет 1: cluster-based init (anchor-soft)**
+- Реализовать pre-clustering: METIS / spectral / connected components на edge graph
+- Anchor per cluster: max-degree macro
+- Initial spawn: anchors распределяются по canvas (k-means на target positions), members компактно вокруг своего anchor
+- Это копирует MTK ANCHOR_SOFT → должно дать ещё -10..-20%
+
+**Приоритет 2: GPU port + multi-start hyperparam sweep**
+- Tensor ops уже vectorized — `pos.cuda()` минимум кода
+- Multi-start через batch dim `[K, n, 2]`
+- 16-64 starts на T4 → best by proxy
+- Hyperparam sweep over (lr, λ_d_max, target_util, gamma_start, gamma_end, overlap_w)
+
+**Приоритет 3: real DREAMPlace integration**
+- Docker image скачан (limbo018/dreamplace:cuda 20GB)
+- Build inside ~1 час
+- ProtobufToLEFDEF.py для конвертации benchmark
+- Subprocess wrapper в placer'е
+
+### Уроки
+
+1. **Читать спеку внимательно**. Мы потратили дни на оптимизацию hard-only pipeline, не заметив что soft тоже movable. Один внимательный read PROBLEM.md сэкономил бы недели.
+2. **Смотреть видео топов**. MTK MP4 показал ANCHOR_SOFT init и multi-cluster colors за 30 секунд — то, что не смогли вычитать из публичного коммента.
+3. **Surrogate ≠ true objective**. Naive smooth WL/density дают gradient в неправильную сторону для real proxy. DREAMPlace тратит 5 лет на правильные surrogate'ы (electric potential, pinrudy, etc.) — это не быстрая задача.
+4. **Visualization >>> логи**. HTML с цветными кластерами + анимация показывает что происходит лучше чем тысячи логов. Score chart с loss components показывает почему gradient идёт куда идёт.
+5. **Pure-PyTorch gradient вполне реализуем**. Наш `gradient_demo.py` показывает что без DREAMPlace мы можем построить рабочий analytical placer (хоть и хуже DREAMPlace в качестве). Достаточно для seed → LNS polish.
+
+### Текущие env vars (полный список для gradient_demo)
+
+```bash
+# Mode
+STRAPLE_DEMO=gradient                    # gradient | force
+STRAPLE_DEMO_PLACE_ALL=1                 # 1 = optimize ALL macros, 0 = hard only
+STRAPLE_DEMO_INIT=center                 # center | random
+STRAPLE_DEMO_SPAWN_JITTER=0.005
+
+# Time/iters
+STRAPLE_DEMO_ITERS=600                   # ИЛИ
+STRAPLE_DEMO_TIME_BUDGET=120             # секунд
+STRAPLE_DEMO_SEED=42
+
+# Optimizer
+STRAPLE_DEMO_LR=0.3
+STRAPLE_DEMO_LR_END_FACTOR=0.05          # cosine cooling end
+STRAPLE_DEMO_LR_PLATEAU=1                # use ReduceLROnPlateau
+STRAPLE_DEMO_PLATEAU_FACTOR=0.5
+STRAPLE_DEMO_PLATEAU_PATIENCE=80
+STRAPLE_DEMO_PLATEAU_MIN_LR=0.05
+
+# Loss components
+STRAPLE_DEMO_GAMMA_FRAC=0.05             # gamma base = canvas_min × frac
+STRAPLE_DEMO_GAMMA_START=1.5
+STRAPLE_DEMO_GAMMA_END=0.3
+STRAPLE_DEMO_LAMBDA_START=0.05           # density weight start
+STRAPLE_DEMO_LAMBDA_GROWTH=1.04
+STRAPLE_DEMO_LAMBDA_MAX=200
+STRAPLE_DEMO_TARGET_UTIL=0.4
+STRAPLE_DEMO_STOP_OVERFLOW=0.07
+
+# Overlap penalty
+STRAPLE_DEMO_OVERLAP_W=15
+STRAPLE_DEMO_OVERLAP_W_GROWTH=1.005
+STRAPLE_DEMO_OVERLAP_W_MAX=2000
+STRAPLE_DEMO_OVERLAP_FORM=gauss_overlap  # linear|quadratic|cubic|huber|gauss|gauss_overlap|coulomb
+STRAPLE_DEMO_LAGRANGIAN=0                # use additive λ update
+STRAPLE_DEMO_RHO=0.05                    # Lagrangian rho
+
+# Congestion-aware loss (experimental, not effective on ibm01)
+STRAPLE_DEMO_CONG_W=0
+STRAPLE_DEMO_CONG_TOP_PCT=0.1
+
+# Plateau-triggered ops
+STRAPLE_DEMO_OP_ON_PLATEAU=0
+STRAPLE_DEMO_OP_PATIENCE=150
+STRAPLE_DEMO_OP_K=20
+STRAPLE_DEMO_OP_WARMUP=0.1               # progress fraction
+STRAPLE_DEMO_OP_MAX_PROGRESS=0.7
+STRAPLE_DEMO_OPS=teleport,swap,shake,scatter_cluster
+STRAPLE_DEMO_OP_EVERY=0                  # period; 0 = plateau-only
+
+# Restart instead of ops
+STRAPLE_DEMO_RESTART_ON_PLATEAU=0
+
+# Finishing
+STRAPLE_DEMO_FINISH_LEGALIZE=1           # C++ legalize at end (only first n_hard)
+
+# Visualization
+STRAPLE_VIS_VIDEO=vis/output.html        # .html / .mp4 / .gif
+STRAPLE_VIS_MAX_FRAMES=240
+STRAPLE_VIS_FPS=30
+STRAPLE_DEMO_SCORE_PNG=vis/score.png
+STRAPLE_DEMO_SCORE_SAMPLE_S=1.0
+```

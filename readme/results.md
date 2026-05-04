@@ -34,6 +34,66 @@
 
 ## 📂 Журнал прогонов
 
+### #27 · 2026-05-05 · 🚨 КРИТИЧЕСКОЕ ОТКРЫТИЕ: soft macros можно двигать + gradient demo
+
+**Главное**: пересмотр спецификации показал что мы 894/1140 макросов (78%) не оптимизировали. Soft позиции movable, не зафиксированы, не запрещены к движению. Подтверждено в `_set_placement` (objective.py:200-218): функция явно записывает позиции и hard, и soft.
+
+**Подтверждение через MTK видео** (3 место leaderboard): кадры показывают rainbow-colored placement где hard И soft равномерно заполняют весь canvas. Их рецепт включает **placement всех макросов**.
+
+**Что не сделано в submitted placer** (commit `c758df2`, AVG17=1.4445):
+- LNS pipeline updates только `pos[:n_hard]`
+- Soft остаются на initial positions (`benchmark.macro_positions[n_hard:]`)
+- Это критический пробел — потенциал улучшения только за исправление: **-5..-20% AVG17**
+
+**Создана инфраструктура** (uncommitted, в `submissions/straple/`):
+- `gradient_demo.py` — pure-PyTorch DREAMPlace-style placer (Adam + density bell + smooth HPWL + adaptive λ + cooling γ)
+- `force_demo.py` — physics demo (force-directed + ops)
+- `visualizer.py` — 2×2 HTML/MP4/GIF visualizer (canvas + JS, hover tooltips, ←/→ navigation)
+
+**Эксперименты на ibm01** (gradient demo):
+
+| Конфиг | proxy | WL | D | C | overlaps | примечание |
+|---|---|---|---|---|---|---|
+| Submitted ALNS (hard only) | 1.0584 | 0.072 | 0.840 | 1.133 | 0 ✅ | submission baseline |
+| Force physics | 1.5582 | 0.133 | 1.046 | 1.804 | 0 ✅ | без netlist attraction |
+| Gradient (hard only) + legalize | 1.4288 | 0.098 | 1.026 | 1.635 | 0 ✅ | до открытия про soft |
+| Gradient gauss_overlap | 1.5800 | 0.133 | 1.036 | 1.858 | 0 ✅ | pure gradient, без legalize |
+| Gradient + Lagrangian (ρ=0.05) | 1.6991 | 0.111 | 1.184 | 2.045 | 0 ✅ | augmented Lagrangian |
+| **Gradient PLACE_ALL=1 + legalize** | **1.5288** | **0.142** | **0.752** | 2.000 | 0 ✅ | **density -28% за счёт soft** |
+| Gradient + 23 restarts | 1.5359 | 0.134 | 1.040 | 1.763 | 0 ✅ | best of 23 random inits |
+| MTK DreamPlace++ (видео) | ~0.91 | — | — | — | 0 ✅ | их submission, реф |
+
+**Интерпретация**:
+- Density упала с 1.04 → 0.752 (-28%) ТОЛЬКО за счёт включения soft макросов в оптимизацию
+- WL и cong подросли — soft пины распределились, bbox-ы нетов стали шире
+- Net trade-off на ibm01: proxy 1.4288 → 1.5288 в gradient_demo (хуже), но baseline для тестов
+- В реальном LNS-pipeline с правильным balance ожидается -5..-20% на AVG17
+
+**Не используется в submission** — gradient_demo это **демо/визуализация**, не submitted placer. Submitted placer (LNS) пока всё ещё hard-only. Перенос PLACE_ALL=1 в submitted pipeline — приоритет следующей сессии.
+
+**Файлы артефактов**:
+- `vis/all_macros_demo.html` — HTML с PLACE_ALL=1 (60 МБ, 240 кадров)
+- `vis/restart_demo.html` — multi-restart (61 МБ)
+- `vis/gauss_overlap_demo.html` — pure gradient gauss form (60 МБ)
+- `readme/mtk_dreamplace_plus_ibm01.mp4` — MTK ANCHOR_SOFT reference (от пользователя)
+
+**Команда воспроизведения** (PLACE_ALL=1):
+```bash
+STRAPLE_DEMO=gradient STRAPLE_DEMO_PLACE_ALL=1 \
+  STRAPLE_DEMO_INIT=center STRAPLE_DEMO_ITERS=1500 \
+  STRAPLE_DEMO_LR=0.5 STRAPLE_DEMO_LR_PLATEAU=1 \
+  STRAPLE_DEMO_GAMMA_START=1.5 STRAPLE_DEMO_GAMMA_END=0.3 \
+  STRAPLE_DEMO_LAMBDA_START=0.05 STRAPLE_DEMO_LAMBDA_MAX=200 \
+  STRAPLE_DEMO_OVERLAP_FORM=gauss_overlap STRAPLE_DEMO_OVERLAP_W=15 \
+  STRAPLE_DEMO_FINISH_LEGALIZE=1 \
+  STRAPLE_VIS_VIDEO=vis/all_macros_demo.html \
+  uv run evaluate submissions/straple/placer.py -b ibm01
+```
+
+**Подробнее** — [todo.md секция 9](todo.md#9-сессия-2026-05-04--2026-05-05-gradient-deep-dive--критический-инсайт-про-soft-macros).
+
+---
+
 ### #26 · 2026-05-04 · попытка плана C (DREAMPlace + perturbation) — РЕГРЕССИЯ, прервано
 
 **Контекст**: следующая сессия после submission #25 (AVG4=1.3886, AVG17=1.4445). Цель — пробить топ-7 (≤1.3479) для квалификации на Гран-при.
