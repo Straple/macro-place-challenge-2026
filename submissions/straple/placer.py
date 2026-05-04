@@ -233,11 +233,16 @@ class StraplePlacer:
         lns_outer_iters: int = 30,
         lns_destroy_size: int = 8,
         verbose: int = 0,
-        analytical_steps: int = 0,
+        analytical_steps: int = None,
         analytical_lr: float = 0.3,
         analytical_lambda_density: float = 50000.0,
         analytical_target_util: float = 0.2,
+        analytical_lambda_schedule=None,
+        analytical_gamma_schedule=None,
+        analytical_gamma_frac: float = 0.05,
     ):
+        if analytical_steps is None:
+            analytical_steps = int(os.environ.get("STRAPLE_ANALYTICAL_STEPS", "0"))
         self.seed = seed
         self.refine_iters = refine_iters
         self.lns_outer_iters = lns_outer_iters
@@ -247,10 +252,45 @@ class StraplePlacer:
         self.analytical_lr = analytical_lr
         self.analytical_lambda_density = analytical_lambda_density
         self.analytical_target_util = analytical_target_util
+        self.analytical_lambda_schedule = analytical_lambda_schedule
+        self.analytical_gamma_schedule = analytical_gamma_schedule
+        self.analytical_gamma_frac = analytical_gamma_frac
+        env_preset = os.environ.get("STRAPLE_ANALYTICAL_PRESET", "")
+        if env_preset == "cold_start":
+            self.analytical_lambda_schedule = [(0.0, 0.0), (0.2, 100.0),
+                                               (0.5, 5000.0), (1.0, 50000.0)]
+            self.analytical_gamma_schedule = [(0.0, 1.5), (1.0, 0.3)]
 
     def _log(self, msg):
         if self.verbose:
             print(msg, flush=True)
+
+    def _perturb_initial(self, args, start_idx):
+        rng = np.random.default_rng(self.seed + start_idx * 1000 + 7)
+        canvas_min = min(args["canvas_w"], args["canvas_h"])
+        perturb_idx = start_idx - args["num_orig_starts"]
+        env_scales = os.environ.get("STRAPLE_PERTURB_SCALES", "")
+        if env_scales:
+            scales = [float(s) for s in env_scales.split(",") if s.strip()]
+            sigma_factor = scales[perturb_idx % len(scales)] if scales else 0.05
+        else:
+            default_scales = [0.05, 0.10, 0.15, 0.20]
+            sigma_factor = default_scales[perturb_idx % len(default_scales)]
+        sigma = sigma_factor * canvas_min
+        movable = args["movable_mask"]
+        perturb = rng.normal(0.0, sigma, size=args["initial_pos"].shape)
+        perturb[~movable] = 0.0
+        seed_pos = args["initial_pos"] + perturb
+        sizes = args["sizes"]
+        half_w = sizes[:, 0] / 2.0
+        half_h = sizes[:, 1] / 2.0
+        seed_pos[:, 0] = np.clip(seed_pos[:, 0], half_w, args["canvas_w"] - half_w)
+        seed_pos[:, 1] = np.clip(seed_pos[:, 1], half_h, args["canvas_h"] - half_h)
+        seed_pos[~movable] = args["initial_pos"][~movable]
+        if self.verbose:
+            self._log(f"[{args['bench_label']}] start#{start_idx} perturbed: "
+                      f"sigma={sigma:.2f} (factor={sigma_factor:.3f})")
+        return seed_pos
 
     def place(self, benchmark: Benchmark) -> torch.Tensor:
         import time
@@ -260,6 +300,20 @@ class StraplePlacer:
 
         n_hard = benchmark.num_hard_macros
         plc = _load_plc(benchmark.name)
+
+        recorder = None
+        vis_path = os.environ.get("STRAPLE_VIS_VIDEO", "")
+        if vis_path and plc is not None:
+            _STRAPLE_DIR = str(Path(__file__).resolve().parent)
+            if _STRAPLE_DIR not in sys.path:
+                sys.path.insert(0, _STRAPLE_DIR)
+            from visualizer import PlacementRecorder
+            interval = int(os.environ.get("STRAPLE_VIS_INTERVAL", "100"))
+            max_frames = int(os.environ.get("STRAPLE_VIS_MAX_FRAMES", "60"))
+            recorder = PlacementRecorder(benchmark, plc, vis_path,
+                                         interval=interval, max_frames=max_frames)
+            self._log(f"[{bench_label}] visualizer ENABLED → {vis_path} "
+                      f"(interval={interval}, max_frames={max_frames})")
         t_after_plc = time.time()
         self._log(f"[{bench_label}] _load_plc: {t_after_plc - t_place_start:.2f}s "
                   f"(n_hard={n_hard})")
@@ -272,6 +326,52 @@ class StraplePlacer:
         t_after_edges = time.time()
         self._log(f"[{bench_label}] _extract_edges: {t_after_edges - t_after_plc:.2f}s "
                   f"(edges={len(edges)})")
+
+        demo_mode = os.environ.get("STRAPLE_DEMO", "")
+        if demo_mode in ("force", "gradient") and plc is not None:
+            _STRAPLE_DIR = str(Path(__file__).resolve().parent)
+            if _STRAPLE_DIR not in sys.path:
+                sys.path.insert(0, _STRAPLE_DIR)
+            demo_iters = int(os.environ.get("STRAPLE_DEMO_ITERS", "300"))
+            demo_seed = int(os.environ.get("STRAPLE_DEMO_SEED", "42"))
+            time_budget = float(os.environ.get("STRAPLE_DEMO_TIME_BUDGET", "0"))
+            score_png = os.environ.get("STRAPLE_DEMO_SCORE_PNG", "")
+            score_sample_every = float(
+                os.environ.get("STRAPLE_DEMO_SCORE_SAMPLE_S", "1.0"))
+            self._log(f"[{bench_label}] DEMO mode={demo_mode} "
+                      f"iters={demo_iters} time_budget={time_budget}s seed={demo_seed} "
+                      f"score_png={score_png or 'none'}")
+            t0 = time.time()
+            if demo_mode == "force":
+                from force_demo import force_directed_demo
+                result = force_directed_demo(
+                    benchmark, plc, edges, edge_weights,
+                    recorder=recorder, num_iters=demo_iters, seed=demo_seed,
+                    time_budget=time_budget, score_png=score_png,
+                    score_sample_every_s=score_sample_every,
+                )
+            else:
+                from gradient_demo import gradient_demo
+                result = gradient_demo(
+                    benchmark, plc,
+                    recorder=recorder, num_steps=demo_iters, seed=demo_seed,
+                    time_budget=time_budget, score_png=score_png,
+                    score_sample_every_s=score_sample_every,
+                )
+            if isinstance(result, tuple):
+                final_pos = result[0]
+            else:
+                final_pos = result
+            self._log(f"[{bench_label}] {demo_mode} demo: {time.time()-t0:.2f}s")
+            full = benchmark.macro_positions.clone()
+            full[:n_hard] = torch.tensor(final_pos, dtype=torch.float32)
+            if recorder is not None:
+                try:
+                    recorder.render()
+                except Exception as exc:
+                    print(f"[visualizer] render failed: {exc}", file=sys.stderr)
+            self._log(f"[{bench_label}] === DEMO DONE total={time.time()-t_place_start:.2f}s ===")
+            return full
 
         initial_pos = benchmark.macro_positions[:n_hard].numpy().astype(np.float64).copy()
         sizes = benchmark.macro_sizes[:n_hard].numpy().astype(np.float64)
@@ -293,7 +393,10 @@ class StraplePlacer:
                 num_steps=self.analytical_steps,
                 lr=self.analytical_lr,
                 lambda_density=self.analytical_lambda_density,
+                gamma_frac=self.analytical_gamma_frac,
                 target_util=self.analytical_target_util,
+                lambda_schedule=self.analytical_lambda_schedule,
+                gamma_schedule=self.analytical_gamma_schedule,
                 log_every=(max(1, self.analytical_steps // 5) if self.verbose else 0),
                 log_proxy=bool(self.verbose),
                 label=bench_label,
@@ -302,7 +405,14 @@ class StraplePlacer:
                       f"{time.time()-t0:.2f}s")
 
         num_orig_starts = 3 if num_movable >= 300 else 1
-        num_starts = num_orig_starts + (1 if analytical_pos is not None else 0)
+        env_n = int(os.environ.get("STRAPLE_NUM_STARTS", "0"))
+        if env_n > 0:
+            num_orig_starts = env_n
+        num_perturbed_starts = int(os.environ.get("STRAPLE_PERTURB_EXTRA_STARTS", "0"))
+        if num_movable < 300:
+            num_perturbed_starts = 0
+        num_starts = (num_orig_starts + num_perturbed_starts
+                      + (1 if analytical_pos is not None else 0))
 
         evaluator = None
         if plc is not None and self.lns_outer_iters > 0:
@@ -324,8 +434,13 @@ class StraplePlacer:
             "num_movable": num_movable,
             "analytical_pos": analytical_pos,
             "num_starts": num_starts,
+            "num_orig_starts": num_orig_starts,
+            "num_perturbed_starts": num_perturbed_starts,
             "bench_label": bench_label,
         }
+
+        if recorder is not None:
+            recorder.add(initial_pos, "initial")
 
         parallel_workers = int(os.environ.get("STRAPLE_PARALLEL_STARTS", "0"))
         if parallel_workers > 1 and evaluator is not None and num_starts > 1:
@@ -343,7 +458,8 @@ class StraplePlacer:
                               f"(not best, best={best_cost:.4f})")
         else:
             for start_idx in range(num_starts):
-                trial_pos, trial_cost = self._run_one_start(start_idx, start_args, evaluator, plc)
+                trial_pos, trial_cost = self._run_one_start(start_idx, start_args, evaluator, plc,
+                                                            recorder=recorder)
                 if trial_cost < best_cost:
                     best_cost = trial_cost
                     best_pos = trial_pos
@@ -362,7 +478,7 @@ class StraplePlacer:
                     canvas_w, canvas_h, int(self.seed + 9999 + refine_iter * 100),
                 )
                 self._lns_loop(state_r, evaluator, plc, num_movable,
-                               bench_label, 99 + refine_iter)
+                               bench_label, 99 + refine_iter, recorder=recorder)
                 refined_pos = state_r.current_positions()
                 refined_cost = evaluator.evaluate(refined_pos)
                 self._log(f"[{bench_label}] REFINE pass#{refine_iter}: "
@@ -372,8 +488,17 @@ class StraplePlacer:
                 if refined_cost < best_cost:
                     best_cost = refined_cost
                     best_pos = refined_pos
+                    if recorder is not None:
+                        recorder.add(best_pos, f"refine#{refine_iter} cost={best_cost:.4f}")
                 else:
                     break
+
+        if recorder is not None and best_pos is not None:
+            recorder.add(best_pos, f"FINAL best={best_cost:.4f}")
+            try:
+                recorder.render()
+            except Exception as exc:
+                print(f"[visualizer] render failed: {exc}", file=sys.stderr)
 
         full = benchmark.macro_positions.clone()
         full[:n_hard] = torch.tensor(best_pos, dtype=torch.float32)
@@ -381,29 +506,52 @@ class StraplePlacer:
                   f"final_cost={best_cost:.4f} ===")
         return full
 
-    def _run_one_start(self, start_idx, args, evaluator, plc):
+    def _run_one_start(self, start_idx, args, evaluator, plc, recorder=None):
         import time
         is_analytical_start = (args["analytical_pos"] is not None
                                and start_idx == args["num_starts"] - 1)
+        num_orig = args["num_orig_starts"]
+        num_perturbed = args.get("num_perturbed_starts", 0)
+        is_perturbed_start = (not is_analytical_start
+                              and start_idx >= num_orig
+                              and start_idx < num_orig + num_perturbed)
         seed = self.seed + start_idx
         t_start_iter = time.time()
 
         state = _placer_core.PlacerState()
-        seed_pos = args["analytical_pos"] if is_analytical_start else args["initial_pos"]
+        if is_analytical_start:
+            seed_pos = args["analytical_pos"]
+        elif is_perturbed_start:
+            seed_pos = self._perturb_initial(args, start_idx)
+        else:
+            seed_pos = args["initial_pos"]
         state.initialize(
             seed_pos, args["sizes"], args["movable_mask"],
             args["edges"], args["edge_weights"],
             args["canvas_w"], args["canvas_h"], int(seed),
         )
 
-        state.legalize()
+        if recorder is not None and (is_analytical_start or is_perturbed_start):
+            recorder.add(state.current_positions(), f"start#{start_idx} pre-legalize")
+
+        if is_analytical_start:
+            state.legalize_min_displacement(500)
+            state.legalize()
+        else:
+            state.legalize()
         cost_after_legal = evaluator.evaluate(state.current_positions()) if evaluator else 0.0
+        if recorder is not None:
+            recorder.add(state.current_positions(),
+                         f"start#{start_idx} post-legalize cost={cost_after_legal:.4f}")
 
         sa_iters_to_run = self.refine_iters if (
             args["num_movable"] < 300 and not is_analytical_start) else 0
         if sa_iters_to_run > 0:
             state.sa_refine(sa_iters_to_run)
         cost_after_sa = evaluator.evaluate(state.current_positions()) if evaluator else 0.0
+        if recorder is not None and sa_iters_to_run > 0:
+            recorder.add(state.current_positions(),
+                         f"start#{start_idx} post-SA cost={cost_after_sa:.4f}")
 
         self._log(f"[{args['bench_label']}] start#{start_idx} seed={seed}: "
                   f"legalize proxy={cost_after_legal:.4f} | "
@@ -412,7 +560,7 @@ class StraplePlacer:
         if evaluator is not None:
             t0 = time.time()
             lns_log = self._lns_loop(state, evaluator, plc, args["num_movable"],
-                                     args["bench_label"], start_idx)
+                                     args["bench_label"], start_idx, recorder=recorder)
             self._log(f"[{args['bench_label']}] start#{start_idx} LNS: {time.time()-t0:.2f}s "
                       f"cost {cost_after_sa:.4f} -> {lns_log['final_cost']:.4f}")
 
@@ -443,7 +591,8 @@ class StraplePlacer:
                 results.append((trial_pos, trial_cost, start_idx))
         return results
 
-    def _lns_loop(self, state, evaluator, plc, num_movable, bench_label="?", start_idx=0):
+    def _lns_loop(self, state, evaluator, plc, num_movable, bench_label="?", start_idx=0,
+                  recorder=None):
         import time
         best_pos = state.current_positions()
         best_cost = evaluator.evaluate(best_pos)
@@ -454,7 +603,9 @@ class StraplePlacer:
         congested_percent = 0.05
 
         adaptive_destroy = max(self.lns_destroy_size, min(16, math.ceil(0.025 * num_movable)))
-        adaptive_outer = max(self.lns_outer_iters, min(50000, math.ceil(60.0 * num_movable)))
+        outer_cap = int(os.environ.get("STRAPLE_LNS_OUTER_CAP", "50000"))
+        outer_factor = float(os.environ.get("STRAPLE_LNS_OUTER_FACTOR", "60.0"))
+        adaptive_outer = max(self.lns_outer_iters, min(outer_cap, math.ceil(outer_factor * num_movable)))
 
         accepted = 0
         accepted_random = 0
@@ -518,6 +669,9 @@ class StraplePlacer:
             else:
                 trial = state.destroy_cluster_and_repair(adaptive_destroy)
             new_cost = evaluator.evaluate(trial)
+            if recorder is not None:
+                recorder.maybe_add_lns(trial, iteration, op,
+                                       new_cost < best_cost, new_cost)
             if new_cost < best_cost:
                 gain = best_cost - new_cost
                 best_cost = new_cost
