@@ -8,7 +8,7 @@
 
 | | Значение |
 |---|---|
-| **AVG4 proxy** (ibm01/10/14/17) | **1.4055** ⭐⭐⭐ #21 (**vs RePlAce -1.00%, ниже Top-10!**) |
+| **AVG4 proxy** (ibm01/10/14/17) | **1.3970** ⭐⭐⭐ #22 (**vs RePlAce -1.60%, ниже Top-10 -0.75%!**) |
 | AVG17 proxy (--all) | 1.5181 (#4, перезамерить) |
 | Placer | `submissions/straple/placer.py` (C++ + adaptive LNS + чередование congested/random) |
 | Дата замера | 2026-05-03 |
@@ -29,7 +29,36 @@
 
 ## 📂 Журнал прогонов
 
-### #21 · 2026-05-04 · 3 starts × 25000 LNS iters — 🏆 НИЖЕ TOP-10 LEADERBOARD!
+### #22 · 2026-05-04 · Shake-up + LNS 50000 (3×N=60·movable) — vs RePlAce -1.60% 🚀
+
+**Изменения**:
+- **Shake-up механизм**: при `no_improve_count >= shake_threshold` (300+) делаем большое perturbation: swap k=min(N/4, 50) макросов + destroy_and_repair тех же. До 5 раз. Сбрасываем op_weights к 1.0.
+- LNS budget: 25000 → 50000 (scale 25·N → 60·N)
+- N starts: 3 (как cycle #21)
+
+**Сводка** (1 fast_check):
+
+| Bench | Proxy | vs #21 (1.4055) | vs Straple #4 baseline | vs RePlAce |
+|---|---|---|---|---|
+| ibm01 | **1.0647** ⭐ | -0.94% | -9.63% ⭐ | +6.7% |
+| ibm10 | **1.2494** ⭐ | -1.25% | -9.74% ⭐ | **-16.3%** ⭐ |
+| ibm14 | **1.5500** | -0.40% | -4.79% | +0.4% (parity) |
+| ibm17 | **1.7240** | -0.10% | -1.21% | +4.8% |
+| **AVG4** | **1.3970** ⭐⭐⭐ | **-0.60%** | **-5.85%** ⭐ | **-1.60%** ⭐⭐⭐ |
+
+- **vs RePlAce: -1.60%** (раньше -1.00%)
+- **vs Top-10 (1.4076): -0.75%** (намного ниже!)
+- ibm10: **-16.3% от RePlAce**
+- 0 overlaps, smoke 10/10
+- wall 850s (ibm17 778s), в 1ч/bench budget
+
+**Прогресс session за 22 цикла**: 1.4839 → 1.3970 = **-5.85%**, vs RePlAce: +3.24% → **-1.60%**
+
+**Команда**: `uv run python scripts/fast_check.py`
+
+---
+
+### #21 · 2026-05-04 · 3 starts × 25000 LNS iters — best после cycle #21
 
 **Изменения**:
 - num_orig_starts: 5 → 3 (меньше parallel starts, больше iterations per start)

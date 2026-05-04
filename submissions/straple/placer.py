@@ -398,7 +398,7 @@ class StraplePlacer:
         congested_percent = 0.05
 
         adaptive_destroy = max(self.lns_destroy_size, min(16, math.ceil(0.025 * num_movable)))
-        adaptive_outer = max(self.lns_outer_iters, min(25000, math.ceil(25.0 * num_movable)))
+        adaptive_outer = max(self.lns_outer_iters, min(50000, math.ceil(60.0 * num_movable)))
 
         accepted = 0
         accepted_random = 0
@@ -423,6 +423,9 @@ class StraplePlacer:
         warmup = min(40, adaptive_outer // 10)
         weight_decay = 0.95
         weight_reaction = 0.3
+
+        shake_threshold = max(200, adaptive_outer // 20)
+        shake_count = 0
 
         for iteration in range(adaptive_outer):
             saved = state.current_positions()
@@ -494,6 +497,18 @@ class StraplePlacer:
                 if log_step and iteration % (log_step * 2) == 0:
                     self._log(f"[{bench_label}] start#{start_idx} LNS iter={iteration:>3} "
                               f"op={op:<7} reject (cost={new_cost:.4f} > {best_cost:.4f})")
+                if no_improve_count >= shake_threshold and shake_count < 5:
+                    state.set_positions(best_pos)
+                    shake_k = min(num_movable // 4, 50)
+                    state.swap_two_macros(shake_k)
+                    state.destroy_and_repair(shake_k)
+                    no_improve_count = 0
+                    shake_count += 1
+                    op_weights = {o: 1.0 for o in ops}
+                    if self.verbose:
+                        self._log(f"[{bench_label}] start#{start_idx} LNS SHAKE-UP @ iter={iteration} "
+                                  f"k={shake_k} count={shake_count}")
+                    continue
                 if no_improve_count >= early_term_threshold:
                     if self.verbose:
                         self._log(f"[{bench_label}] start#{start_idx} LNS early term @ iter={iteration} "
