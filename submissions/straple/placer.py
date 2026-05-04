@@ -211,6 +211,20 @@ def _build_proxy_evaluator(benchmark, plc):
     return evaluator
 
 
+def _worker_run_start(start_idx, args, seed_base, refine_iters, lns_outer_iters,
+                      lns_destroy_size, benchmark, plc):
+    placer = StraplePlacer(
+        seed=seed_base,
+        refine_iters=refine_iters,
+        lns_outer_iters=lns_outer_iters,
+        lns_destroy_size=lns_destroy_size,
+        verbose=0,
+        analytical_steps=0,
+    )
+    evaluator = _build_proxy_evaluator(benchmark, plc)
+    return placer._run_one_start(start_idx, args, evaluator, plc)
+
+
 class StraplePlacer:
     def __init__(
         self,
@@ -299,87 +313,44 @@ class StraplePlacer:
         best_pos = None
         best_cost = float("inf")
 
-        for start_idx in range(num_starts):
-            is_analytical_start = (analytical_pos is not None
-                                   and start_idx == num_starts - 1)
-            seed = self.seed + start_idx
-            t_start_iter = time.time()
-            state = _placer_core.PlacerState()
-            seed_pos = analytical_pos if is_analytical_start else initial_pos
-            state.initialize(
-                seed_pos, sizes, movable_mask,
-                edges, edge_weights,
-                canvas_w, canvas_h, int(seed),
-            )
+        start_args = {
+            "initial_pos": initial_pos,
+            "sizes": sizes,
+            "movable_mask": movable_mask,
+            "edges": edges,
+            "edge_weights": edge_weights,
+            "canvas_w": canvas_w,
+            "canvas_h": canvas_h,
+            "num_movable": num_movable,
+            "analytical_pos": analytical_pos,
+            "num_starts": num_starts,
+            "bench_label": bench_label,
+        }
 
-            t0 = time.time()
-            state.legalize()
-            t_legalize = time.time() - t0
-            cost_after_legal = evaluator.evaluate(state.current_positions()) if evaluator else 0.0
-
-            sa_iters_to_run = self.refine_iters if (num_movable < 300 and not is_analytical_start) else 0
-            t0 = time.time()
-            if self.verbose and sa_iters_to_run > 0:
-                snap = max(1, sa_iters_to_run // 10)
-                sa_stats = state.sa_refine_with_stats(sa_iters_to_run, snap)
-            elif sa_iters_to_run > 0:
-                state.sa_refine(sa_iters_to_run)
-                sa_stats = None
-            else:
-                sa_stats = None
-            t_sa = time.time() - t0
-            cost_after_sa = evaluator.evaluate(state.current_positions()) if evaluator else 0.0
-
-            self._log(f"[{bench_label}] start#{start_idx} seed={seed}: "
-                      f"legalize={t_legalize:.2f}s proxy={cost_after_legal:.4f} | "
-                      f"sa_refine({sa_iters_to_run})={t_sa*1000:.1f}ms proxy={cost_after_sa:.4f} "
-                      f"(delta {cost_after_sa-cost_after_legal:+.4f})")
-            if sa_stats and not sa_stats.get("skipped", True):
-                acc = sa_stats["num_accepted"]
-                rej = sa_stats["num_rejected"]
-                bolt = sa_stats["num_accepted_boltzmann"]
-                rej_ovr = sa_stats["num_rejected_overlap"]
-                ni = sa_stats["num_iters"]
-                self._log(f"[{bench_label}] start#{start_idx} SA stats: "
-                          f"iters={ni} acc={acc} ({acc*100//ni}%) "
-                          f"acc_boltzmann={bolt} ({bolt*100//max(acc,1)}% of acc) "
-                          f"rej={rej} (rej_overlap={rej_ovr}) "
-                          f"shift={sa_stats['num_shift']} swap={sa_stats['num_swap']} "
-                          f"toward={sa_stats['num_toward_neighbor']} "
-                          f"WL: init={sa_stats['initial_wl']:.4f} -> "
-                          f"best@step{sa_stats['best_step']}={sa_stats['best_wl']:.4f} "
-                          f"final={sa_stats['final_wl']:.4f} "
-                          f"T: {sa_stats['t_start']:.2f}->{sa_stats['t_end']:.4f}")
-                if "trajectory_steps" in sa_stats:
-                    traj_s = sa_stats["trajectory_steps"]
-                    traj_w = sa_stats["trajectory_wl"]
-                    snapshots_str = " ".join(
-                        f"step{s}={w:.4f}" for s, w in zip(traj_s, traj_w))
-                    self._log(f"[{bench_label}] start#{start_idx} SA trajectory: {snapshots_str}")
-
-            if evaluator is not None:
-                t0 = time.time()
-                lns_log = self._lns_loop(state, evaluator, plc, num_movable, bench_label, start_idx)
-                t_lns = time.time() - t0
-                self._log(f"[{bench_label}] start#{start_idx} LNS: {t_lns:.2f}s "
-                          f"iters={lns_log['iters']} accepted={lns_log['accepted']} "
-                          f"cost {cost_after_sa:.4f} -> {lns_log['final_cost']:.4f} "
-                          f"(delta {lns_log['final_cost']-cost_after_sa:+.4f})")
-
-            trial_pos = state.current_positions()
-            if evaluator is not None:
-                trial_cost = evaluator.evaluate(trial_pos)
-            else:
-                trial_cost = 0.0 if num_starts == 1 else float(start_idx)
-
-            if trial_cost < best_cost:
-                best_cost = trial_cost
-                best_pos = trial_pos
-                self._log(f"[{bench_label}] start#{start_idx} new best={trial_cost:.4f} "
-                          f"(iter_total={time.time()-t_start_iter:.2f}s)")
-            else:
-                self._log(f"[{bench_label}] start#{start_idx} cost={trial_cost:.4f} "
-                          f"(not best, current best={best_cost:.4f})")
+        parallel_workers = int(os.environ.get("STRAPLE_PARALLEL_STARTS", "0"))
+        if parallel_workers > 1 and evaluator is not None and num_starts > 1:
+            self._log(f"[{bench_label}] === parallel multi-start ({parallel_workers} workers, "
+                      f"{num_starts} starts) ===")
+            results = self._run_starts_parallel(start_args, benchmark, plc,
+                                                min(parallel_workers, num_starts))
+            for trial_pos, trial_cost, start_idx in results:
+                if trial_cost < best_cost:
+                    best_cost = trial_cost
+                    best_pos = trial_pos
+                    self._log(f"[{bench_label}] start#{start_idx} new best={trial_cost:.4f}")
+                else:
+                    self._log(f"[{bench_label}] start#{start_idx} cost={trial_cost:.4f} "
+                              f"(not best, best={best_cost:.4f})")
+        else:
+            for start_idx in range(num_starts):
+                trial_pos, trial_cost = self._run_one_start(start_idx, start_args, evaluator, plc)
+                if trial_cost < best_cost:
+                    best_cost = trial_cost
+                    best_pos = trial_pos
+                    self._log(f"[{bench_label}] start#{start_idx} new best={trial_cost:.4f}")
+                else:
+                    self._log(f"[{bench_label}] start#{start_idx} cost={trial_cost:.4f} "
+                              f"(not best, best={best_cost:.4f})")
 
         if evaluator is not None and best_pos is not None:
             for refine_iter in range(3):
@@ -409,6 +380,68 @@ class StraplePlacer:
         self._log(f"[{bench_label}] === DONE total={time.time()-t_place_start:.2f}s "
                   f"final_cost={best_cost:.4f} ===")
         return full
+
+    def _run_one_start(self, start_idx, args, evaluator, plc):
+        import time
+        is_analytical_start = (args["analytical_pos"] is not None
+                               and start_idx == args["num_starts"] - 1)
+        seed = self.seed + start_idx
+        t_start_iter = time.time()
+
+        state = _placer_core.PlacerState()
+        seed_pos = args["analytical_pos"] if is_analytical_start else args["initial_pos"]
+        state.initialize(
+            seed_pos, args["sizes"], args["movable_mask"],
+            args["edges"], args["edge_weights"],
+            args["canvas_w"], args["canvas_h"], int(seed),
+        )
+
+        state.legalize()
+        cost_after_legal = evaluator.evaluate(state.current_positions()) if evaluator else 0.0
+
+        sa_iters_to_run = self.refine_iters if (
+            args["num_movable"] < 300 and not is_analytical_start) else 0
+        if sa_iters_to_run > 0:
+            state.sa_refine(sa_iters_to_run)
+        cost_after_sa = evaluator.evaluate(state.current_positions()) if evaluator else 0.0
+
+        self._log(f"[{args['bench_label']}] start#{start_idx} seed={seed}: "
+                  f"legalize proxy={cost_after_legal:.4f} | "
+                  f"sa_refine({sa_iters_to_run}) proxy={cost_after_sa:.4f}")
+
+        if evaluator is not None:
+            t0 = time.time()
+            lns_log = self._lns_loop(state, evaluator, plc, args["num_movable"],
+                                     args["bench_label"], start_idx)
+            self._log(f"[{args['bench_label']}] start#{start_idx} LNS: {time.time()-t0:.2f}s "
+                      f"cost {cost_after_sa:.4f} -> {lns_log['final_cost']:.4f}")
+
+        trial_pos = state.current_positions()
+        trial_cost = evaluator.evaluate(trial_pos) if evaluator else float(start_idx)
+        self._log(f"[{args['bench_label']}] start#{start_idx} done in "
+                  f"{time.time()-t_start_iter:.1f}s cost={trial_cost:.4f}")
+        return trial_pos, trial_cost
+
+    def _run_starts_parallel(self, args, benchmark, plc, num_workers):
+        import multiprocessing as mp
+        try:
+            ctx = mp.get_context("fork")
+        except ValueError:
+            ctx = mp.get_context("spawn")
+
+        with ctx.Pool(num_workers) as pool:
+            futures = []
+            for start_idx in range(args["num_starts"]):
+                futures.append(pool.apply_async(
+                    _worker_run_start,
+                    (start_idx, args, self.seed, self.refine_iters,
+                     self.lns_outer_iters, self.lns_destroy_size, benchmark, plc),
+                ))
+            results = []
+            for start_idx, fut in enumerate(futures):
+                trial_pos, trial_cost = fut.get()
+                results.append((trial_pos, trial_cost, start_idx))
+        return results
 
     def _lns_loop(self, state, evaluator, plc, num_movable, bench_label="?", start_idx=0):
         import time
