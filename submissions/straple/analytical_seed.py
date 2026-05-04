@@ -56,6 +56,44 @@ def _build_net_pin_tensors(benchmark, plc):
     return net_macro_idx, net_pin_offsets
 
 
+def _build_net_pin_tensors_full(benchmark, plc):
+    """Like _build_net_pin_tensors but includes BOTH hard and soft macros.
+
+    Indexing convention: indices [0, n_hard) are hard macros (matching
+    plc.hard_macro_indices), indices [n_hard, n_total) are soft macros
+    (matching plc.soft_macro_indices). This matches benchmark.macro_positions.
+    """
+    n_hard = benchmark.num_hard_macros
+    name_to_global = {}
+    for bidx, idx in enumerate(plc.hard_macro_indices):
+        name_to_global[plc.modules_w_pins[idx].get_name()] = bidx
+    for sidx, idx in enumerate(plc.soft_macro_indices):
+        name_to_global[plc.modules_w_pins[idx].get_name()] = n_hard + sidx
+
+    net_macro_idx = []
+    net_pin_offsets = []
+    for driver, sinks in plc.nets.items():
+        macros = []
+        offsets = []
+        for pin_name in [driver] + sinks:
+            parent = pin_name.split("/")[0]
+            if parent not in name_to_global:
+                continue
+            gidx = name_to_global[parent]
+            pin_idx = plc.mod_name_to_indices.get(pin_name, -1)
+            if pin_idx < 0:
+                continue
+            pin_node = plc.modules_w_pins[pin_idx]
+            ox, oy = pin_node.get_offset()
+            macros.append(gidx)
+            offsets.append((ox, oy))
+        if len(macros) < 2:
+            continue
+        net_macro_idx.append(torch.tensor(macros, dtype=torch.long))
+        net_pin_offsets.append(torch.tensor(offsets, dtype=torch.float32))
+    return net_macro_idx, net_pin_offsets
+
+
 def _build_padded_net_tensors(net_macro_idx, net_pin_offsets):
     num_nets = len(net_macro_idx)
     if num_nets == 0:

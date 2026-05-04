@@ -364,7 +364,8 @@ class StraplePlacer:
                 final_pos = result
             self._log(f"[{bench_label}] {demo_mode} demo: {time.time()-t0:.2f}s")
             full = benchmark.macro_positions.clone()
-            full[:n_hard] = torch.tensor(final_pos, dtype=torch.float32)
+            n_demo = final_pos.shape[0]
+            full[:n_demo] = torch.tensor(final_pos, dtype=torch.float32)
             if recorder is not None:
                 try:
                     recorder.render()

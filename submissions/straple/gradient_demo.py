@@ -24,11 +24,13 @@ def _import_analytical():
         sys.path.insert(0, _STRAPLE_DIR)
     from analytical_seed import (
         _build_net_pin_tensors,
+        _build_net_pin_tensors_full,
         _build_padded_net_tensors,
         _smooth_hpwl_padded,
         _density_penalty,
     )
-    return (_build_net_pin_tensors, _build_padded_net_tensors,
+    return (_build_net_pin_tensors, _build_net_pin_tensors_full,
+            _build_padded_net_tensors,
             _smooth_hpwl_padded, _density_penalty)
 
 
@@ -38,31 +40,36 @@ def gradient_demo(benchmark, plc, recorder=None, num_steps: int = 300,
     import torch
     from macro_place.objective import compute_proxy_cost
 
-    (_build_net_pin_tensors, _build_padded_net_tensors,
+    (_build_net_pin_tensors, _build_net_pin_tensors_full,
+     _build_padded_net_tensors,
      _smooth_hpwl_padded, _density_penalty) = _import_analytical()
 
     n_hard = benchmark.num_hard_macros
+    n_total = benchmark.num_macros
+    place_all = os.environ.get("STRAPLE_DEMO_PLACE_ALL", "1") != "0"
+    n_active = n_total if place_all else n_hard
+
     canvas_w = float(benchmark.canvas_width)
     canvas_h = float(benchmark.canvas_height)
     canvas_min = min(canvas_w, canvas_h)
 
-    sizes_t = benchmark.macro_sizes[:n_hard].float()
+    sizes_t = benchmark.macro_sizes[:n_active].float()
     half_w = sizes_t[:, 0] / 2.0
     half_h = sizes_t[:, 1] / 2.0
-    movable = benchmark.get_movable_mask()[:n_hard]
-    fixed_pos = benchmark.macro_positions[:n_hard].float().clone()
+    movable = benchmark.get_movable_mask()[:n_active]
+    fixed_pos = benchmark.macro_positions[:n_active].float().clone()
 
     rng_np = np.random.default_rng(seed)
     init_mode = os.environ.get("STRAPLE_DEMO_INIT", "center")
-    pos_np = np.zeros((n_hard, 2), dtype=np.float32)
+    pos_np = np.zeros((n_active, 2), dtype=np.float32)
     if init_mode == "random":
         pos_np[:, 0] = rng_np.uniform(half_w.numpy(), canvas_w - half_w.numpy())
         pos_np[:, 1] = rng_np.uniform(half_h.numpy(), canvas_h - half_h.numpy())
     else:
         spawn_jitter = canvas_min * float(
             os.environ.get("STRAPLE_DEMO_SPAWN_JITTER", "0.005"))
-        pos_np[:, 0] = canvas_w / 2.0 + rng_np.normal(0, spawn_jitter, n_hard)
-        pos_np[:, 1] = canvas_h / 2.0 + rng_np.normal(0, spawn_jitter, n_hard)
+        pos_np[:, 0] = canvas_w / 2.0 + rng_np.normal(0, spawn_jitter, n_active)
+        pos_np[:, 1] = canvas_h / 2.0 + rng_np.normal(0, spawn_jitter, n_active)
         pos_np[:, 0] = np.clip(pos_np[:, 0],
                                half_w.numpy(), canvas_w - half_w.numpy())
         pos_np[:, 1] = np.clip(pos_np[:, 1],
@@ -93,6 +100,7 @@ def gradient_demo(benchmark, plc, recorder=None, num_steps: int = 300,
     op_k = int(os.environ.get("STRAPLE_DEMO_OP_K", "8"))
     op_warmup_progress = float(os.environ.get("STRAPLE_DEMO_OP_WARMUP", "0.15"))
     op_max_progress = float(os.environ.get("STRAPLE_DEMO_OP_MAX_PROGRESS", "0.7"))
+    restart_on_plateau = os.environ.get("STRAPLE_DEMO_RESTART_ON_PLATEAU", "0") == "1"
     op_kinds_env = os.environ.get(
         "STRAPLE_DEMO_OPS", "teleport,swap,pull,shake,scatter_cluster")
     op_kinds = [s.strip() for s in op_kinds_env.split(",") if s.strip()]
@@ -101,8 +109,15 @@ def gradient_demo(benchmark, plc, recorder=None, num_steps: int = 300,
     best_loss = float("inf")
     no_improve_count = 0
 
+    global_best_pos = None
+    global_best_proxy = float("inf")
+    restart_count = 0
+
     print(f"[gradient_demo] building net tensors...", flush=True)
-    net_macro_idx, net_pin_offsets = _build_net_pin_tensors(benchmark, plc)
+    if place_all:
+        net_macro_idx, net_pin_offsets = _build_net_pin_tensors_full(benchmark, plc)
+    else:
+        net_macro_idx, net_pin_offsets = _build_net_pin_tensors(benchmark, plc)
     padded = _build_padded_net_tensors(net_macro_idx, net_pin_offsets)
     n_nets = len(net_macro_idx)
     print(f"[gradient_demo] n_hard={n_hard} n_nets={n_nets} "
@@ -132,8 +147,9 @@ def gradient_demo(benchmark, plc, recorder=None, num_steps: int = 300,
 
     lr_end_factor = float(os.environ.get("STRAPLE_DEMO_LR_END_FACTOR", "0.05"))
 
-    sizes_x_pair = (sizes_t[:, 0:1] + sizes_t[:, 0].unsqueeze(0)) * 0.5
-    sizes_y_pair = (sizes_t[:, 1:2] + sizes_t[:, 1].unsqueeze(0)) * 0.5
+    sizes_hard = sizes_t[:n_hard]
+    sizes_x_pair = (sizes_hard[:, 0:1] + sizes_hard[:, 0].unsqueeze(0)) * 0.5
+    sizes_y_pair = (sizes_hard[:, 1:2] + sizes_hard[:, 1].unsqueeze(0)) * 0.5
     eye_mask = (1.0 - torch.eye(n_hard, dtype=torch.float32))
 
     grid_rows = int(benchmark.grid_rows)
@@ -155,7 +171,7 @@ def gradient_demo(benchmark, plc, recorder=None, num_steps: int = 300,
 
     if score_history is not None:
         full = full_template.clone()
-        full[:n_hard] = pos.detach()
+        full[:n_active] = pos.detach()
         c0 = compute_proxy_cost(full, benchmark, plc)
         score_history.append({
             "step": 0, "elapsed": 0.0,
@@ -198,8 +214,9 @@ def gradient_demo(benchmark, plc, recorder=None, num_steps: int = 300,
             grid_rows, grid_cols, target_util,
         )
 
-        diff_x = pos[:, 0:1] - pos[:, 0].unsqueeze(0)
-        diff_y = pos[:, 1:2] - pos[:, 1].unsqueeze(0)
+        pos_hard = pos[:n_hard]
+        diff_x = pos_hard[:, 0:1] - pos_hard[:, 0].unsqueeze(0)
+        diff_y = pos_hard[:, 1:2] - pos_hard[:, 1].unsqueeze(0)
 
         if overlap_form == "gauss":
             sigma_x_sq = sizes_x_pair * sizes_x_pair + 1e-6
@@ -305,6 +322,67 @@ def gradient_demo(benchmark, plc, recorder=None, num_steps: int = 300,
 
         if (trigger_op
                 and op_warmup_progress <= progress <= op_max_progress
+                and restart_on_plateau):
+            cur_pos_np = pos.detach().numpy().astype(np.float64).copy()
+            cpp_dir = str(Path(__file__).resolve().parent / "cpp")
+            if cpp_dir not in sys.path:
+                sys.path.insert(0, cpp_dir)
+            import _placer_core
+            sizes_np_hard = sizes_t[:n_hard].numpy().astype(np.float64)
+            movable_np_hard = movable[:n_hard].numpy().astype(np.bool_)
+            try_state = _placer_core.PlacerState()
+            try_state.initialize(
+                cur_pos_np[:n_hard].copy(), sizes_np_hard, movable_np_hard,
+                np.zeros((0, 2), dtype=np.int32),
+                np.zeros(0, dtype=np.float64),
+                canvas_w, canvas_h, int(seed),
+            )
+            try_state.legalize_min_displacement(500)
+            try_state.legalize()
+            legalized_hard = try_state.current_positions()
+            legalized_full = cur_pos_np.copy()
+            legalized_full[:n_hard] = legalized_hard
+            full = full_template.clone()
+            full[:n_active] = torch.tensor(legalized_full, dtype=torch.float32)
+            cur_costs = compute_proxy_cost(full, benchmark, plc)
+            cur_proxy = float(cur_costs["proxy_cost"])
+            cur_overlaps = int(cur_costs["overlap_count"])
+            if cur_overlaps == 0 and cur_proxy < global_best_proxy:
+                global_best_proxy = cur_proxy
+                global_best_pos = legalized_full.astype(np.float64).copy()
+            restart_count += 1
+            restart_rng = np.random.default_rng(seed + 7000 + restart_count)
+            new_pos = np.zeros((n_active, 2), dtype=np.float32)
+            half_w_np = (sizes_t[:, 0].numpy() / 2.0)
+            half_h_np = (sizes_t[:, 1].numpy() / 2.0)
+            new_pos[:, 0] = restart_rng.uniform(half_w_np, canvas_w - half_w_np)
+            new_pos[:, 1] = restart_rng.uniform(half_h_np, canvas_h - half_h_np)
+            mov_np = movable.numpy().astype(np.bool_)
+            fixed_np = fixed_pos.numpy().astype(np.float32)
+            new_pos[~mov_np] = fixed_np[~mov_np]
+            with torch.no_grad():
+                pos.data.copy_(torch.tensor(new_pos, dtype=torch.float32))
+            optimizer = torch.optim.Adam([pos], lr=lr)
+            if use_plateau:
+                plateau_sched = ReduceLROnPlateau(
+                    optimizer, mode="min", factor=plateau_factor,
+                    patience=plateau_patience, threshold=1e-4,
+                    min_lr=plateau_min_lr,
+                )
+            density_weight = float(os.environ.get("STRAPLE_DEMO_LAMBDA_START", "0.05"))
+            overlap_weight = float(os.environ.get("STRAPLE_DEMO_OVERLAP_W", "15"))
+            no_improve_count = 0
+            best_loss = float("inf")
+            op_label_grad = (f"RESTART#{restart_count} "
+                             f"prev_proxy={cur_proxy:.4f} ovrlp={cur_overlaps}")
+            op_events_grad.append({
+                "step": step + 1, "label": op_label_grad,
+                "elapsed": time.time() - t_start,
+            })
+            print(f"[gradient_demo] 🔄 step={step+1} {op_label_grad} "
+                  f"global_best={global_best_proxy:.4f}", flush=True)
+        elif (trigger_op
+                and op_warmup_progress <= progress <= op_max_progress
                 and len(op_kinds) > 0):
                 from force_demo import _apply_random_op
                 pos_np = pos.detach().numpy().astype(np.float64)
@@ -368,7 +446,7 @@ def gradient_demo(benchmark, plc, recorder=None, num_steps: int = 300,
             if now - last_score_t >= score_sample_every_s:
                 last_score_t = now
                 full = full_template.clone()
-                full[:n_hard] = pos.detach()
+                full[:n_active] = pos.detach()
                 cs = compute_proxy_cost(full, benchmark, plc)
                 score_history.append({
                     "step": step + 1, "elapsed": now - t_start,
@@ -390,31 +468,64 @@ def gradient_demo(benchmark, plc, recorder=None, num_steps: int = 300,
 
     final_pos = pos.detach().numpy().astype(np.float64)
 
+    if restart_on_plateau:
+        cpp_dir = str(Path(__file__).resolve().parent / "cpp")
+        if cpp_dir not in sys.path:
+            sys.path.insert(0, cpp_dir)
+        import _placer_core
+        sizes_np_hard = sizes_t[:n_hard].numpy().astype(np.float64)
+        movable_np_hard = movable[:n_hard].numpy().astype(np.bool_)
+        end_state = _placer_core.PlacerState()
+        end_state.initialize(
+            final_pos[:n_hard].copy(), sizes_np_hard, movable_np_hard,
+            np.zeros((0, 2), dtype=np.int32),
+            np.zeros(0, dtype=np.float64),
+            canvas_w, canvas_h, int(seed),
+        )
+        end_state.legalize_min_displacement(500)
+        end_state.legalize()
+        legalized_hard = end_state.current_positions()
+        legalized_end = final_pos.copy()
+        legalized_end[:n_hard] = legalized_hard
+        full = full_template.clone()
+        full[:n_active] = torch.tensor(legalized_end, dtype=torch.float32)
+        end_costs = compute_proxy_cost(full, benchmark, plc)
+        end_proxy = float(end_costs["proxy_cost"])
+        end_overlaps = int(end_costs["overlap_count"])
+        if end_overlaps == 0 and end_proxy < global_best_proxy:
+            global_best_proxy = end_proxy
+            global_best_pos = legalized_end.astype(np.float64).copy()
+        if global_best_pos is not None:
+            print(f"[gradient_demo] using global_best_proxy={global_best_proxy:.4f} "
+                  f"(restart_count={restart_count})", flush=True)
+            final_pos = global_best_pos.copy()
+
     do_legalize = os.environ.get("STRAPLE_DEMO_FINISH_LEGALIZE", "1") != "0"
     if do_legalize:
         cpp_dir = str(Path(__file__).resolve().parent / "cpp")
         if cpp_dir not in sys.path:
             sys.path.insert(0, cpp_dir)
         import _placer_core
-        sizes_np = sizes_t.numpy().astype(np.float64)
-        movable_np = movable.numpy().astype(np.bool_)
+        sizes_np_hard = sizes_t[:n_hard].numpy().astype(np.float64)
+        movable_np_hard = movable[:n_hard].numpy().astype(np.bool_)
         state = _placer_core.PlacerState()
         state.initialize(
-            final_pos.copy(), sizes_np, movable_np,
+            final_pos[:n_hard].copy(), sizes_np_hard, movable_np_hard,
             np.zeros((0, 2), dtype=np.int32),
             np.zeros(0, dtype=np.float64),
             canvas_w, canvas_h, int(seed),
         )
         moves = state.legalize_min_displacement(500)
         state.legalize()
-        final_pos = state.current_positions()
+        legalized_hard = state.current_positions()
+        final_pos[:n_hard] = legalized_hard
         print(f"[gradient_demo] post-legalize: min_disp moves={moves}", flush=True)
         if recorder is not None:
             recorder.add(final_pos.astype(np.float64), "gradient: FINISH legalize")
 
     if score_history is not None:
         full = full_template.clone()
-        full[:n_hard] = torch.tensor(final_pos, dtype=torch.float32)
+        full[:n_active] = torch.tensor(final_pos, dtype=torch.float32)
         cf = compute_proxy_cost(full, benchmark, plc)
         last_record = score_history[-1] if score_history else {}
         score_history.append({

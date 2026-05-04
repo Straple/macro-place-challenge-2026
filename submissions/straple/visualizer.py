@@ -88,7 +88,7 @@ class PlacementRecorder:
               flush=True)
         for idx, (pos, label) in enumerate(self.snapshots):
             full = full_template.clone()
-            full[:n_hard] = torch.tensor(pos, dtype=torch.float32)
+            full[:pos.shape[0]] = torch.tensor(pos, dtype=torch.float32)
             costs = compute_proxy_cost(full, self.benchmark, self.plc)
             breakdowns.append(costs)
             if (idx + 1) % 10 == 0 or idx + 1 == len(self.snapshots):
@@ -133,7 +133,7 @@ class PlacementRecorder:
             tmp_dir = Path(tmp)
             for idx, (pos, label) in enumerate(self.snapshots):
                 full = full_template.clone()
-                full[:n_hard] = torch.tensor(pos, dtype=torch.float32)
+                full[:pos.shape[0]] = torch.tensor(pos, dtype=torch.float32)
                 _ = compute_proxy_cost(full, self.benchmark, self.plc)
 
                 fig, axes = plt.subplots(2, 2, figsize=(16, 14))
@@ -205,7 +205,7 @@ class PlacementRecorder:
 
         for idx, (pos, label) in enumerate(self.snapshots):
             full = full_template.clone()
-            full[:n_hard] = torch.tensor(pos, dtype=torch.float32)
+            full[:pos.shape[0]] = torch.tensor(pos, dtype=torch.float32)
             _ = compute_proxy_cost(full, bench, self.plc)
 
             density_png = self._panel_to_base64(
