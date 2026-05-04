@@ -79,13 +79,27 @@ def gradient_demo(benchmark, plc, recorder=None, num_steps: int = 300,
     plateau_factor = float(os.environ.get("STRAPLE_DEMO_PLATEAU_FACTOR", "0.5"))
     plateau_patience = int(os.environ.get("STRAPLE_DEMO_PLATEAU_PATIENCE", "30"))
     plateau_min_lr = float(os.environ.get("STRAPLE_DEMO_PLATEAU_MIN_LR", "0.001"))
+    from torch.optim.lr_scheduler import ReduceLROnPlateau
     if use_plateau:
-        from torch.optim.lr_scheduler import ReduceLROnPlateau
         plateau_sched = ReduceLROnPlateau(
             optimizer, mode="min", factor=plateau_factor,
             patience=plateau_patience, threshold=1e-4,
             min_lr=plateau_min_lr,
         )
+
+    op_on_plateau = os.environ.get("STRAPLE_DEMO_OP_ON_PLATEAU", "0") == "1"
+    op_patience = int(os.environ.get("STRAPLE_DEMO_OP_PATIENCE", "50"))
+    op_every = int(os.environ.get("STRAPLE_DEMO_OP_EVERY", "0"))
+    op_k = int(os.environ.get("STRAPLE_DEMO_OP_K", "8"))
+    op_warmup_progress = float(os.environ.get("STRAPLE_DEMO_OP_WARMUP", "0.15"))
+    op_max_progress = float(os.environ.get("STRAPLE_DEMO_OP_MAX_PROGRESS", "0.7"))
+    op_kinds_env = os.environ.get(
+        "STRAPLE_DEMO_OPS", "teleport,swap,pull,shake,scatter_cluster")
+    op_kinds = [s.strip() for s in op_kinds_env.split(",") if s.strip()]
+    op_rng = np.random.default_rng(seed + 12345)
+    op_events_grad = []
+    best_loss = float("inf")
+    no_improve_count = 0
 
     print(f"[gradient_demo] building net tensors...", flush=True)
     net_macro_idx, net_pin_offsets = _build_net_pin_tensors(benchmark, plc)
@@ -136,7 +150,7 @@ def gradient_demo(benchmark, plc, recorder=None, num_steps: int = 300,
                      f"gradient: init lambda={density_weight:.4f}")
 
     score_history = [] if (time_budget > 0 or score_png) else None
-    op_events = None
+    op_events = op_events_grad
     full_template = benchmark.macro_positions.clone()
 
     if score_history is not None:
@@ -268,8 +282,58 @@ def gradient_demo(benchmark, plc, recorder=None, num_steps: int = 300,
                 + cong_weight * cong_loss)
         loss.backward()
         optimizer.step()
+        loss_val_pre = float(loss.item())
+
         if use_plateau:
-            plateau_sched.step(loss.item())
+            plateau_sched.step(loss_val_pre)
+
+        op_label_grad = None
+        trigger_op = False
+        if op_on_plateau:
+            rel_threshold = max(1e-3, abs(best_loss) * 0.001)
+            if loss_val_pre < best_loss - rel_threshold:
+                best_loss = loss_val_pre
+                no_improve_count = 0
+            else:
+                no_improve_count += 1
+            if no_improve_count >= op_patience:
+                trigger_op = True
+                no_improve_count = 0
+                best_loss = loss_val_pre
+        if op_every > 0 and step > 0 and step % op_every == 0:
+            trigger_op = True
+
+        if (trigger_op
+                and op_warmup_progress <= progress <= op_max_progress
+                and len(op_kinds) > 0):
+                from force_demo import _apply_random_op
+                pos_np = pos.detach().numpy().astype(np.float64)
+                velocity_np = np.zeros_like(pos_np)
+                sizes_np = sizes_t.numpy().astype(np.float64)
+                half_w_np = (sizes_np[:, 0] / 2.0)
+                half_h_np = (sizes_np[:, 1] / 2.0)
+                movable_np = movable.numpy().astype(np.bool_)
+                edges_a_np = np.zeros(0, dtype=np.int32)
+                edges_b_np = np.zeros(0, dtype=np.int32)
+                op_label_grad = _apply_random_op(
+                    pos_np, velocity_np, sizes_np, half_w_np, half_h_np,
+                    canvas_w, canvas_h, movable_np, edges_a_np, edges_b_np,
+                    op_k, op_rng, op_kinds,
+                )
+                if op_label_grad:
+                    with torch.no_grad():
+                        pos.data.copy_(torch.tensor(pos_np, dtype=torch.float32))
+                        for state in optimizer.state.values():
+                            if "exp_avg" in state:
+                                state["exp_avg"].zero_()
+                    no_improve_count = 0
+                    best_loss = float("inf")
+                    op_events_grad.append({
+                        "step": step + 1, "label": op_label_grad,
+                        "elapsed": time.time() - t_start,
+                    })
+                    print(f"[gradient_demo] ⚡ step={step+1} OP: {op_label_grad}",
+                          flush=True)
 
         with torch.no_grad():
             pos[:, 0].clamp_(min=half_w, max=canvas_w - half_w)
@@ -290,12 +354,14 @@ def gradient_demo(benchmark, plc, recorder=None, num_steps: int = 300,
                                      overlap_w_max)
 
         if recorder is not None:
-            recorder.add(pos.detach().numpy().astype(np.float64),
-                         f"grad step={step+1} "
-                         f"λ_d={cur_density_weight:.2f} "
-                         f"λ_o={overlap_weight:.1f} λ_c={cong_weight:.1f} "
-                         f"ov={ovlap_val:.2f} cong={float(cong_loss):.2f} "
-                         f"lr={cur_lr:.3f}")
+            label = (f"grad step={step+1} "
+                     f"λ_d={cur_density_weight:.2f} "
+                     f"λ_o={overlap_weight:.1f} λ_c={cong_weight:.1f} "
+                     f"ov={ovlap_val:.2f} cong={float(cong_loss):.2f} "
+                     f"lr={cur_lr:.3f}")
+            if op_label_grad:
+                label = f"⚡ {op_label_grad} | " + label
+            recorder.add(pos.detach().numpy().astype(np.float64), label)
 
         if score_history is not None:
             now = time.time()
