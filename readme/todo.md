@@ -169,3 +169,121 @@
 **Рекомендация**: начать с **Плана A** (parallel + perturbed seeds) — quick win, может дать -0.5..-1.5% за 1-2 часа. Потом решить идти ли в План B (DREAMPlace).
 
 Подробный журнал прогонов с per-bench разбивкой → [results.md](results.md).
+
+---
+
+## 7. Сессия 2026-05-04 (попытка плана C, прервано)
+
+### Что выяснили (важно для следующей сессии)
+
+**1. analytical_seed.py не работает как seed — surrogate loss не отражает proxy.**
+
+Прогнали `submissions/straple/analytical_seed.py` standalone на ibm17 (initial=1.7392):
+| Конфиг | proxy после analytical | Δ от initial |
+|---|---|---|
+| 200 шагов lr=0.3 lambda=50000 (placer.py default) | 1.8816 | **+8.2%** |
+| 300 шагов cold_start [(0,0),(0.2,100),(0.5,5000),(1,50000)] | 1.9440 | +11.8% |
+| 20 шагов lr=0.5 lambda=1000 | 1.8335 | +5.4% |
+| 50 шагов lr=0.3 lambda=5000 | 1.8396 | +5.8% |
+| 50 шагов lr=0.1 lambda=1000 | 1.7850 | +2.6% (минимальный, всё равно хуже) |
+
+**Корневая причина**: smooth HPWL surrogate (LSE с gamma~3.6) и Gaussian-bell density penalty НЕ КОРРЕЛИРУЮТ с реальным proxy_cost. Adam успешно минимизирует loss (8M → 4M), но реальный proxy растёт. Density goes 0.945→1.067, congestion goes 2.426→2.708. Конгестию вообще не моделируем — а это 66% метрики.
+
+**Что делать чтобы починить (НЕ ДЕЛАЛИ — это 1-2 дня):**
+- Добавить congestion-aware loss (bell-curve smoothing edge contributions to grid cells)
+- Tune gamma/lambda через адаптивный update (как DREAMPlace's overflow-based subgradient ascent)
+- Использовать Nesterov вместо Adam (DREAMPlace recipe)
+- Возможно, проверить нет ли багов в density_penalty (target_util scale, normalization)
+
+**2. Plan A: perturbed multi-start не помог в наивной форме.**
+
+Изначально заменили start_idx=1,2 (same-seed multi-start) на perturbed σ=0.03, 0.05 of canvas. **Регрессия**: AVG4 1.3886 → **1.3962** (+0.55%). На ibm10 ушли с 1.2282 на 1.2588.
+
+**Урок**: same-seed multi-start (3 starts с seeds 42,43,44) УЖЕ даёт diversity, особенно на ibm10. Менять её на perturbed = терять рабочую находку. Refactor на additive (3 orig + N perturbed extras) сделан в коде, **не измерен** (тест прерван).
+
+**3. DREAMPlace интеграция через Docker возможна, но многодневная.**
+
+- Склонили `external/DREAMPlace/` (BSD-3, github.com/limbo018/DREAMPlace)
+- Запустили colima x86 VM на Mac arm64
+- Скачали `limbo018/dreamplace:cuda` (20.2 GB) — оказалось это **только окружение**, DREAMPlace надо билдить внутри (~1 час компиляции из-за многих submodules: Limbo, Flute, OpenTimer, CUB, munkres-cpp)
+- Без CUDA на Mac — только CPU mode, через Rosetta x86 — медленно
+- TILOS уже имеет `external/MacroPlacement/CodeElements/FormatTranslators/src/ProtobufToLEFDEF.py` — конвертер protobuf → LEF/DEF (нужен для feed в DREAMPlace). Требует `tqdm` (не в наших deps).
+
+### Изменения в коде (uncommitted, в submissions/straple/placer.py)
+
+**Backward-compatible env var инфраструктура** (поведение по дефолту НЕ изменилось):
+- `STRAPLE_PERTURB_EXTRA_STARTS` (default 0) — добавить N perturbed starts поверх 3 same-seed (только для n_movable >= 300)
+- `STRAPLE_PERTURB_SCALES` — comma-sep σ factors для perturbed (default `0.05,0.10,0.15,0.20`)
+- `STRAPLE_LNS_OUTER_CAP` (default 50000) — cap LNS outer iters
+- `STRAPLE_LNS_OUTER_FACTOR` (default 60.0) — multiplier для adaptive_outer
+- `STRAPLE_NUM_STARTS` — override num_orig_starts (был раньше)
+- `STRAPLE_ANALYTICAL_PRESET=cold_start` — lambda/gamma schedule (мёртвый код, analytical не работает)
+
+**Логика**: для analytical seed теперь `legalize_min_displacement(500)` + `legalize()` safety net вместо disruptive `legalize()`. Тоже мёртвый код пока.
+
+`_perturb_initial(args, start_idx)` — Гауссов шум σ_factor * min(canvas_w, canvas_h), clamp в canvas, не двигает non-movable. Семя RNG = `self.seed + start_idx*1000 + 7`.
+
+**Решение**: можно либо закоммитить инфраструктуру (она безопасна — поведение не меняет), либо `git checkout submissions/straple/placer.py` чтобы откатить.
+
+### Рекомендованный план для следующей сессии
+
+**Краткий путь к улучшению (1 день)**:
+1. Закоммитить env-var инфраструктуру (`git add submissions/straple/placer.py`)
+2. Тестировать `STRAPLE_LNS_OUTER_CAP=100000 STRAPLE_LNS_OUTER_FACTOR=120` — больше LNS итераций может дать -0.5..-1%. Wall ibm17 вырастет до ~50 мин (в 1ч лимита).
+3. Если ок — measure full --all для AVG17.
+4. Затем `STRAPLE_PERTURB_EXTRA_STARTS=2 STRAPLE_PERTURB_SCALES=0.05,0.10` — additive perturbation. Измерить best of 5 vs best of 3.
+
+**Длинный путь (3-5 дней)**:
+1. Билд DREAMPlace внутри docker контейнера (image уже скачан)
+2. `pip install tqdm`, прогнать `ProtobufToLEFDEF.py` на ibm01 → LEF/DEF
+3. Скормить в DREAMPlace, получить positions
+4. Конвертировать обратно (DEF parsing + matching macro names)
+5. Wire как один из multi-start seeds
+6. Tune hyperparams (target_density, density_weight, gamma)
+
+**Альтернатива (1-2 дня) — починить свой analytical**:
+- Добавить congestion-aware loss
+- Adaptive density_weight (как DREAMPlace's overflow-based)
+- Nesterov instead of Adam
+- Тест: должен ХОТЯ БЫ матчить initial proxy на ibm17, иначе бесполезно
+
+### Инсайт от MTK (#3, DreamPlace++, score 1.2818)
+
+Из публичного комментария Billy Lee (MediaTek):
+
+> "Standard continuous models naturally struggle here. Our 'DreamPlace++' approach
+> succeeded by introducing **structural constraints** and a **dynamic, multi-phase
+> spatial optimization strategy**. The raw parallel power of the GPU was crucial —
+> it allowed us to efficiently evaluate these complex boundaries and **smoothly
+> steer the analytical engine out of local traps into a highly optimized,
+> zero-overlap state**."
+
+**Что отсюда можно вытащить:**
+
+1. **Vanilla DREAMPlace недостаточен** — даже #3 место строилось НЕ на голом DREAMPlace, а на надстройке поверх. Подтверждает наше наблюдение, что наш analytical_seed.py с базовыми компонентами (smooth WL + density bell) обречён.
+
+2. **Multi-phase optimization** — не один проход gradient → legalize, а несколько фаз с разными целями. Возможные интерпретации:
+   - Phase 1: coarse global placement (пусть с overlap'ами)
+   - Phase 2: пересборка density bins, узкие constraint'ы → refinement
+   - Phase 3: legalize-aware finishing (макросы уже почти non-overlapping, нужно только snap)
+   - Аналог DREAMPlace's overflow-based subgradient с stop_overflow=0.07: lambda растёт пока overflow > порог.
+
+3. **Structural constraints** — НЕ просто WL + density. Что это может быть:
+   - **Pre-clustering** макросов по netlist topology (mincut / spectral) → жёстко держим cluster в одном регионе
+   - **Symmetry constraints** для регулярных IP (memory arrays)
+   - **Border-affinity** — макросы с большим количеством IO-пинов прижимать к краю
+   - **Region partitioning** — заранее разбить canvas на несколько регионов и распределить макросы по нагрузке
+
+4. **"Smoothly steer out of local traps"** — escape от bad local minima ВНУТРИ analytical engine, не через рестарты:
+   - Адаптивный density_weight (растёт когда overflow высокий, как DREAMPlace overflow algo)
+   - Адаптивная gamma (decreasing schedule в зависимости от overflow, как у них)
+   - Возможно momentum → Nesterov, чтобы не залипать в плоских регионах
+
+5. **"Zero-overlap state"** из аналитического выхода — они выходят УЖЕ почти-legal. Значит multi-phase сходится к решению с минимумом overlap'ов, и финальный legalize_min_displacement не разрушает layout. Это решает нашу проблему "after legalize структура теряется".
+
+**Action items для нашего placer (если идём по аналитическому пути):**
+- Реализовать adaptive density_weight + adaptive gamma schedule (DREAMPlace overflow algorithm) в `analytical_seed.py`
+- Добавить congestion-aware loss term
+- Перед analytical: hierarchical clustering макросов (METIS / spectral) → использовать как **initial structural prior**
+- Multi-phase scheduling с stop conditions per phase (overflow target, gradient norm threshold)
+- На каждой фазе пересобирать density bins (увеличивать разрешение к концу)
