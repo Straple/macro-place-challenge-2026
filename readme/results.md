@@ -34,6 +34,59 @@
 
 ## 📂 Журнал прогонов
 
+### #26 · 2026-05-04 · попытка плана C (DREAMPlace + perturbation) — РЕГРЕССИЯ, прервано
+
+**Контекст**: следующая сессия после submission #25 (AVG4=1.3886, AVG17=1.4445). Цель — пробить топ-7 (≤1.3479) для квалификации на Гран-при.
+
+**Что попробовали:**
+
+**(а) DREAMPlace native build на Mac arm64** — слишком долго setup (нужны GCC 7.5, Boost, Bison, кучу submodules). Через Docker x86 emulation (colima) — образ `limbo018/dreamplace:cuda` 20 ГБ скачан, но это только окружение, билд внутри 1+ час. Отложено.
+
+**(б) Свой `analytical_seed.py` (Adam + smooth HPWL + density bell)** — проверили standalone на ibm17 (initial proxy=1.7392):
+- 200 шагов lambda=50000 (placer.py default): proxy=**1.8816** (+8.2%)
+- 300 шагов cold_start schedule: proxy=**1.9440** (+11.8%)
+- 50 шагов lr=0.1 lambda=1000 (минимально-инвазивно): proxy=**1.7850** (+2.6%)
+
+ВСЕ конфиги ХУЖЕ initial. Корневая причина: smooth WL surrogate (LSE) и density bell не коррелируют с реальным proxy. Adam успешно минимизирует loss (8M→4M), но реальный proxy_cost растёт. Конгестию вообще не моделируем (66% метрики).
+
+Чтобы починить — переписать loss с congestion-aware moe + adaptive density_weight (как DREAMPlace). 1-2 дня работы.
+
+**(в) Perturbed-initial multi-start (план A)** — добавили в `placer.py`:
+- `_perturb_initial`: Гауссов шум σ_factor × min(canvas_w, canvas_h), clamp в canvas, non-movable не трогаем
+- env vars: `STRAPLE_PERTURB_EXTRA_STARTS`, `STRAPLE_PERTURB_SCALES`, `STRAPLE_LNS_OUTER_CAP`, `STRAPLE_LNS_OUTER_FACTOR`
+
+**Тест 1 (заменили start 1, 2 на perturbed σ=0.03, 0.05):** РЕГРЕССИЯ 1.3886 → **1.3962** (+0.55%).
+
+| Bench | baseline #25 | perturb σ=0.03,0.05 | Δ |
+|---|---|---|---|
+| ibm01 | 1.0584 | 1.0584 | 0 (n<300, не trigger) |
+| ibm10 | 1.2282 | **1.2588** | **+2.49%** ⚠ |
+| ibm14 | 1.5454 | 1.5454 | 0 |
+| ibm17 | 1.7223 | 1.7223 | 0 |
+| **AVG4** | **1.3886** | **1.3962** | **+0.55%** ⚠ |
+| Wall | 1797s | 1664s | -7% (быстрее, т.к. perturb path иногда раньше сходится) |
+
+**Урок #1**: same-seed multi-start (3 starts с seeds 42, 43, 44) УЖЕ даёт diversity, особенно на ibm10. `_run_one_start` использует `self.seed + start_idx` для C++ RNG (state.rng) и Python ALNS (np.random.default_rng), разные start_idx → разные пути → разные минимумы. Заменять на perturbed = терять рабочую находку.
+
+**Refactor (не измерен, fast_check прервал юзер)**: keep 3 same-seed orig + ADD `STRAPLE_PERTURB_EXTRA_STARTS` perturbed extras. Best-of-N ≤ best-of-3 в худшем случае. Стоит измерить.
+
+**Что делать дальше** (см. [todo.md секция 7](todo.md#7-сессия-2026-05-04-попытка-плана-c-прервано)):
+- Закоммитить env-var infrastructure (поведение по дефолту = baseline)
+- `STRAPLE_LNS_OUTER_CAP=100000 STRAPLE_LNS_OUTER_FACTOR=120` — больше LNS budget, может дать -0.5..-1%
+- `STRAPLE_PERTURB_EXTRA_STARTS=2` — additive perturbed starts, без потери same-seed
+- DREAMPlace integration — отдельная многодневная задача
+
+**Состояние кода**: изменения в `submissions/straple/placer.py` uncommitted (60 строк изменений). Backward-compatible — default behavior без env vars = #25 baseline. `git checkout submissions/straple/placer.py` для отката.
+
+**Команды для воспроизведения регрессии:**
+```bash
+# Регрессия (заменили same-seed на perturb) — было до refactor:
+# (Сейчас в коде refactor — заменено на additive)
+# git diff покажет текущее состояние
+```
+
+---
+
 ### #25 · 2026-05-04 · 🏆 FULL `--all` РЕЗУЛЬТАТ для submission: AVG17=1.4445 (vs RePlAce -0.91%)
 
 Запустили `scripts/fast_check.py --benches ibm01..ibm18 --workers 12` (parallel runner) на всех 17 IBM benchmarks с финальным конфигом:
