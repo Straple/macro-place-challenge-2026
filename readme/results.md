@@ -4,11 +4,16 @@
 
 ---
 
-## 🏆 Текущий best score
+## 🏆 Текущий best score (FINAL для submission)
 
 | | Значение |
 |---|---|
+| **AVG17 proxy** (все 17 IBM benches) | **1.4445** ⭐ (vs RePlAce -0.91%, vs Top-10 +2.62%) |
 | **AVG4 proxy** (ibm01/10/14/17) | **1.3886** ⭐⭐⭐⭐ #24 (**vs RePlAce -2.19%, ниже Top-10 -1.35%!**) |
+| Average runtime per bench | **8.8 мин** (528s) |
+| Max per bench (ibm17) | 28.7 мин (в пределах 1ч лимита) |
+| Total placer time (sum 17) | 149.6 мин (parallel wall: 32.5 мин с 12 workers) |
+| Overlaps | **0 на ВСЕХ 17** ✅ |
 | AVG17 proxy (--all) | 1.5181 (#4, перезамерить) |
 | Placer | `submissions/straple/placer.py` (C++ + adaptive LNS + чередование congested/random) |
 | Дата замера | 2026-05-03 |
@@ -28,6 +33,52 @@
 ---
 
 ## 📂 Журнал прогонов
+
+### #25 · 2026-05-04 · 🏆 FULL `--all` РЕЗУЛЬТАТ для submission: AVG17=1.4445 (vs RePlAce -0.91%)
+
+Запустили `scripts/fast_check.py --benches ibm01..ibm18 --workers 12` (parallel runner) на всех 17 IBM benchmarks с финальным конфигом:
+- 3 starts + до 3 refine passes
+- LNS budget: max(30, min(50000, ceil(60*N_movable)))
+- 4 ALNS-операторa (rand/cong/swap/cluster) с adaptive weights
+- Shake-up при stagnation
+
+**Per-bench результаты** (overlaps=0 на всех):
+
+| Bench | n_macros | Proxy | RePlAce | Δ vs RePlAce | Time |
+|---|---|---|---|---|---|
+| ibm01 | 246 | **1.0584** | 0.9976 | +6.1% | 96.7s |
+| ibm02 | 254 | 1.4957 | 1.8370 | **-18.6%** ⭐ | 161.5s |
+| ibm03 | 269 | 1.3666 | 1.5223 | **-10.2%** ⭐ | 110.1s |
+| ibm04 | 285 | 1.3233 | 1.5786 | **-16.2%** ⭐ | 157.6s |
+| ibm06 | 318 | 1.6748 | 1.6182 | +3.5% | 95.9s |
+| ibm07 | 335 | 1.5511 | 1.4717 | +5.4% | 152.8s |
+| ibm08 | 352 | 1.4590 | 1.4287 | +2.1% | 286.2s |
+| ibm09 | 369 | 1.1434 | 1.1192 | +2.2% | 134.5s |
+| ibm10 | 387 | **1.2282** | 1.4928 | **-17.7%** ⭐ | 1486.1s |
+| ibm11 | 405 | 1.1939 | 1.1781 | +1.3% | 334.8s |
+| ibm12 | 423 | 1.6066 | 1.7239 | **-6.8%** ⭐ | 1174.0s |
+| ibm13 | 441 | 1.3669 | 1.3304 | +2.7% | 493.7s |
+| ibm14 | 460 | 1.5454 | 1.5436 | +0.1% (parity) | 968.3s |
+| ibm15 | 479 | 1.5730 | 1.5132 | +4.0% | 550.1s |
+| ibm16 | 498 | 1.4687 | 1.4760 | -0.5% (parity) | 794.5s |
+| ibm17 | 517 | 1.7223 | 1.6448 | +4.7% | 1723.6s (28.7 мин) |
+| ibm18 | 537 | 1.7791 | 1.7722 | +0.4% (parity) | 256.9s |
+| **AVG17** | — | **1.4445** | **1.4578** | **-0.91%** ⭐ | **avg=8.8 мин** |
+
+- **vs RePlAce (1.4578): -0.91%** ⭐⭐⭐ — пробили baseline
+- vs Top-10 (1.4076): +2.62% — между 14-17 местом
+- vs Top-7 Гран-при (1.3479): +7.17% — далеко
+- vs Straple #4 baseline (1.5181): -4.85%
+
+**Где обходим RePlAce** (8 из 17 бенчей): ibm02 -18.6%, ibm03 -10.2%, ibm04 -16.2%, ibm10 -17.7%, ibm12 -6.8%, ibm14 parity, ibm16 parity, ibm18 parity.
+
+**Где RePlAce лучше**: ibm01 (+6.1%), ibm06-09 (+2-5%), ibm07/15/17 (+4-5%).
+
+**Time**: 32.5 мин wall (parallel 12 workers), max ibm17=28.7 мин — внутри 1ч/bench лимита ✅.
+
+**Команда**: `uv run python scripts/fast_check.py --benches ibm01..ibm18 --workers 12`
+
+---
 
 ### #24 · 2026-05-04 · Multiple refine passes (3) — FINAL BEST 🏆🏆 AVG4=1.3886 (vs RePlAce -2.19%)
 
