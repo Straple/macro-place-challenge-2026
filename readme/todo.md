@@ -1,376 +1,171 @@
-# Macro Placement Challenge 2026 — План
+# Macro Placement Challenge 2026 — План и журнал
 
-> Личный todo / журнал для участия в Partcl × HRT Macro Placement Challenge.
-> Команда: **Straple** (репо: `Straple/macro-place-challenge-2026`).
+> Команда **Straple** (приватный репо `Straple/macro-place-challenge-2026`).
+> Дедлайн: **2026-05-21**. Сегодня: **2026-05-04** (17 дней).
 
 ---
 
-## 🚦 Текущий статус
+## 🚦 Текущий статус (после 25 циклов оптимизации)
 
-| Метрика | Значение | Источник |
+| | Значение |
+|---|---|
+| **Submitted AVG17 proxy** | **1.4445** (commit `c758df2`) |
+| **Submitted AVG4** (ibm01/10/14/17) | 1.3886 (отчётный для итераций) |
+| **Место** | ~16 (между ArzunPD 1.4421 и Pragnay 1.4427 / Convex 1.4556) |
+| **vs RePlAce baseline (1.4578)** | **-0.91%** — пробили ✅ |
+| **vs Top-10 (1.4076)** | +2.62% — нужно ещё **-2.6%** |
+| **vs Top-7 (Гран-при, 1.3479)** | +7.17% — нужно ещё **-6.7%** |
+| Submission status | ☑ Заполнено в Google form, репо приватный + access судьям |
+| Wall time --all (parallel 12 cores) | 32.5 мин (max ibm17 = 28.7 мин — в пределах 1ч лимита) |
+| Overlaps | **0 на всех 17** ✅ |
+
+**Sub'd как**: "Adaptive LNS with Multi-Operator Search" — Pure C++ ALNS placer (4 destroy/repair operators, adaptive weights, multi-start, refine passes).
+
+---
+
+## 1. Анализ leaderboard (актуальный, 2026-05-04)
+
+| # | Команда | Score | Подход | Open-source? |
+|---|---|---|---|---|
+| 1 | Cezar (ReFine) | 1.2224 | RL refinement над analytical seed (закрыто, disputed) | ❌ |
+| 2 | RoRa (RoomPlace) | 1.2723 | "Rip and re-place" + analytical seed (pending verify) | ❌ |
+| 3 | MTK (DreamPlace++) | 1.2818 | DREAMPlace + tuning, GPU 37s | ❌ |
+| 4 | Electric Beatle (ePlace-Lite) | 1.3253 | Adam stochastic descent + multi-start hyperparam sweep, GPU 2000s | ❌ |
+| 5 | UToronto MOSAIC | 1.3323 | Custom gradient + smooth WL/density/cong + joint hard+soft, **CPU** 24 мин | ❌ |
+| 6 | V5 (TierPlace) | 1.3382 | GPU multi-density-formulation + phased optimization, 850s | ❌ |
+| 7 | Shoom (MultiDREAMPlace) | 1.3381 | Multi-start DREAMPlace + min-disp legalize + SA, 350s | ❌ |
+| 8 | Archgen (AutoDMP++) | 1.3479 | NVlabs AutoDMP fork: multi-start + Bayesian hyperparam + bounded refinement | based on [AutoDMP](https://github.com/NVlabs/AutoDMP) |
+| 9 | Beatel (ePlace-Lite older) | 1.3913 | GPU 155s | ❌ |
+| 10 | UT Austin AS | 1.4076 | **Plain DREAMPlace**, 17s | based on [DREAMPlace](https://github.com/limbo018/DREAMPlace) |
+| 11 | ByteDancer | 1.4151 | Incremental Coordinate Descent, 38min/bench | ❌ |
+| 12 | vmallela | 1.4152 | Pure Python+numpy CD+LNS, single-thread, 12h total | ❌ |
+| 13 | TAISPlAce | 1.4321 | **ALNS + Thompson Sampling** (bandit operator selection) | ❌ |
+| 14 | ArzunPD | 1.4421 | HyperPlace SA+LNS | ❌ |
+| 15 | Pragnay | 1.4427 | SweepingBellPlacement | ❌ |
+| **16** | **Мы (Straple ALNS)** | **1.4445** | **Pure C++ ALNS + multi-start + refine** | private |
+| 17 | Convex Optimization (UWaterloo) | 1.4556 | — | — |
+| — | RePlAce baseline | 1.4578 | — | TILOS published |
+
+### Главные паттерны топ-10
+
+1. **DREAMPlace или ePlace-style analytical placer** — фундамент 80% top-10. Это **наш главный пробел**.
+2. **Recipe топа**: `analytical seed → min-displacement legalize → multi-start hyperparam sweep → SA/LNS polish`
+3. **GPU помогает но не критично**: MOSAIC #5 = CPU 24 мин, мы тоже могли бы 24 мин.
+4. **Чистый LNS застревает на ~1.42-1.45** (TAISPlAce, ArzunPD, vmallela, мы) — без gradient seed дальше не пробьёшь.
+5. **Soft macro joint optimization** — MOSAIC явно делает.
+
+### DQ-ловушки в которые попали другие
+- `Mike Gao`: DREAMPlace silent fail → 47-189 overlaps на bench
+- `BakaBobo`: import error в чистой среде
+- `vmallela`: self-reported 1.1172 → verified 1.4152 (-27% на их железе)
+
+**Урок**: тестировать в чистой среде, не полагаться на оптимизированные локальные настройки.
+
+---
+
+## 2. Что мы попробовали (25 циклов)
+
+### Сработало (chronological)
+| Cycle | Что | Эффект |
 |---|---|---|
-| **Phase** | Phase 0 завершена → начинаем Phase 1 (LNS skeleton) | — |
-| **Окружение** | uv 0.11.8, Python 3.14.4, torch 2.10.0, submodule подтянут | этот ноут (Mac ARM) |
-| **Best AVG proxy** | **1.5336** (will_seed reference) | [results.md](results.md) |
-| **Будем 25/30** в leaderboard | Если бы сабмитили сейчас | — |
-| **Gap до RePlAce** | -5.2% (нужно улучшить) | — |
-| **Gap до топ-7** | -12.7% (Tier 2/Гран-при) | — |
-| **Gap до топ-1** | -25.3% (Cezar 1.2224) | — |
+| #1 | Congestion-aware destroy в LNS | -0.11% |
+| #3 | Adaptive LNS + чередование ops | -0.30% |
+| #4 | **Congestion-aware repair** (spiral search threshold по cong-grid) | -0.89% |
+| #7-8 | Multi-start N=3 → N=5 для больших | -1.11% |
+| #10-11 | LNS budget 60 → 100 → 150 outer iters | -1.32% |
+| **#12** | **🚨 BUG FIX: evaluator 1:1:1 → 1:0.5:0.5** | -1.48% (критично) |
+| #13 | Skip SA для больших (n>=300) — SA там вреден | -1.99% |
+| #14 | Vectorize `_smooth_hpwl` — 37× ускорение analytical | (для будущего) |
+| #19 | 2-opt swap operator + LNS budget 8000 | -3.85% |
+| #20 | ALNS adaptive weights + cluster destroy | **-4.93%** (пробили RePlAce) |
+| #21 | 3 starts × 25000 LNS | -5.28% (ниже Top-10 на AVG4) |
+| #22 | Shake-up + LNS 50000 | -5.85% |
+| #24 | 3 refine passes intensification | **-6.42%** AVG4 = 1.3886 |
+| #25 (--all) | Full 17 benchmarks с финальным конфигом | **AVG17 = 1.4445** |
+| #26 | Parallel multi-start infrastructure (mp.Pool) | (готово, не использовано в submission) |
 
-**Полные результаты замеров:** [results.md](results.md).
+### Не сработало / откатили
+- **Analytical seed (DREAMPlace-style)** — наш `analytical_seed.py` после legalize+LNS даёт **хуже** original initial. Initial benchmark.macro_positions уже хорош, наш analytical сходит в worse local minimum. (cycles #15-#18)
+- **Adaptive SA budget** — больше SA = хуже proxy (SA optimize wrong objective HPWL). (cycle #9)
+- **No alternation random/congested** — exploration важна. (cycle #2 регрессия +0.46%)
+- **Tighter cong threshold P30** — слишком много fallback. (cycle #5)
+- **Stronger swap (k=destroy)** — disruptive. (cycle #22)
+- **Proximity-based swap** — хуже net-bias. (cycle #22)
+- **Single start × 60000** — теряет diversity на ibm10. (cycle #20)
+- **8 random-seed multi-start** — все сходят в один attractor (нужна structural diversity, не RNG)
 
 ---
 
-## 0. Контекст и цели
+## 3. Цели и план до дедлайна (17 дней)
 
-| Что | Значение |
-|---|---|
-| **Дедлайн** | 21 мая 2026, 23:59 PT |
-| **Призы** | $20K Grand / $20K Proxy / $5K 2nd / $4K Innovation + swag |
-| **Tier 1** (proxy) | Среднее по 17 IBM benchmarks. RePlAce baseline = **1.4578** |
-| **Tier 2** (Grand) | Топ-7 по proxy → ORFS на 4 NG45 designs (+ 1-2 hidden) → WNS:TNS:Area = 3:2:1 |
-| **Лимит** | 1 час на benchmark, 16 ядер + 100 GB RAM + RTX 6000 Ada 48 GB |
-| **Лицензия победителя** | Apache 2.0 / MIT (open-source обязателен) |
+### Цели по уровням ambition
 
-**Цели по уровням** (текущий best = will_seed 1.5336):
-
-| Уровень | Цель | Прирост от текущего | Что даёт |
+| Уровень | AVG17 | Δ от 1.4445 | Что даёт |
 |---|---|---|---|
-| 🎯 **Минимум** | proxy ≤ **1.4578** | **-5.2%** | Выше RePlAce baseline → есть место в leaderboard выше baseline'а |
-| 🎯 Топ-10 | proxy ≤ 1.4076 | -8.9% | Видимая позиция в топе |
-| 🎯 **Реалистично** | proxy ≤ **1.3479** | **-12.7%** | Топ-7 → **квалификация на Tier 2 / Гран-при** |
-| 🎯 Топ-3-5 | proxy ≤ 1.32 | -14% | Серьёзная борьба за призы |
-| 🎯 Амбициозно | proxy ≤ **1.2224** | -25.3% | Первое место (как Cezar) |
+| 🎯 Текущее | 1.4445 | 0% | ~16 место, выше RePlAce |
+| 🎯 +1 место (Pragnay) | 1.4427 | -0.13% | trivial polishing |
+| 🎯 Топ-13 (TAISPlAce) | 1.4321 | -0.86% | улучшение LNS / больше budget |
+| 🎯 **Топ-10** | 1.4076 | **-2.55%** | **требует gradient seed** |
+| 🎯 Топ-8 (Archgen) | 1.3479 | -6.69% | DREAMPlace-class + multi-start |
+| 🎯 Гран-при ($20K) | ~1.30 | -10% | топ DREAMPlace + GPU + ORFS работает |
+
+### План A: incremental wins (1-2 дня) — реалистичный для топ-13
+
+1. **Parallel multi-start с N=16** на eval-машине (16 cores) с diverse seeds
+   - Random RNG не работает (узнали). Нужна **structural diversity**:
+     - Perturbed initial: `initial_pos + noise(σ=0.05·canvas)` для каждого старта
+     - Или несколько hyperparameter configs (разные shake_threshold, destroy_size, etc.)
+   - **Ожидание**: -0.5..-1.5% AVG17 → **1.42-1.43**
+   - **Effort**: уже есть `STRAPLE_PARALLEL_STARTS` env var. Добавить perturbation в `_run_one_start`.
+
+2. **Per-bench profiling на ibm06-09** где мы хуже RePlAce — найти что не так
+   - На ibm06, ibm07, ibm08, ibm09 у нас +2..+5% от RePlAce. Возможно tuning per-size-class.
+
+3. **Final --all run в чистой среде** для verification до сабмита
+
+### План B: gradient seed (2-4 дня) — для топ-10
+
+1. **Интегрировать [DREAMPlace](https://github.com/limbo018/DREAMPlace)** (BSD-3) как один из multi-start seeds
+   - Subprocess wrapper или Python embedding
+   - DREAMPlace requires: PyTorch, SCIP optional, CPU OR GPU build
+   - Output → наш min-displacement legalize → LNS polish
+   - **Ожидание**: -2..-5% AVG17 → **1.37-1.42**
+   - **Effort**: 2-3 дня (build, integration, testing, dependency management)
+   - **Риск**: сложности с deps в чистой среде (как у Mike Gao — silent fail)
+
+2. **Альтернатива: фикс собственного analytical_seed.py**
+   - Главная проблема: после legalize теряется structure
+   - Fix: совместить analytical с min-displacement legalize что **не разрушает** layout
+   - Может работать без external deps
+   - **Effort**: 1-2 дня
+   - **Ожидание**: -1..-3% если получится
+
+### План C: реальный DREAMPlace + ORFS Tier 2 (5-7 дней) — для Гран-при
+
+Только если получится топ-7 по proxy. Требует ORFS docker setup, NG45 designs.
 
 ---
 
-## 1. Анализ leaderboard — что работает у топов
+## 4. Критичные риски до сабмита
 
-Извлечено из [README.md:233-265](../README.md#L233). Сортировка по proxy cost (ниже = лучше).
-
-| # | Команда | Score | Что делают |
-|---|---|---|---|
-| 1 | Cezar **(ReFine)** | 1.2224 | Verified, оспаривает результат — детали скрыты |
-| 2 | MTK **(DreamPlace++)** | 1.2818 | DREAMPlace + улучшения. **GPU, 37s/bench** |
-| 3 | RoRa (RipPlace) | 1.3241 | 694s/bench |
-| 4 | UToronto **(MOSAIC)** | 1.3323 | Gradient-based + smooth surrogates, hard+soft вместе |
-| 5 | Shoom **(MultiDREAMPlace)** | 1.3381 | Multi-start DREAMPlace + min-displacement legalization + SA |
-| 6 | V5 **(TierPlace)** | 1.3382 | GPU, multi-density-formulation pilot + phased optimization |
-| 7 | Archgen **(AutoDMP++)** | 1.3479 | Multi-start + fast proxy screening + bounded refinement |
-| 8 | Beatel (ePlace-Lite) | 1.3913 | GPU, 155s/bench |
-| 9 | Varun (GRPlace) | 1.4017 | 27s/bench |
-| 10 | UT Austin AS | 1.4076 | DREAMPlace Analytical, 17s/bench |
-| 11 | ByteDancer | 1.4151 | Incremental CD, 38min/bench |
-| 12 | vmallela | 1.4152 | **Pure Python+numpy single-threaded**, Incremental CD+LNS |
-| 14 | ArzunPD | 1.4421 | HyperPlace SA+**LNS** |
-| 13 | TAISPlAce | 1.4321 | A**LNS** + Thompson Sampling |
-| **—** | **RePlAce baseline** | **1.4578** | **порог отсечки** |
-| 22 | SEVmakers | 1.5200 | Hybrid Legalization + SA |
-| **—** | **SA baseline** | **2.1251** | |
-| **—** | Greedy Row demo | 2.2109 | |
-
-### Главные выводы
-
-1. **DREAMPlace (DRP) доминирует** в топ-10: места 2, 5, 7, 10 — все на нём. Это GPU-ускоренная версия RePlAce/ePlace; де-факто стандартный seed для современных решений.
-2. **Multi-start работает**: Shoom (#5), Archgen (#7) — несколько запусков с разных random seeds → выбор лучшего.
-3. **GPU даёт скорость**: топ-2 в **37 секунд**, топ-10 в **17 секунд**. CPU-only решения работают в десятки раз дольше.
-4. **Чистый LNS застревает на ~1.42-1.45** (TAISPlAce, ArzunPD, vmallela). Без хорошего seed LNS только догоняет RePlAce.
-5. **Soft macros важны**: MOSAIC (#4) явно оптимизирует hard+soft вместе. SA baseline тоже двигает soft через `plc.optimize_stdcells()`. Простые placer'ы оставляют soft на месте → теряют 5-15% по proxy.
-6. **Tier 1 тесты ОТКРЫТЫЕ** ([README.md FAQ](../README.md#L281)). Те же 17 IBM benchmark файлы используются у нас и у судей. Self-reported = verified (с поправкой на железо). Это рычаг — можно глубоко анализировать каждый benchmark, тренировать ML на них. Но **хардкод под имя бенчмарка = DQ** ([README.md:88](../README.md#L88)). Адаптивная логика по структуре (`if num_macros > 500: ...`) — ок.
-7. **DQ-ловушки** (важно избежать):
-   - `Mike Gao`: DREAMPlace silent fail в eval environment → 47-189 overlaps на benchmark
-   - `BakaBobo`: код импортирует несуществующий `macro_place.fast_proxy`
-   - `vmallela`: self-reported 1.1172, на их железе **1.4152** — 27% хуже
-   - **Урок:** тестировать в чистой среде до сабмита, не полагаться на свои оптимизированные компоненты, явно пинить зависимости
-
-### Что выбираем мы
-
-**Стратегия:** **DREAMPlace как seed → LNS-refinement сверху**.
-
-Это даёт:
-- DREAMPlace доводит до ~1.30-1.40 за минуты
-- LNS-фаза дополнительно улучшает на 3-7% (видно у Shoom #5: DRP+SA → 1.3381)
-- Возможность win по Innovation Award за гибрид (если достаточно оригинален)
-
-Если LNS зайдёт хорошо — потенциальный target ~1.30-1.32 (топ-3-5).
+- [ ] **Repo verification mismatch** (как у vmallela -27%). Мы детерминируемся, должно быть consistent. Но hardware у судей: 16-core EPYC vs наш 12-core M-series. Может быть minor differences.
+- [ ] **Final pre-submit run в чистой среде** (новый clone в /tmp, чистый uv sync) — to catch dependency issues.
+- [ ] **bounds-violations** на 15 из 17 бенчей (макросы вне canvas). Это **НЕ DQ** по checklist (только overlaps), но потенциальный риск если судьи усилят validation. Стоит закостыливать.
 
 ---
 
-## 2. API и инфраструктура (выжимка)
+## 5. Полезные ссылки
 
-### Сигнатура submission
-
-Файл: `submissions/straple/placer.py`
-
-```python
-import torch
-from macro_place.benchmark import Benchmark
-
-class StraplePlacer:
-    def __init__(self):
-        # evaluator зовёт без аргументов
-        pass
-
-    def place(self, benchmark: Benchmark) -> torch.Tensor:
-        # Возвращает [num_macros, 2] тензор центров (x, y) в микронах
-        # Hard macros: индексы [0, num_hard_macros)
-        # Soft macros: индексы [num_hard_macros, num_macros)
-        # Оба двигать можно и НУЖНО (см. SETUP.md:127)
-        ...
-```
-
-**Жёсткие требования** (см. [SETUP.md:152-157](../SETUP.md#L152)):
-- Координаты — **центры** макросов (не углы!)
-- Fixed macros (`benchmark.macro_fixed`) не двигаем
-- Все макросы внутри canvas (учитывая половину размера)
-- **Zero overlaps между hard macros** (soft могут перекрываться — это нормально, они абстракция кластеров)
-
-### Ключевые модули
-
-| Модуль | Что даёт |
-|---|---|
-| [macro_place/benchmark.py](../macro_place/benchmark.py) | `Benchmark` dataclass (canvas, macros, nets, fixed mask) |
-| [macro_place/loader.py](../macro_place/loader.py) | `load_benchmark_from_dir(path)` → `(Benchmark, plc)` |
-| [macro_place/objective.py](../macro_place/objective.py) | `compute_proxy_cost(placement, benchmark, plc)` → dict с `proxy_cost`, `wirelength_cost`, `density_cost`, `congestion_cost`, `overlap_count`, ... |
-| [macro_place/utils.py](../macro_place/utils.py) | `validate_placement(placement, benchmark)` → `(is_valid, violations)`; `visualize_placement(...)` |
-| [macro_place/evaluate.py](../macro_place/evaluate.py) | CLI `uv run evaluate <file>` |
-| [macro_place/def_writer.py](../macro_place/def_writer.py) | Экспорт в DEF (для Tier 2 ORFS, опц.) |
-
-### Формула proxy cost
-
-```
-proxy_cost = 1.0 × wirelength + 0.5 × density + 0.5 × congestion
-```
-
-- **Wirelength** — нормализованный HPWL (half-perimeter wirelength)
-- **Density** — top-10% самых плотных grid cells
-- **Congestion** — top-5% самых перегруженных routing-сегментов
-
-### Soft macro оптимизация
-
-Если двигаем hard, **обязательно** перестраиваем soft:
-
-```python
-canvas_size = max(benchmark.canvas_width, benchmark.canvas_height)
-plc.optimize_stdcells(
-    use_current_loc=False, move_stdcells=True, move_macros=False,
-    log_scale_conns=False, use_sizes=False, io_factor=1.0,
-    num_steps=[100, 100, 100],
-    max_move_distance=[canvas_size/100]*3,
-    attract_factor=[100, 1.0e-3, 1.0e-5],
-    repel_factor=[0, 1.0e6, 1.0e7],
-)
-```
-
-⚠️ Это **медленно в Python** (минуты на вызов). SA baseline вызывает редко, между батчами hard moves. Альтернатива — свой быстрый force-directed на GPU.
-
-### Бенчмарки
-
-- **Pre-processed `.pt` уже есть** в [benchmarks/processed/public/](../benchmarks/processed/public/) — 17 IBM + 4 NG45 + ASAP7 версии. Можно работать **без** инициализации submodule.
-- Submodule `external/MacroPlacement` нужен только для:
-  - Прогона полного evaluator с `uv run evaluate ... -b ibm01` (он грузит из `external/MacroPlacement/Testcases/...`)
-  - Tier 2 ORFS оценки (DEF/TCL → OpenROAD)
+- **DREAMPlace**: https://github.com/limbo018/DREAMPlace (BSD-3, GPU/CPU)
+- **AutoDMP** (надстройка над DREAMPlace с MOBO): https://github.com/NVlabs/AutoDMP
+- **ePlace 2014 paper**: https://cseweb.ucsd.edu/~jlu/papers/eplace-todaes14/paper.pdf
+- **Submission status**: monitor https://github.com/partcleda/partcl-macro-place-challenge — leaderboard updates через PRs от willpartcl
+- **TILOS MacroPlacement**: https://github.com/TILOS-AI-Institute/MacroPlacement — benchmarks + RePlAce baseline
 
 ---
 
-## 3. Roadmap (фазы)
+## 6. Решение что делать сейчас
 
-### Phase 0 — Setup (Day 1-2) ✅ ЗАВЕРШЕНА
+**Рекомендация**: начать с **Плана A** (parallel + perturbed seeds) — quick win, может дать -0.5..-1.5% за 1-2 часа. Потом решить идти ли в План B (DREAMPlace).
 
-- [x] Инициализировать submodule: `git submodule update --init external/MacroPlacement` — 3.5GB, 17 IBM benchmarks
-- [x] `uv sync` — установлено 24 пакета (torch 2.10.0, numpy 2.4.2, и т.д.)
-- [x] Прогнать demo: `uv run evaluate submissions/examples/greedy_row_placer.py -b ibm01` → proxy 2.0463
-- [x] Прогнать `--all` для greedy_row → AVG 2.2109 (точно как в leaderboard), 0.05s total
-- [x] Прогнать `--all` для will_seed → AVG **1.5336**, 34.74s total — **наша точка отсчёта**
-- [x] Smoke tests: `pytest test/test_smoke.py` → 7/7 PASSED
-- [ ] Прочитать [submissions/will_seed/placer.py](../submissions/will_seed/placer.py) целиком — детально, не через агента
-- [ ] Создать `submissions/straple/placer.py` с заглушкой (random placer) — убедиться что evaluator его подхватывает
-
-### Phase 1 — Реализация скелета LNS (Day 3-5) 👈 ТЕКУЩАЯ
-
-- [ ] **Initial seed**: начать с GreedyRowPlacer, потом заменить на DREAMPlace
-- [ ] **Cost cache**: кешировать proxy components чтобы не пересчитывать с нуля при destroy/repair
-- [ ] **Destroy operator (random)**: убрать k случайных макросов
-- [ ] **Repair operator (greedy bottom-left fill)**: восстановить по одному в позицию с минимальным delta_cost
-- [ ] **Acceptance**: greedy improve-only на старте
-- [ ] **Legalization**: либо встроить в repair (только swap-ы в legal позиции), либо post-pass spiral search (как у will_seed)
-- [ ] **Замер**: на ibm01 — должен побить greedy_row (~1.7) минимум до ~1.5
-
-### Phase 2 — Хороший seed (Day 6-10) ☐
-
-DREAMPlace интеграция — это самое жирное улучшение по leaderboard.
-
-- [ ] Изучить, можно ли прицепить `dreamplace` PyPI пакет / `dreamplace-fpga` / открытую реализацию
-- [ ] Альтернатива: написать **свой analytical placer** (gradient descent на smooth bell-shaped density + log-sum-exp WL approximation) — это путь MOSAIC #4
-- [ ] Альтернатива минимум: использовать **force-directed** placement на bipartite graph (быстрее писать, хуже DRP)
-- [ ] Сравнить seed'ы на ibm01-ibm04: какой даёт лучший pre-LNS proxy cost?
-
-### Phase 3 — LNS operators (Day 11-15) ☐
-
-- [ ] **Adaptive operator selection** (как ALNS — TAISPlAce топ-13): набор destroy/repair операторов с весами, обновляющимися по успеху
-- [ ] Destroy variants:
-  - random k macros
-  - spatially-clustered subset (соседи по координатам)
-  - worst-cost subset (макросы с худшим вкладом в HPWL)
-  - net-based (макросы из одной "плохой" сети)
-- [ ] Repair variants:
-  - greedy min-delta-cost insertion
-  - mini-SA на subset
-  - force-directed re-insertion
-- [ ] **Simulated-annealing acceptance** (а не просто greedy): принимать худшее с убывающей температурой
-- [ ] **Soft macro joint optimization**: вызывать `plc.optimize_stdcells()` периодически, ИЛИ написать свой быстрый soft updater
-
-### Phase 4 — GPU acceleration (Day 16-20) ☐
-
-Если не уложимся в час на ibm17/ibm18 — без GPU топ-7 не светит.
-
-- [ ] Перенести cost-incremental update на CUDA (torch на GPU)
-- [ ] Batched destroy/repair: пробовать сразу N кандидатов параллельно
-- [ ] Profile: где именно узкое место — `plc.get_cost()`, overlap check, или legalization
-
-### Phase 5 — Tuning + verify (Day 21-25) ☐
-
-- [ ] Grid search по гиперпараметрам (k destroy, T_start/T_end, num_iters) на ibm01..ibm04
-- [ ] Прогон `--all` много раз на разных seed'ах → stability check
-- [ ] **Critical**: прогон в чистой среде (новая `uv sync`, чистый clone) — избежать ловушки `BakaBobo`/`Mike Gao`
-- [ ] Опционально: ORFS прогон на ariane133 (3-8 часов) — проверить что Tier 2 не ломается
-- [ ] Замерить runtime на каждом benchmark — должно быть ≤1 час
-
-### Phase 6 — Submit (Day 26-28) ☐
-
-- [ ] Финальный прогон `--all`, зафиксировать avg proxy cost и runtime
-- [ ] Создать ветку `submission` в нашем `Straple/...` репо, default branch
-- [ ] Проверить что в репо ничего лишнего (deps пинятся в `pyproject.toml`)
-- [ ] Расшарить приватный репо с judges: `partclxhrtmacroplace@gmail.com`, `will@partcl.com`
-- [ ] Заполнить Google form с SHA коммита в URL
-- [ ] **До дедлайна**: можно пересабмитить новую версию
-
----
-
-## 4. Идеи / Pool
-
-### Конкретные техники для LNS
-- [ ] **Critical net analysis**: находить нетлы с худшим HPWL и трогать только их макросы
-- [ ] **Mirror/flip orientation**: разрешено `N`, `FN`, `FS`, `S` (Klein-4) — сохранять выбор в `orientations.pt`
-- [ ] **Сохранение лучшего**: best_placement обновляется только при принятии хода
-- [ ] **Restart**: если стагнация N итераций — большой destroy + greedy repair
-- [ ] **Hybrid with quadratic placement**: сначала quadratic для seed, потом LNS
-
-### Идеи seed-этапа
-- [ ] **Spectral seed** (Jiangban Ya #19): eigenvectors of Laplacian → coordinates
-- [ ] **Concentric layout** на основе netlist (центральные узлы внутри)
-- [ ] **Min-cut bisection** rekursivно (классический partitioning approach)
-- [ ] Использовать `benchmark.macro_positions` (initial placement) как seed — он от организаторов hand-crafted
-
-### Идеи post-processing
-- [ ] **Snap to grid** (Tier 2 это всё равно делает) — учесть на Tier 1, чтобы grid alignment был не случайным
-- [ ] **Gap injection ≥12 μm** между hard macros — pre-paid защита от Tier 2 push-apart
-- [ ] **Orientation optimization** в финале (только flip → можем выиграть pin access)
-
-### Innovation Award идеи
-- [ ] LNS с обучаемой выборкой destroy operators (RL-bandit)
-- [ ] Predictive cost via small neural net trained per benchmark
-- [ ] Multi-objective Pareto frontier между WL/density/congestion
-
-### Идеи, использующие открытость Tier 1 тестов
-> Tier 1 — все 17 IBM публичные. Можно использовать при тренировке/тюнинге, но **без хардкодинга под имя**.
-
-- [ ] **Per-benchmark тюнинг гиперпараметров** через generic feature: вместо `if name == 'ibm17'` использовать `if num_macros > 500 and density > 0.50 then more_iterations`. Параметры можно подобрать grid search'ем, факторами выбирая структуру, а не имя.
-- [ ] **GNN/RL обучение на 17 IBM** — leave-one-out cross-validation: тренируем на 16, проверяем на 17-м. Так ловим overfitting под конкретный benchmark.
-- [ ] **Анализ ibm02/ibm10/ibm12** — на этих will_seed обходит RePlAce. Понять, в чём специфика их netlist/canvas структуры → попробовать использовать эти инсайты в general logic.
-- [ ] **Pre-computed embeddings/seeds** для известной структуры (тип топологии netlist) — но генеришь их детектируя структуру в runtime, не по имени.
-- [ ] **Адаптивный compute budget**: на маленьких (`ibm01`-`ibm04`) — мало итераций SA, на больших (`ibm15`-`ibm18`) — больше. Используется runtime-запас 600× от лимита.
-
----
-
-## 5. Журнал экспериментов
-
-> Краткий журнал. Полные таблицы по каждому прогону с per-benchmark разбивкой и декомпозицией cost — в [results.md](results.md).
-
-| Дата | Что проверял | Score (avg) | Best/Worst | Runtime | Комментарий |
-|---|---|---|---|---|---|
-| _baseline_ | SA (TILOS reported) | 2.1251 | 1.3166 / 3.6726 | — | Из README |
-| _baseline_ | RePlAce (TILOS reported) | **1.4578** | 0.9976 / 1.8370 | — | **Порог отсечки** |
-| 2026-05-03 | greedy_row_placer (Mac ARM) | 2.2109 | 1.6728 (ibm09) / 2.7696 (ibm12) | 0.05s total | Точно как в leaderboard. Все 0 overlaps |
-| 2026-05-03 | will_seed (Mac ARM) | **1.5336** | 1.1625 (ibm09) / 1.7921 (ibm18) | **34.74s total** (ibm17=6.05s ⬅ slowest) | Reference от организаторов. -5.2% от RePlAce, +27.8% от SA. Mac ARM = ~35s ↔ leaderboard 35s |
-| | | | | | |
-
-**Шаблон записи:** дата, что меняли, средний proxy на `--all`, лучший/худший benchmark, runtime, инсайты.
-
-### Bottleneck-анализ (по will_seed)
-
-Декомпозиция AVG proxy:
-- Wirelength: ~0.06-0.08 (мало, SA уже хорошо это давит)
-- Density: ~0.85-1.05 (средне)
-- **Congestion: 1.3-2.6** ← основной источник стоимости
-
-→ **Главная цель LNS — снизить congestion.** Просто двигать макросы для минимизации HPWL (как делает SA в will_seed) недостаточно.
-
----
-
-## 6. Полезные команды
-
-```bash
-# Setup
-git submodule update --init external/MacroPlacement
-uv sync
-
-# Запуск своего placer'а
-uv run evaluate submissions/straple/placer.py -b ibm01            # один
-uv run evaluate submissions/straple/placer.py --all               # все 17 IBM
-uv run evaluate submissions/straple/placer.py --ng45              # 4 NG45
-uv run evaluate submissions/straple/placer.py -b ibm01 --vis      # с визуализацией
-
-# Подтянуть обновления от организаторов
-git fetch upstream
-git merge upstream/main
-git push origin main
-
-# Работа в submission ветке
-git checkout -b submission
-# ... edit submissions/straple/placer.py ...
-git add submissions/straple/
-git commit -m "LNS placer iteration N"
-git push -u origin submission
-git rev-parse HEAD                 # SHA для Google form
-
-# Локально протестировать на pre-processed .pt (без submodule)
-python -c "from macro_place.benchmark import Benchmark; b = Benchmark.load('benchmarks/processed/public/ibm01.pt'); print(b.num_hard_macros, b.canvas_width)"
-```
-
----
-
-## 7. Полезные файлы / референсы
-
-### В репо
-- [README.md](../README.md) — правила, leaderboard (или [русский перевод](README.md))
-- [SCORING.md](../SCORING.md) — формула Tier 2 (geometric mean WNS:TNS:Area = 3:2:1) (или [русский перевод](SCORING.md))
-- [SETUP.md](../SETUP.md) — API референс, soft macro helper, ORFS prerequisites (или [русский перевод](SETUP.md))
-- [submissions/examples/greedy_row_placer.py](../submissions/examples/greedy_row_placer.py) — простой shelf-pack
-- [submissions/examples/simple_random_placer.py](../submissions/examples/simple_random_placer.py) — тривиальный пример
-- [submissions/will_seed/placer.py](../submissions/will_seed/placer.py) — **reference от организаторов**, гибрид легализации + SA refinement (изучить целиком)
-- [macro_place/objective.py](../macro_place/objective.py) — формула proxy cost, overlap detection
-- [macro_place/loader.py](../macro_place/loader.py) — `load_benchmark_from_dir`
-- [scripts/evaluate_with_orfs.py](../scripts/evaluate_with_orfs.py) — Tier 2 локально (3-8 часов на NG45)
-
-### Внешние
-- Background paper #1 (key): [An Updated Assessment of Reinforcement Learning for Macro Placement](https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber=11300304) — baseline numbers оттуда
-- [TILOS MacroPlacement repo](https://github.com/TILOS-AI-Institute/MacroPlacement) — evaluator source, PlacementCost API
-- [DREAMPlace repo](https://github.com/limbo018/DREAMPlace) — топ-2 базируется на нём
-- [OpenROAD-flow-scripts](https://github.com/The-OpenROAD-Project/OpenROAD-flow-scripts) — Tier 2 evaluation flow
-- [PlacementCost API в TILOS](https://github.com/TILOS-AI-Institute/MacroPlacement/blob/main/CodeElements/Plc_client/plc_client_os.py) — для прямого доступа к нетлисту
-
----
-
-## 8. Риски и подводные камни
-
-| Риск | Митигация |
-|---|---|
-| **Float-precision overlaps** на границе | Добавлять gap ≥0.001 между макросами (как greedy_row делает) |
-| **DQ из-за overlaps в eval env** (Mike Gao) | Прогон в чистой `uv sync` среде до сабмита |
-| **Зависимость на нестандартный пакет** (BakaBobo, ArzunPD networkit) | Все deps в `pyproject.toml`, через `uv sync` ставится |
-| **Self-reported ≠ verified** (vmallela 1.12 → 1.42) | Замерять на их железе (16 cores, 100GB) — или close to it |
-| **Soft macros не двигаем** | Обязательно `plc.optimize_stdcells()` или свой soft updater |
-| **Runtime > 1 hour на ibm17/ibm18** | Profile, GPU, или ослабить итерации на больших benchmarks |
-| **Tier 2 push-apart портит размещение** | Оставлять ≥12 μm между hard macros в submission |
-| **Hardcoding под benchmarks** (DQ) | Один алгоритм с параметрами, без if-ов на имя бенчмарка |
+Подробный журнал прогонов с per-bench разбивкой → [results.md](results.md).
