@@ -8,7 +8,7 @@
 
 | | Значение |
 |---|---|
-| **AVG4 proxy** (ibm01/10/14/17) | **1.3970** ⭐⭐⭐ #22 (**vs RePlAce -1.60%, ниже Top-10 -0.75%!**) |
+| **AVG4 proxy** (ibm01/10/14/17) | **1.3921** ⭐⭐⭐ #23 (**vs RePlAce -1.94%, ниже Top-10 -1.10%!**) |
 | AVG17 proxy (--all) | 1.5181 (#4, перезамерить) |
 | Placer | `submissions/straple/placer.py` (C++ + adaptive LNS + чередование congested/random) |
 | Дата замера | 2026-05-03 |
@@ -29,7 +29,38 @@
 
 ## 📂 Журнал прогонов
 
-### #22 · 2026-05-04 · Shake-up + LNS 50000 (3×N=60·movable) — vs RePlAce -1.60% 🚀
+### #23 · 2026-05-04 · Refine pass на best (intensification phase) — НОВЫЙ BEST 🏆 vs RePlAce -1.94%
+
+**Идея**: после finishing all multi-start LNS, взять best position и сделать **дополнительный full LNS pass** с другим RNG seed. Это даёт второй "intensification" — ALNS weights пересоберутся с новым context, shake-up triggered более intense, поскольку basin уже глубокий.
+
+**Изменения**: в `place()` после multi-start цикла, если `best_pos` найден, запускаем `_lns_loop` ещё раз на нём (state2, seed+9999).
+
+**Сводка** (1 fast_check):
+
+| Bench | Proxy | vs #22 (1.3970) | vs Straple #4 baseline | vs RePlAce |
+|---|---|---|---|---|
+| ibm01 | **1.0597** ⭐ | -0.47% | -10.05% ⭐ | +6.2% |
+| ibm10 | **1.2386** ⭐ | -0.86% | -10.52% ⭐ | **-17.0%** ⭐ |
+| ibm14 | **1.5469** ⭐ | -0.20% | -4.98% | +0.2% (parity++) |
+| ibm17 | **1.7232** ⭐ | -0.05% | -1.25% | +4.8% |
+| **AVG4** | **1.3921** ⭐⭐⭐ | **-0.35%** | **-6.19%** ⭐ | **-1.94%** ⭐⭐⭐ |
+
+- **vs RePlAce: -1.94%** (раньше -1.60%)
+- **vs Top-10 (1.4076): -1.10%**
+- ibm10: **-17.0% от RePlAce**
+- 0 overlaps, smoke 10/10
+- wall 1116s (ibm17 1044s, ibm10 865s) — ещё в 1ч/bench budget
+
+**Прогресс session за 23 цикла**:
+- Старт: AVG4=1.4839 (vs RePlAce **+3.24%**)
+- Финал: AVG4=1.3921 (vs RePlAce **-1.94%**)
+- **Δ = -6.19%** — пробили на 5.18% от baseline
+
+**Команда**: `uv run python scripts/fast_check.py`
+
+---
+
+### #22 · 2026-05-04 · Shake-up + LNS 50000 (3×N=60·movable) — best после cycle #22
 
 **Изменения**:
 - **Shake-up механизм**: при `no_improve_count >= shake_threshold` (300+) делаем большое perturbation: swap k=min(N/4, 50) макросов + destroy_and_repair тех же. До 5 раз. Сбрасываем op_weights к 1.0.
