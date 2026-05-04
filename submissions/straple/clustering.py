@@ -219,6 +219,8 @@ def anchor_soft_init(
     seed: int = 42,
     spawn_radius_frac: float = 0.02,
     anchor_strategy: str = "grid",
+    return_anchors: bool = False,
+    spawn_adaptive: bool = False,
 ) -> np.ndarray:
     """Generate ANCHOR_SOFT initial positions a-la MTK DreamPlace++.
 
@@ -228,8 +230,12 @@ def anchor_soft_init(
     Args:
         anchor_strategy: "grid" — anchors on uniform grid covering canvas
                          "centroid" — anchors at cluster centroid of initial pos
+        return_anchors: if True, returns (pos, anchors) tuple
+        spawn_adaptive: if True, scale sigma per cluster by sqrt(size_c/mean_size)
+                        so cluster spawn area grows linearly with member count
+                        (constant areal density). Default False = single radius.
 
-    Returns: float32 numpy array [n_total, 2]
+    Returns: float32 numpy array [n_total, 2], optionally with anchors [K, 2]
     """
     canvas_w = float(benchmark.canvas_width)
     canvas_h = float(benchmark.canvas_height)
@@ -251,7 +257,24 @@ def anchor_soft_init(
     movable = benchmark.get_movable_mask().cpu().numpy().astype(bool)
     fixed_pos = benchmark.macro_positions.cpu().numpy().astype(np.float64)
 
-    sigma = canvas_min * spawn_radius_frac
+    sigma_base = canvas_min * spawn_radius_frac
+    if spawn_adaptive:
+        cluster_sizes = np.bincount(cluster_id, minlength=num_clusters).astype(np.float64)
+        mean_size = float(cluster_sizes.mean())
+        if mean_size <= 0.0:
+            mean_size = 1.0
+        sigma_per_cluster = sigma_base * np.sqrt(cluster_sizes / mean_size)
+        print(
+            f"[anchor_soft_init] spawn_adaptive=1 sigma_base={sigma_base:.2f} "
+            f"sigma_c(min/mean/max)="
+            f"{sigma_per_cluster.min():.2f}/"
+            f"{sigma_per_cluster.mean():.2f}/"
+            f"{sigma_per_cluster.max():.2f}",
+            flush=True,
+        )
+    else:
+        sigma_per_cluster = None
+
     pos = np.zeros((n_total, 2), dtype=np.float64)
     for i in range(n_total):
         if not movable[i]:
@@ -259,9 +282,12 @@ def anchor_soft_init(
             continue
         c = cluster_id[i]
         ax, ay = anchors[c]
-        pos[i, 0] = ax + rng.normal(0.0, sigma)
-        pos[i, 1] = ay + rng.normal(0.0, sigma)
+        sigma_i = sigma_per_cluster[c] if sigma_per_cluster is not None else sigma_base
+        pos[i, 0] = ax + rng.normal(0.0, sigma_i)
+        pos[i, 1] = ay + rng.normal(0.0, sigma_i)
 
     pos[:, 0] = np.clip(pos[:, 0], half_w, canvas_w - half_w)
     pos[:, 1] = np.clip(pos[:, 1], half_h, canvas_h - half_h)
+    if return_anchors:
+        return pos.astype(np.float32), anchors.astype(np.float64)
     return pos.astype(np.float32)

@@ -109,7 +109,7 @@ _PIN_KIND_HARD = 1
 _PIN_KIND_SOFT = 2
 
 
-def _build_proxy_evaluator(benchmark, plc):
+def _build_proxy_evaluator(benchmark, plc, soft_positions_override=None):
     hard_name_to_bidx = {}
     for bidx, idx in enumerate(plc.hard_macro_indices):
         hard_name_to_bidx[plc.modules_w_pins[idx].get_name()] = bidx
@@ -187,7 +187,14 @@ def _build_proxy_evaluator(benchmark, plc):
 
     hard_sizes = benchmark.macro_sizes[:n_hard].numpy().astype(np.float64)
     soft_sizes = benchmark.macro_sizes[n_hard:].numpy().astype(np.float64)
-    soft_positions = benchmark.macro_positions[n_hard:].numpy().astype(np.float64)
+    if soft_positions_override is not None:
+        soft_positions = np.asarray(soft_positions_override, dtype=np.float64)
+        if soft_positions.shape != (n_soft, 2):
+            raise ValueError(
+                f"soft_positions_override shape {soft_positions.shape} != ({n_soft}, 2)"
+            )
+    else:
+        soft_positions = benchmark.macro_positions[n_hard:].numpy().astype(np.float64)
     port_positions = benchmark.port_positions.numpy().astype(np.float64) if benchmark.port_positions.numel() > 0 else np.zeros((0, 2), dtype=np.float64)
 
     evaluator = _proxy_cost.ProxyEvaluator()
@@ -221,7 +228,10 @@ def _worker_run_start(start_idx, args, seed_base, refine_iters, lns_outer_iters,
         verbose=0,
         analytical_steps=0,
     )
-    evaluator = _build_proxy_evaluator(benchmark, plc)
+    evaluator = _build_proxy_evaluator(
+        benchmark, plc,
+        soft_positions_override=args.get("gradient_soft_pos"),
+    )
     return placer._run_one_start(start_idx, args, evaluator, plc)
 
 
@@ -405,6 +415,85 @@ class StraplePlacer:
             self._log(f"[{bench_label}] analytical_seed({self.analytical_steps} steps): "
                       f"{time.time()-t0:.2f}s")
 
+        gradient_hard_pos = None
+        gradient_soft_pos = None
+        use_gradient_seed = (
+            os.environ.get("STRAPLE_USE_GRADIENT_SEED", "0") == "1"
+            and plc is not None
+        )
+        if use_gradient_seed:
+            _STRAPLE_DIR = str(Path(__file__).resolve().parent)
+            if _STRAPLE_DIR not in sys.path:
+                sys.path.insert(0, _STRAPLE_DIR)
+            try:
+                from gradient_demo import gradient_demo
+                env_snapshot = {}
+                for k, v in (("STRAPLE_DEMO_INIT", "anchor_soft"),
+                             ("STRAPLE_DEMO_PLACE_ALL", "1"),
+                             ("STRAPLE_DEMO_FINISH_LEGALIZE", "1")):
+                    env_snapshot[k] = os.environ.get(k)
+                    if env_snapshot[k] is None:
+                        os.environ[k] = v
+                grad_steps = int(os.environ.get("STRAPLE_GRADIENT_SEED_STEPS", "500"))
+                grad_seed = self.seed
+                grad_n = max(1, int(
+                    os.environ.get("STRAPLE_GRADIENT_SEED_NUM", "1")))
+                self._log(f"[{bench_label}] gradient seed pre-pass "
+                          f"({grad_n}x{grad_steps} steps)...")
+                t0 = time.time()
+                from macro_place.objective import compute_proxy_cost
+                best_grad_pos = None
+                best_grad_proxy = float("inf")
+                gp = None
+                for k in range(grad_n):
+                    sd = grad_seed + k * 1009
+                    grad_result = gradient_demo(
+                        benchmark, plc, recorder=None,
+                        num_steps=grad_steps, seed=sd,
+                        time_budget=0.0, score_png="",
+                        score_sample_every_s=1.0,
+                    )
+                    gp = grad_result[0] if isinstance(grad_result, tuple) else grad_result
+                    gp = np.asarray(gp, dtype=np.float64)
+                    full_test = benchmark.macro_positions.clone()
+                    full_test[:n_hard] = torch.tensor(gp[:n_hard], dtype=torch.float32)
+                    if gp.shape[0] > n_hard:
+                        nsl = benchmark.num_soft_macros
+                        full_test[n_hard:n_hard + nsl] = torch.tensor(
+                            gp[n_hard:n_hard + nsl], dtype=torch.float32)
+                    cost = compute_proxy_cost(full_test, benchmark, plc)
+                    self._log(f"[{bench_label}] grad_seed#{k} sd={sd} "
+                              f"proxy={cost['proxy_cost']:.4f} "
+                              f"ovrlp={cost['overlap_count']}")
+                    if (cost['overlap_count'] == 0
+                            and cost['proxy_cost'] < best_grad_proxy):
+                        best_grad_proxy = cost['proxy_cost']
+                        best_grad_pos = gp
+                grad_pos = best_grad_pos if best_grad_pos is not None else gp
+                if grad_pos is None:
+                    raise RuntimeError("all gradient seeds failed")
+                if grad_pos.shape[0] >= n_hard:
+                    gradient_hard_pos = grad_pos[:n_hard].copy()
+                use_grad_soft = (
+                    os.environ.get("STRAPLE_GRADIENT_SEED_USE_SOFT", "0") == "1"
+                )
+                if use_grad_soft and grad_pos.shape[0] > n_hard:
+                    n_soft_local = benchmark.num_soft_macros
+                    gradient_soft_pos = grad_pos[n_hard:n_hard + n_soft_local].copy()
+                self._log(f"[{bench_label}] best grad proxy={best_grad_proxy:.4f}")
+                for k, prev in env_snapshot.items():
+                    if prev is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = prev
+                self._log(f"[{bench_label}] gradient seed: {time.time()-t0:.2f}s "
+                          f"(hard={gradient_hard_pos is not None}, "
+                          f"soft={gradient_soft_pos is not None})")
+            except Exception as exc:
+                print(f"[{bench_label}] gradient seed FAILED: {exc}", file=sys.stderr)
+                gradient_hard_pos = None
+                gradient_soft_pos = None
+
         num_orig_starts = 3 if num_movable >= 300 else 1
         env_n = int(os.environ.get("STRAPLE_NUM_STARTS", "0"))
         if env_n > 0:
@@ -412,14 +501,18 @@ class StraplePlacer:
         num_perturbed_starts = int(os.environ.get("STRAPLE_PERTURB_EXTRA_STARTS", "0"))
         if num_movable < 300:
             num_perturbed_starts = 0
+        num_gradient_starts = 1 if gradient_hard_pos is not None else 0
         num_starts = (num_orig_starts + num_perturbed_starts
+                      + num_gradient_starts
                       + (1 if analytical_pos is not None else 0))
 
         evaluator = None
         if plc is not None and self.lns_outer_iters > 0:
             t0 = time.time()
-            evaluator = _build_proxy_evaluator(benchmark, plc)
-            self._log(f"[{bench_label}] _build_proxy_evaluator: {time.time()-t0:.2f}s")
+            evaluator = _build_proxy_evaluator(
+                benchmark, plc, soft_positions_override=gradient_soft_pos)
+            self._log(f"[{bench_label}] _build_proxy_evaluator: {time.time()-t0:.2f}s "
+                      f"(soft_override={gradient_soft_pos is not None})")
 
         best_pos = None
         best_cost = float("inf")
@@ -434,9 +527,12 @@ class StraplePlacer:
             "canvas_h": canvas_h,
             "num_movable": num_movable,
             "analytical_pos": analytical_pos,
+            "gradient_hard_pos": gradient_hard_pos,
+            "gradient_soft_pos": gradient_soft_pos,
             "num_starts": num_starts,
             "num_orig_starts": num_orig_starts,
             "num_perturbed_starts": num_perturbed_starts,
+            "num_gradient_starts": num_gradient_starts,
             "bench_label": bench_label,
         }
 
@@ -494,15 +590,79 @@ class StraplePlacer:
                 else:
                     break
 
+        full = benchmark.macro_positions.clone()
+        full[:n_hard] = torch.tensor(best_pos, dtype=torch.float32)
+        if gradient_soft_pos is not None:
+            full[n_hard:n_hard + gradient_soft_pos.shape[0]] = torch.tensor(
+                gradient_soft_pos, dtype=torch.float32)
+
+        refine_soft = (
+            os.environ.get("STRAPLE_REFINE_SOFT", "0") == "1"
+            and plc is not None
+            and benchmark.num_soft_macros > 0
+        )
+        if refine_soft and best_pos is not None:
+            try:
+                from copy import deepcopy
+                _STRAPLE_DIR = str(Path(__file__).resolve().parent)
+                if _STRAPLE_DIR not in sys.path:
+                    sys.path.insert(0, _STRAPLE_DIR)
+                from gradient_demo import gradient_demo
+                refine_steps = int(
+                    os.environ.get("STRAPLE_REFINE_SOFT_STEPS", "300"))
+                bench_refine = deepcopy(benchmark)
+                bench_refine.macro_positions = full.clone()
+                bench_refine.macro_fixed = bench_refine.macro_fixed.clone()
+                bench_refine.macro_fixed[:n_hard] = True
+                env_snap = {}
+                for k, v in (("STRAPLE_DEMO_INIT", "current"),
+                             ("STRAPLE_DEMO_PLACE_ALL", "1"),
+                             ("STRAPLE_DEMO_FINISH_LEGALIZE", "0"),
+                             ("STRAPLE_DEMO_ANCHOR_LOSS", "0")):
+                    env_snap[k] = os.environ.get(k)
+                    os.environ[k] = v
+                self._log(f"[{bench_label}] post-ALNS soft refine "
+                          f"({refine_steps} steps)...")
+                t0 = time.time()
+                refined = gradient_demo(
+                    bench_refine, plc, recorder=None,
+                    num_steps=refine_steps, seed=self.seed + 31337,
+                    time_budget=0.0, score_png="",
+                )
+                refined_pos = refined[0] if isinstance(refined, tuple) else refined
+                refined_pos = np.asarray(refined_pos, dtype=np.float64)
+                for k, prev in env_snap.items():
+                    if prev is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = prev
+                full_refined = full.clone()
+                if refined_pos.shape[0] >= n_hard:
+                    full_refined[n_hard:] = torch.tensor(
+                        refined_pos[n_hard:], dtype=torch.float32)
+                from macro_place.objective import compute_proxy_cost
+                cost_before = compute_proxy_cost(full, benchmark, plc)
+                cost_after = compute_proxy_cost(full_refined, benchmark, plc)
+                self._log(f"[{bench_label}] soft refine: "
+                          f"{time.time()-t0:.2f}s "
+                          f"proxy {cost_before['proxy_cost']:.4f} -> "
+                          f"{cost_after['proxy_cost']:.4f} "
+                          f"(ovrlp {cost_before['overlap_count']} -> "
+                          f"{cost_after['overlap_count']})")
+                if (cost_after['proxy_cost'] < cost_before['proxy_cost']
+                        and cost_after['overlap_count'] == 0):
+                    full = full_refined
+            except Exception as exc:
+                print(f"[{bench_label}] soft refine FAILED: {exc}", file=sys.stderr)
+
         if recorder is not None and best_pos is not None:
-            recorder.add(best_pos, f"FINAL best={best_cost:.4f}")
+            recorder.add(full[:n_hard].numpy().astype(np.float64),
+                         f"FINAL best={best_cost:.4f}")
             try:
                 recorder.render()
             except Exception as exc:
                 print(f"[visualizer] render failed: {exc}", file=sys.stderr)
 
-        full = benchmark.macro_positions.clone()
-        full[:n_hard] = torch.tensor(best_pos, dtype=torch.float32)
         self._log(f"[{bench_label}] === DONE total={time.time()-t_place_start:.2f}s "
                   f"final_cost={best_cost:.4f} ===")
         return full
@@ -513,15 +673,23 @@ class StraplePlacer:
                                and start_idx == args["num_starts"] - 1)
         num_orig = args["num_orig_starts"]
         num_perturbed = args.get("num_perturbed_starts", 0)
+        num_gradient = args.get("num_gradient_starts", 0)
         is_perturbed_start = (not is_analytical_start
                               and start_idx >= num_orig
                               and start_idx < num_orig + num_perturbed)
+        is_gradient_start = (not is_analytical_start
+                             and not is_perturbed_start
+                             and num_gradient > 0
+                             and start_idx >= num_orig + num_perturbed
+                             and start_idx < num_orig + num_perturbed + num_gradient)
         seed = self.seed + start_idx
         t_start_iter = time.time()
 
         state = _placer_core.PlacerState()
         if is_analytical_start:
             seed_pos = args["analytical_pos"]
+        elif is_gradient_start:
+            seed_pos = args["gradient_hard_pos"]
         elif is_perturbed_start:
             seed_pos = self._perturb_initial(args, start_idx)
         else:
@@ -532,10 +700,11 @@ class StraplePlacer:
             args["canvas_w"], args["canvas_h"], int(seed),
         )
 
-        if recorder is not None and (is_analytical_start or is_perturbed_start):
+        if recorder is not None and (is_analytical_start or is_perturbed_start
+                                     or is_gradient_start):
             recorder.add(state.current_positions(), f"start#{start_idx} pre-legalize")
 
-        if is_analytical_start:
+        if is_analytical_start or is_gradient_start:
             state.legalize_min_displacement(500)
             state.legalize()
         else:
@@ -546,7 +715,9 @@ class StraplePlacer:
                          f"start#{start_idx} post-legalize cost={cost_after_legal:.4f}")
 
         sa_iters_to_run = self.refine_iters if (
-            args["num_movable"] < 300 and not is_analytical_start) else 0
+            args["num_movable"] < 300
+            and not is_analytical_start
+            and not is_gradient_start) else 0
         if sa_iters_to_run > 0:
             state.sa_refine(sa_iters_to_run)
         cost_after_sa = evaluator.evaluate(state.current_positions()) if evaluator else 0.0

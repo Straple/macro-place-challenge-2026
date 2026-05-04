@@ -63,7 +63,9 @@ def gradient_demo(benchmark, plc, recorder=None, num_steps: int = 300,
     init_mode = os.environ.get("STRAPLE_DEMO_INIT", "center")
     pos_np = np.zeros((n_active, 2), dtype=np.float32)
     cluster_id_arr = None
-    if init_mode == "random":
+    if init_mode == "current":
+        pos_np[:] = benchmark.macro_positions[:n_active].cpu().numpy().astype(np.float32)
+    elif init_mode == "random":
         pos_np[:, 0] = rng_np.uniform(half_w.numpy(), canvas_w - half_w.numpy())
         pos_np[:, 1] = rng_np.uniform(half_h.numpy(), canvas_h - half_h.numpy())
     elif init_mode == "anchor_soft":
@@ -76,6 +78,7 @@ def gradient_demo(benchmark, plc, recorder=None, num_steps: int = 300,
         anchor_strategy = os.environ.get("STRAPLE_DEMO_ANCHOR_STRATEGY", "grid")
         spawn_radius_frac = float(
             os.environ.get("STRAPLE_DEMO_SPAWN_RADIUS_FRAC", "0.05"))
+        spawn_adaptive = os.environ.get("STRAPLE_DEMO_SPAWN_ADAPTIVE", "0") == "1"
         if cluster_target_env == "auto":
             cluster_target = max(15, n_total // 30)
             print(f"[gradient_demo] auto cluster_target={cluster_target} "
@@ -98,10 +101,12 @@ def gradient_demo(benchmark, plc, recorder=None, num_steps: int = 300,
             cluster_id_active = cluster_id_arr
         else:
             cluster_id_active = cluster_id_arr[:n_active]
-        full_init = anchor_soft_init(
+        full_init, anchors_np = anchor_soft_init(
             benchmark, cluster_id_arr, seed=seed,
             spawn_radius_frac=spawn_radius_frac,
             anchor_strategy=anchor_strategy,
+            return_anchors=True,
+            spawn_adaptive=spawn_adaptive,
         )
         pos_np[:] = full_init[:n_active]
     else:
@@ -119,6 +124,25 @@ def gradient_demo(benchmark, plc, recorder=None, num_steps: int = 300,
     if cluster_id_arr is not None and recorder is not None:
         if hasattr(recorder, "set_cluster_ids"):
             recorder.set_cluster_ids(cluster_id_arr)
+
+    anchor_loss_enabled = (
+        cluster_id_arr is not None
+        and os.environ.get("STRAPLE_DEMO_ANCHOR_LOSS", "0") == "1"
+    )
+    if anchor_loss_enabled:
+        cluster_id_t = torch.tensor(cluster_id_active, dtype=torch.long)
+        anchors_t = torch.tensor(anchors_np, dtype=torch.float32)
+        anchor_beta_start = float(
+            os.environ.get("STRAPLE_DEMO_ANCHOR_BETA_START", "10.0"))
+        anchor_beta_end = float(
+            os.environ.get("STRAPLE_DEMO_ANCHOR_BETA_END", "0.01"))
+        anchor_norm_factor = canvas_min * canvas_min
+        movable_t = movable.float()
+        print(f"[gradient_demo] anchor displacement loss enabled "
+              f"beta {anchor_beta_start}->{anchor_beta_end}", flush=True)
+    else:
+        cluster_id_t = None
+        anchors_t = None
 
     pos = torch.tensor(pos_np, dtype=torch.float32, requires_grad=True)
 
@@ -362,8 +386,18 @@ def gradient_demo(benchmark, plc, recorder=None, num_steps: int = 300,
         else:
             cong_loss = pos.new_zeros(())
 
+        if anchors_t is not None:
+            beta = anchor_beta_start * (
+                (anchor_beta_end / anchor_beta_start) ** progress)
+            anchor_pos_per_macro = anchors_t[cluster_id_t]
+            sq = (pos - anchor_pos_per_macro).pow(2).sum(dim=1)
+            sq = sq * movable_t
+            anchor_loss = beta * sq.sum() / anchor_norm_factor
+        else:
+            anchor_loss = pos.new_zeros(())
+
         loss = (wl + cur_density_weight * dpen + overlap_weight * overlap_loss
-                + cong_weight * cong_loss)
+                + cong_weight * cong_loss + anchor_loss)
         loss.backward()
         optimizer.step()
         loss_val_pre = float(loss.item())
