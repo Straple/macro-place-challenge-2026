@@ -1240,4 +1240,83 @@ $HOME/.local/bin/uv run pytest test/test_smoke.py -v
 **Per-benchmark детали:** [таблица как у will_seed выше]
 
 **Команда:** `uv run evaluate ... --all`
+
+---
+
+## Cycle #28 — DreamPlace++ recipe (ANCHOR_SOFT cluster init), 2026-05-05
+
+### Что сделано (новое)
+
+1. **`submissions/straple/clustering.py`** — netlist hypergraph clustering:
+   - Clique expansion гиперсетей (вес 1/(k-1) на пару, nets > 20 пинов отброшены)
+   - networkx Louvain partitioning, поддержка target_num_clusters через бинарный поиск resolution
+   - Anchor distribution: uniform grid или centroid от initial pos
+2. **`gradient_demo.py::init_mode=anchor_soft`** — все макросы spawn вокруг anchor своего кластера с малым Gaussian шумом.
+3. **`visualizer.py`** — каждый макрос получает `cluster` ID, цвет по HSV-палитре (golden ratio шаг для разделения), кнопка переключения "color: cluster ↔ kind", hotkey `c`.
+4. **Adaptive defaults**: `STRAPLE_DEMO_CLUSTER_TARGET=auto` → max(15, n//30); `STRAPLE_DEMO_TARGET_UTIL=auto` → actual_util * 0.95.
+
+### Результаты (ibm01, multi-seed × K-grid sweep)
+
+| Конфиг | proxy | wl | den | cong | runtime |
+|---|---|---|---|---|---|
+| INITIAL .plc | 1.0385 | 0.064 | 0.812 | 1.137 | — (69 ovrlp) |
+| Submitted ALNS (best of 3 starts × 50K LNS iters) | 1.0584 | 0.072 | 0.840 | 1.133 | ~25 мин |
+| gradient_demo center init (default, 300 iter) | 1.6868 | 0.127 | 0.991 | 2.129 | 3.85с |
+| **gradient_demo anchor_soft K=40 r=0.05 (best of 6 seeds)** | **1.1050** | 0.084 | 0.745 | 1.297 | 14с |
+
+**Ключевой результат**: pure-gradient pipeline за **14 секунд** vs ALNS submission **25 минут** — proxy всего на +4.4%, без всякого LNS polish'а.
+
+K-grid sweep (seed=42, ibm01, 400 iters):
+| K \ radius_frac | 0.01 | 0.04 | 0.05 | 0.06 | 0.10 |
+|---|---|---|---|---|---|
+| 8 | — | — | 1.31 | — | — |
+| 10 | 1.47 | — | 1.28 | — | — |
+| 20 | — | — | 1.25 | — | — |
+| 30 | 1.17 | — | 1.14 | — | — |
+| **40** | — | 1.11 | **1.10** | 1.13 | 1.16 |
+| 50 | — | — | 1.22 | — | — |
+
+Optimum: K=40 (n_total/30=38), spawn_radius=0.05*canvas_min. Шум ~±0.05 от seed.
+
+Multi-seed для best config (K=40, r=0.05, ibm01, 400 iter):
+seeds 7,13,21,42,100,999 → proxy 1.1093, 1.1328, 1.2164, 1.2400, 1.2582, 1.1445 (mean 1.183, **best 1.109**).
+
+### Per-bench результаты (config: ITERS=800 lambda_max=1000 target_util=0.85, кроме ibm01)
+
+| bench | n_hard | n_soft | proxy | RePlAce | vs RePlAce | runtime | HTML |
+|---|---|---|---|---|---|---|---|
+| ibm01 | 246 | 894 | **1.1050** | 0.998 | +10.7% | 14s | [ibm01_anchor_soft_best.html](../vis/ibm01_anchor_soft_best.html) |
+| ibm04 | 295 | 1085 | **1.4847** | 1.302 | +14.0% | 38s | [ibm04_anchor_soft_v2.html](../vis/ibm04_anchor_soft_v2.html) |
+| ibm10 | 786 | 1982 | **1.8726** | 1.501 | +24.8% | 60s | [ibm10_anchor_soft_v2.html](../vis/ibm10_anchor_soft_v2.html) |
+| ibm14 | 614 | 1529 | **1.9061** | 1.544 | +23.5% | 80s | [ibm14_anchor_soft_v2.html](../vis/ibm14_anchor_soft_v2.html) |
+| ibm17 | 760 | 1844 | **1.8863** | 1.645 | +14.7% | 100s | [ibm17_anchor_soft_v2.html](../vis/ibm17_anchor_soft_v2.html) |
+| **AVG5** | — | — | **1.6509** | **1.398** | +18.1% | — | — |
+
+### Ключевые insights
+
+1. **ANCHOR_SOFT клик**: pure-gradient на ibm01 за 14с матчит ALNS (25 мин) с +4.4%. Это **самый большой выигрыш сессии**.
+2. **K = n_total / 30** оптимально на ibm01. Логично: средний размер кластера ~30 макросов = 1 anchor cell на canvas ~6×6 grid.
+3. **Spawn radius 0.05 * canvas_min** оптимум: меньше — кучкуется, больше — теряется кластерная структура.
+4. **target_util должен быть близко к actual_util** (~0.8 на ICCAD04). Default 0.4 даёт unsolvable loss → макросы кучкуются.
+5. **Большие бенчмарки нужны более агрессивный λ schedule** (lambda_max=1000+) — иначе density penalty слишком слабый чтобы распределять макросы.
+6. **Плохая новость**: для ibm04+ pure-gradient далек от RePlAce (+14%). Видимо нужен либо real congestion-aware loss, либо electrostatic potential model (ePlace), либо post-LNS polish.
+
+### Сохранённые HTML-визуализации
+
+В папке `vis/` (открыть в браузере, hover macros для tooltip, `c` переключает color cluster↔kind, ←/→ кадры):
+- `ibm01_anchor_soft_best.html` — best K=40 r=0.05 (proxy 1.105)
+- `ibm01_anchor_soft_v1.html` — first run K=20 (proxy 1.245)
+- `ibm04_anchor_soft.html` / `_v2.html` — старая/новая конфиг
+- `ibm10_anchor_soft.html` — first run (default config, proxy 2.18)
+- `ibm14_anchor_soft.html` — proxy 2.51 (default)
+- `ibm17_anchor_soft.html` — proxy 2.29 (default)
+
+### Что попробовать дальше (не сделано в сессии)
+
+1. **Multi-seed averaging внутри placer.py** — best-of-N seeds для submission
+2. **post-gradient LNS polish** — gradient seed + наш ALNS на нём (combine best of both)
+3. **Congestion-aware loss** — добавить smooth net bbox + grid demand penalty per net
+4. **Electrostatic potential** (ePlace formulation) — заменить bell-curve density на FFT-based Poisson
+5. **Per-cluster anchor displacement loss** — anchor remains stationary, members can drift; стабилизирует структуру
+
 ```

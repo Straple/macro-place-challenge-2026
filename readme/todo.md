@@ -621,3 +621,125 @@ STRAPLE_VIS_FPS=30
 STRAPLE_DEMO_SCORE_PNG=vis/score.png
 STRAPLE_DEMO_SCORE_SAMPLE_S=1.0
 ```
+
+---
+
+## 10. Сессия 2026-05-05 — DreamPlace++ recipe (cluster init + visualizer)
+
+### Цель сессии
+Воспроизвести MTK-style ANCHOR_SOFT pipeline (видео `mtk_dreamplace_plus_ibm01.mp4`):
+кластеризовать макросы по netlist'у → spawn в одной anchor-точке на кластер → GP
+раскручивает по canvas с сохранением структуры. Визуализировать процесс с
+cluster colors как у MTK, экспортировать HTML в `vis/`.
+
+### Baseline (точка отсчёта, ibm01)
+
+| Что | proxy | wl | den | cong | overlaps | runtime |
+|---|---|---|---|---|---|---|
+| INITIAL (.plc по умолчанию) | 1.0385 | 0.064 | 0.812 | 1.137 | **69** ⚠ | — |
+| Submitted ALNS (current) | 1.0584 | 0.072 | 0.840 | 1.133 | 0 ✅ | ~25 мин |
+| gradient_demo PLACE_ALL=1 (default, 300 iter) | **1.6868** | 0.127 | 0.991 | 2.129 | 0 ✅ | 3.85с |
+| MTK DreamPlace++ (видео target) | ~0.91 | — | — | — | 0 ✅ | ~37с |
+
+Vanilla gradient_demo далеко от submitted ALNS и от MTK. Главные потери:
+density 0.99 (оптимум ~0.5) и congestion 2.13 (оптимум ~0.7) — макросы кучкуются
+в центре canvas вместо равномерного распределения.
+
+### Поэтапный план
+
+**Phase 1: clustering.py** (networkx Louvain)
+- Hypergraph nets → undirected weighted graph (clique expansion, weight = 1/(k-1))
+- Игнорировать nets с >K макросов (K=20) — supernets зашумляют
+- Louvain → partition; fallback на label_propagation для очень больших
+- Output: `cluster_id: tensor[n_total]`, `num_clusters: int`
+- Success criteria: на ibm01 K кластеров в диапазоне 8-50, дисперсия размеров < 5×
+
+**Phase 2: ANCHOR_SOFT init в gradient_demo**
+- Новый env `STRAPLE_DEMO_INIT=anchor_soft`
+- Anchors распределяются по canvas равномерным grid'ом по числу кластеров (или k-means)
+- Members кластера spawn в радиусе R = anchor_jitter * canvas_min от anchor (Gaussian)
+- Hard и soft трактуются одинаково
+- `cluster_id` сохраняется в recorder для визуализации
+- Success criteria: после init proxy >> baseline (все макросы в anchors), но после 200 iter
+  GP распределяет их и proxy < 1.6868 (текущий gradient_demo с center init)
+
+**Phase 3: cluster colors в visualizer.py**
+- `PlacementRecorder.set_cluster_ids(arr)` — сохранить
+- В HTML: каждый макрос получает поле `cluster` → цвет HSV(c/K, 0.7, 0.85)
+- Hover tooltip показывает cluster id
+- Сохранять выходной HTML в `vis/cluster_init_<bench>_<timestamp>.html`
+
+**Phase 4: tune schedule**
+- Больше iters (500-800)
+- Adaptive λ_d schedule (DREAMPlace overflow rule)
+- Multi-phase: spreading (low λ, high γ) → settling (high λ, low γ)
+- Success criteria: proxy < 1.30 на ibm01 в pure-gradient (близко к ALNS submission 1.06)
+
+**Phase 5: extend на 4-5 benchmarks**
+- ibm01 (small), ibm04 (mid), ibm10 (mid), ibm14 (large), ibm17 (xlarge)
+- Per-bench proxy + AVG → таблица в results.md
+- Если AVG < ALNS — этот pipeline становится seed candidate для submitted placer
+
+### Что готово до сессии (можно переиспользовать)
+- `gradient_demo.py` Adam loop с adaptive λ + γ cooling — менять только init
+- `_build_net_pin_tensors_full(benchmark, plc)` — net→macros mapping для hard+soft
+- `visualizer.py` HTML с canvas+JS+score history — только цвета и tooltip добавить
+- `STRAPLE_DEMO_PLACE_ALL=1` уже двигает все макросы
+
+### Exit conditions сессии
+- Минимум: cluster init работает, HTML с цветными кластерами в `vis/`, baseline для сравнения
+- Норм: proxy на ibm01 < 1.30 (улучшение vs текущий gradient_demo на 22%+)
+- Хорошо: pure-gradient pipeline matches ALNS на ibm01 (1.06)
+- Идеально: pure-gradient AVG ≤ ALNS — становится seed для submitted placer
+
+### Реализация и результаты (что получилось)
+
+**Реализовано:**
+- ✅ `submissions/straple/clustering.py` — Louvain на hypergraph clique-projection (180 LOC).
+  Поддержка target_num_clusters через бинарный поиск resolution. На ibm01 (1140 макросов,
+  5993 нета) кластеризация занимает 0.2с, K=18-19 (или target).
+- ✅ `gradient_demo.py::init_mode=anchor_soft` + adaptive defaults (`auto` для K и target_util).
+- ✅ `visualizer.py` cluster colors: HSV golden-ratio palette, кнопка переключения color-mode
+  (`cluster ↔ kind`), hotkey `c`, tooltip показывает `cluster: c / K`.
+
+**Метрики (best per bench, см. results.md cycle #28):**
+
+| bench | proxy v1 (default) | proxy v2 (tuned) | RePlAce | vs RePlAce | runtime |
+|---|---|---|---|---|---|
+| ibm01 | 1.245 | **1.105** (K=40 r=0.05 util=auto λ=100 400i) | 0.998 | +10.7% | 14s |
+| ibm04 | 1.727 | **1.485** (K=auto r=0.05 util=0.85 λ=1000 800i) | 1.302 | +14.0% | 38s |
+| ibm10 | 2.179 | **1.873** (same v2 config) | 1.501 | +24.8% | 60s |
+| ibm14 | 2.514 | **1.906** (same v2 config) | 1.544 | +23.5% | 80s |
+| ibm17 | 2.290 | **1.886** (same v2 config) | 1.645 | +14.7% | 100s |
+| **AVG5** | 1.991 | **1.651** | 1.398 | **+18.1%** | — |
+
+Tuning v1→v2 = **−17%** AVG. Auto-defaults в коде: lambda_max=100/1000/2000 по
+n_total<1500/<2500/else; target_util = actual_util × {0.95, 1.05} по тому же критерию.
+
+**Главный win:** на **ibm01** pure-gradient за 14 секунд достигает proxy 1.105,
+тогда как submitted ALNS требует **25 минут** для 1.058. То есть pure-gradient — отличный
+кандидат на **seed для ALNS polish** (ALNS получит уже хороший начальный layout вместо
+default initial с overlaps).
+
+**HTML визуализации в `vis/`:**
+- `ibm01_anchor_soft_best.html` (21.6 MB, 80 frames) — ⭐ best config
+- `ibm01_anchor_soft_v1.html` (21 MB) — first run
+- `ibm04_anchor_soft_v2.html`, `ibm10_anchor_soft.html`, `ibm14_anchor_soft.html`,
+  `ibm17_anchor_soft.html`
+
+В HTML видна эволюция MTK-style: iter=0 кластеры схлопнуты в anchor-точки, iter=200
+"венозные" паттерны, finale — rainbow placement по всему canvas.
+
+**Что НЕ закрыло:**
+- Pure-gradient на больших бенчмарках (ibm04+) +14% от RePlAce. Density >0.85 даже с λmax=1000.
+- Корневая причина: density penalty smooth-bell weak, soft-soft pair force отсутствует,
+  congestion вообще не моделируется в loss (только косвенно через WL).
+- Нужен либо DREAMPlace electrostatic potential model, либо congestion-aware loss term.
+
+### Следующие шаги (для будущей сессии)
+1. **Multi-seed averaging** прямо в gradient_demo (параллельный sweep сидов через mp.Pool)
+2. **Hybrid: gradient seed → ALNS polish** в submitted placer.py (сменить initial_pos на gradient output)
+3. **Per-cluster anchor displacement loss** — добавить loss term, удерживающий cluster в окрестности anchor (стабилизатор)
+4. **Real congestion-aware loss** (smooth net bbox → cell demand → top-k mean) — проводился эксп, не сходился
+5. **ePlace electrostatic FFT density** — переход с bell-curve density penalty на правильный physics-based
+

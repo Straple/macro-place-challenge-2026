@@ -62,9 +62,48 @@ def gradient_demo(benchmark, plc, recorder=None, num_steps: int = 300,
     rng_np = np.random.default_rng(seed)
     init_mode = os.environ.get("STRAPLE_DEMO_INIT", "center")
     pos_np = np.zeros((n_active, 2), dtype=np.float32)
+    cluster_id_arr = None
     if init_mode == "random":
         pos_np[:, 0] = rng_np.uniform(half_w.numpy(), canvas_w - half_w.numpy())
         pos_np[:, 1] = rng_np.uniform(half_h.numpy(), canvas_h - half_h.numpy())
+    elif init_mode == "anchor_soft":
+        from clustering import cluster_macros, anchor_soft_init
+        cluster_method = os.environ.get("STRAPLE_DEMO_CLUSTER_METHOD", "louvain")
+        cluster_resolution = float(
+            os.environ.get("STRAPLE_DEMO_CLUSTER_RESOLUTION", "1.0"))
+        cluster_target_env = os.environ.get("STRAPLE_DEMO_CLUSTER_TARGET", "auto")
+        cluster_max_net = int(os.environ.get("STRAPLE_DEMO_CLUSTER_MAX_NET", "20"))
+        anchor_strategy = os.environ.get("STRAPLE_DEMO_ANCHOR_STRATEGY", "grid")
+        spawn_radius_frac = float(
+            os.environ.get("STRAPLE_DEMO_SPAWN_RADIUS_FRAC", "0.05"))
+        if cluster_target_env == "auto":
+            cluster_target = max(15, n_total // 30)
+            print(f"[gradient_demo] auto cluster_target={cluster_target} "
+                  f"(n_total={n_total})", flush=True)
+        else:
+            cluster_target = int(cluster_target_env)
+        print(f"[gradient_demo] clustering ({cluster_method}, "
+              f"target={cluster_target}, max_net={cluster_max_net})...", flush=True)
+        cluster_id_arr, num_clusters, cluster_stats = cluster_macros(
+            benchmark, method=cluster_method, seed=seed,
+            max_net_size=cluster_max_net, resolution=cluster_resolution,
+            target_num_clusters=cluster_target,
+        )
+        print(f"[gradient_demo] clusters K={num_clusters} "
+              f"sizes(min/mean/max)="
+              f"{cluster_stats['min_cluster_size']}/"
+              f"{cluster_stats['mean_cluster_size']:.1f}/"
+              f"{cluster_stats['max_cluster_size']}", flush=True)
+        if place_all:
+            cluster_id_active = cluster_id_arr
+        else:
+            cluster_id_active = cluster_id_arr[:n_active]
+        full_init = anchor_soft_init(
+            benchmark, cluster_id_arr, seed=seed,
+            spawn_radius_frac=spawn_radius_frac,
+            anchor_strategy=anchor_strategy,
+        )
+        pos_np[:] = full_init[:n_active]
     else:
         spawn_jitter = canvas_min * float(
             os.environ.get("STRAPLE_DEMO_SPAWN_JITTER", "0.005"))
@@ -76,6 +115,10 @@ def gradient_demo(benchmark, plc, recorder=None, num_steps: int = 300,
                                half_h.numpy(), canvas_h - half_h.numpy())
     fixed_idx = (~movable).numpy()
     pos_np[fixed_idx] = fixed_pos.numpy()[fixed_idx]
+
+    if cluster_id_arr is not None and recorder is not None:
+        if hasattr(recorder, "set_cluster_ids"):
+            recorder.set_cluster_ids(cluster_id_arr)
 
     pos = torch.tensor(pos_np, dtype=torch.float32, requires_grad=True)
 
@@ -128,9 +171,33 @@ def gradient_demo(benchmark, plc, recorder=None, num_steps: int = 300,
     gamma_factor_end = float(os.environ.get("STRAPLE_DEMO_GAMMA_END", "0.3"))
 
     density_weight = float(os.environ.get("STRAPLE_DEMO_LAMBDA_START", "0.01"))
-    lambda_max = float(os.environ.get("STRAPLE_DEMO_LAMBDA_MAX", "100.0"))
+    lambda_max_env = os.environ.get("STRAPLE_DEMO_LAMBDA_MAX", "auto")
+    if lambda_max_env == "auto":
+        if n_total < 1500:
+            lambda_max = 100.0
+        elif n_total < 2500:
+            lambda_max = 1000.0
+        else:
+            lambda_max = 2000.0
+        print(f"[gradient_demo] auto lambda_max={lambda_max:.0f} "
+              f"(n_total={n_total})", flush=True)
+    else:
+        lambda_max = float(lambda_max_env)
     weight_growth = float(os.environ.get("STRAPLE_DEMO_LAMBDA_GROWTH", "1.05"))
-    target_util = float(os.environ.get("STRAPLE_DEMO_TARGET_UTIL", "0.7"))
+    target_util_env = os.environ.get("STRAPLE_DEMO_TARGET_UTIL", "auto")
+    if target_util_env == "auto":
+        macro_areas = (benchmark.macro_sizes[:, 0]
+                       * benchmark.macro_sizes[:, 1]).sum().item()
+        canvas_area = canvas_w * canvas_h
+        actual_util = macro_areas / max(canvas_area, 1e-9)
+        if n_total < 1500:
+            target_util = max(0.1, min(0.95, actual_util * 0.95))
+        else:
+            target_util = max(0.1, min(0.95, actual_util * 1.05))
+        print(f"[gradient_demo] auto target_util={target_util:.3f} "
+              f"(actual macro/canvas={actual_util:.3f})", flush=True)
+    else:
+        target_util = float(target_util_env)
     stop_overflow = float(os.environ.get("STRAPLE_DEMO_STOP_OVERFLOW", "0.07"))
 
     cong_weight = float(os.environ.get("STRAPLE_DEMO_CONG_W", "0.0"))

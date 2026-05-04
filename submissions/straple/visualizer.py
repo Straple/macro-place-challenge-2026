@@ -33,6 +33,19 @@ class PlacementRecorder:
         self.max_frames = max(4, max_frames)
         self.snapshots: List[Tuple[np.ndarray, str]] = []
         self._lns_counter = 0
+        self.cluster_ids: Optional[np.ndarray] = None
+
+    def set_cluster_ids(self, cluster_ids: np.ndarray):
+        if cluster_ids is None:
+            self.cluster_ids = None
+            return
+        arr = np.asarray(cluster_ids, dtype=np.int32).copy()
+        if arr.shape[0] != self.benchmark.num_macros:
+            raise ValueError(
+                f"cluster_ids length {arr.shape[0]} != num_macros "
+                f"{self.benchmark.num_macros}"
+            )
+        self.cluster_ids = arr
 
     def add(self, hard_positions: np.ndarray, label: str):
         positions = np.ascontiguousarray(hard_positions, dtype=np.float64).copy()
@@ -199,6 +212,12 @@ class PlacementRecorder:
 
         sizes_list = bench.macro_sizes.tolist()
         fixed_list = [bool(bench.macro_fixed[i]) for i in range(bench.num_macros)]
+        if self.cluster_ids is not None:
+            cluster_list = self.cluster_ids.tolist()
+            num_clusters_total = int(self.cluster_ids.max()) + 1
+        else:
+            cluster_list = [-1] * bench.num_macros
+            num_clusters_total = 0
 
         frames_data = []
         print(f"[visualizer] rendering {len(self.snapshots)} HTML frames...", flush=True)
@@ -232,6 +251,7 @@ class PlacementRecorder:
                     "h": round(h, 4),
                     "soft": i >= n_hard,
                     "fixed": fixed_list[i],
+                    "c": int(cluster_list[i]),
                 })
 
             frames_data.append({
@@ -276,6 +296,10 @@ class PlacementRecorder:
         canvas_h = bench.canvas_height
         frames_json = json.dumps(frames_data)
         fps = int(os.environ.get("STRAPLE_VIS_FPS", "20"))
+        if self.cluster_ids is not None:
+            num_clusters = int(self.cluster_ids.max()) + 1
+        else:
+            num_clusters = 0
 
         return _HTML_TEMPLATE.format(
             bench_name=bench_name,
@@ -284,6 +308,7 @@ class PlacementRecorder:
             num_hard=bench.num_hard_macros,
             num_total=bench.num_macros,
             num_soft=bench.num_macros - bench.num_hard_macros,
+            num_clusters=num_clusters,
             fps=fps,
             frames_json=frames_json,
         )
@@ -504,15 +529,16 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 </head>
 <body>
 <header>
-  <h1>{bench_name} · {num_hard} hard + {num_soft} soft macros</h1>
+  <h1>{bench_name} · {num_hard} hard + {num_soft} soft macros · K={num_clusters} clusters</h1>
   <div class="controls">
     <button id="prev">◀</button>
     <button id="play">▶ play</button>
     <button id="next">▶</button>
     <input type="range" id="slider" min="0" max="0" value="0" />
     <span class="frame-info" id="frame-info">frame 0/0</span>
+    <button id="color-mode" title="Toggle color mode">color: cluster</button>
   </div>
-  <span class="help">← → keys • space = play/pause • hover macros for info</span>
+  <span class="help">← → keys • space = play/pause • c = toggle color • hover macros for info</span>
 </header>
 
 <div class="grid">
@@ -541,10 +567,12 @@ const CANVAS_W = {canvas_w};
 const CANVAS_H = {canvas_h};
 const NUM_HARD = {num_hard};
 const NUM_TOTAL = {num_total};
+const NUM_CLUSTERS = {num_clusters};
 
 let cur = 0;
 let playing = false;
 let lastT = 0;
+let colorMode = NUM_CLUSTERS > 0 ? "cluster" : "kind";
 const FPS = {fps};
 
 const canvas = document.getElementById("placement-canvas");
@@ -553,10 +581,45 @@ const tooltip = document.getElementById("tooltip");
 const slider = document.getElementById("slider");
 const frameInfo = document.getElementById("frame-info");
 const placementTitle = document.getElementById("placement-title");
+const colorModeBtn = document.getElementById("color-mode");
 slider.max = FRAMES.length - 1;
+
+function hsvToRgb(h, s, v) {{
+  const c = v * s;
+  const hp = (h % 1) * 6;
+  const x = c * (1 - Math.abs((hp % 2) - 1));
+  let rp, gp, bp;
+  if (hp < 1) {{ rp = c; gp = x; bp = 0; }}
+  else if (hp < 2) {{ rp = x; gp = c; bp = 0; }}
+  else if (hp < 3) {{ rp = 0; gp = c; bp = x; }}
+  else if (hp < 4) {{ rp = 0; gp = x; bp = c; }}
+  else if (hp < 5) {{ rp = x; gp = 0; bp = c; }}
+  else {{ rp = c; gp = 0; bp = x; }}
+  const m = v - c;
+  return [Math.round((rp + m) * 255), Math.round((gp + m) * 255),
+          Math.round((bp + m) * 255)];
+}}
+
+const CLUSTER_COLORS = (() => {{
+  const arr = [];
+  const n = Math.max(1, NUM_CLUSTERS);
+  const golden = 0.6180339887;
+  let h = 0.137;
+  for (let k = 0; k < n; k++) {{
+    h = (h + golden) % 1;
+    const [r, g, b] = hsvToRgb(h, 0.78, 0.9);
+    arr.push(`rgba(${{r}}, ${{g}}, ${{b}}, 0.65)`);
+  }}
+  return arr;
+}})();
 
 function colorFor(macro) {{
   if (macro.fixed) return "rgba(220, 60, 60, 0.55)";
+  if (colorMode === "cluster" && macro.c >= 0 && NUM_CLUSTERS > 0) {{
+    const base = CLUSTER_COLORS[macro.c % CLUSTER_COLORS.length];
+    if (macro.soft) return base.replace("0.65)", "0.32)");
+    return base;
+  }}
   if (macro.soft)  return "rgba(176, 196, 222, 0.30)";
   return "rgba(50, 100, 200, 0.55)";
 }}
@@ -662,10 +725,19 @@ function togglePlay() {{
 }}
 document.getElementById("play").onclick = togglePlay;
 
+function toggleColorMode() {{
+  if (NUM_CLUSTERS === 0) return;
+  colorMode = colorMode === "cluster" ? "kind" : "cluster";
+  if (colorModeBtn) colorModeBtn.textContent = `color: ${{colorMode}}`;
+  drawPlacement();
+}}
+if (colorModeBtn) colorModeBtn.onclick = toggleColorMode;
+
 document.addEventListener("keydown", (e) => {{
   if (e.key === "ArrowLeft") {{ showFrame(cur - 1); e.preventDefault(); }}
   else if (e.key === "ArrowRight") {{ showFrame(cur + 1); e.preventDefault(); }}
   else if (e.key === " ") {{ togglePlay(); e.preventDefault(); }}
+  else if (e.key === "c" || e.key === "C") {{ toggleColorMode(); e.preventDefault(); }}
 }});
 
 canvas.addEventListener("mousemove", (e) => {{
@@ -691,11 +763,15 @@ canvas.addEventListener("mousemove", (e) => {{
   }}
   if (hit) {{
     const kind = hit.fixed ? "FIXED" : (hit.soft ? "soft" : "hard");
-    tooltip.textContent =
+    let lines =
       `[${{hit.i}}] ${{hit.name}}\\n` +
       `kind: ${{kind}}\\n` +
       `pos:  (${{hit.x.toFixed(3)}}, ${{hit.y.toFixed(3)}})\\n` +
       `size: ${{hit.w.toFixed(3)}} × ${{hit.h.toFixed(3)}}`;
+    if (hit.c >= 0 && NUM_CLUSTERS > 0) {{
+      lines += `\\ncluster: ${{hit.c}} / ${{NUM_CLUSTERS}}`;
+    }}
+    tooltip.textContent = lines;
     tooltip.style.display = "block";
     tooltip.style.left = (e.clientX - r.left + 14) + "px";
     tooltip.style.top = (e.clientY - r.top + 14) + "px";
