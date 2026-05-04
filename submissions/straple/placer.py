@@ -497,9 +497,9 @@ class StraplePlacer:
                 if log_step and iteration % (log_step * 2) == 0:
                     self._log(f"[{bench_label}] start#{start_idx} LNS iter={iteration:>3} "
                               f"op={op:<7} reject (cost={new_cost:.4f} > {best_cost:.4f})")
-                if no_improve_count >= shake_threshold and shake_count < 5:
+                if no_improve_count >= shake_threshold and shake_count < 10:
                     state.set_positions(best_pos)
-                    shake_k = min(num_movable // 4, 50)
+                    shake_k = min(num_movable // 4 + shake_count * 10, max(20, num_movable // 2))
                     state.swap_two_macros(shake_k)
                     state.destroy_and_repair(shake_k)
                     no_improve_count = 0
