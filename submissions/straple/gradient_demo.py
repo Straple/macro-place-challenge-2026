@@ -92,6 +92,9 @@ def gradient_demo(benchmark, plc, recorder=None, num_steps: int = 300,
     target_util = float(os.environ.get("STRAPLE_DEMO_TARGET_UTIL", "0.7"))
     stop_overflow = float(os.environ.get("STRAPLE_DEMO_STOP_OVERFLOW", "0.07"))
 
+    cong_weight = float(os.environ.get("STRAPLE_DEMO_CONG_W", "0.0"))
+    cong_top_pct = float(os.environ.get("STRAPLE_DEMO_CONG_TOP_PCT", "0.1"))
+
     overlap_weight = float(os.environ.get("STRAPLE_DEMO_OVERLAP_W", "1.0"))
     overlap_w_max = float(os.environ.get("STRAPLE_DEMO_OVERLAP_W_MAX", "100000.0"))
     overlap_w_growth = float(os.environ.get("STRAPLE_DEMO_OVERLAP_W_GROWTH", "1.01"))
@@ -109,6 +112,12 @@ def gradient_demo(benchmark, plc, recorder=None, num_steps: int = 300,
 
     grid_rows = int(benchmark.grid_rows)
     grid_cols = int(benchmark.grid_cols)
+
+    cell_w_t = canvas_w / grid_cols
+    cell_h_t = canvas_h / grid_rows
+    cell_cx_t = (torch.arange(grid_cols, dtype=torch.float32) + 0.5) * cell_w_t
+    cell_cy_t = (torch.arange(grid_rows, dtype=torch.float32) + 0.5) * cell_h_t
+    cong_smooth_sigma = (cell_w_t + cell_h_t) * 0.25
 
     if recorder is not None:
         recorder.add(pos.detach().numpy().astype(np.float64),
@@ -165,22 +174,48 @@ def gradient_demo(benchmark, plc, recorder=None, num_steps: int = 300,
 
         diff_x = pos[:, 0:1] - pos[:, 0].unsqueeze(0)
         diff_y = pos[:, 1:2] - pos[:, 1].unsqueeze(0)
-        ovlap_x = torch.relu(sizes_x_pair - torch.abs(diff_x))
-        ovlap_y = torch.relu(sizes_y_pair - torch.abs(diff_y))
-        ovlap_area = (ovlap_x * ovlap_y) * eye_mask
-        if overlap_form == "quadratic":
-            overlap_loss = (ovlap_area * ovlap_area).sum() * 0.5
-        elif overlap_form == "cubic":
-            overlap_loss = (ovlap_area ** 3).sum() * 0.5
-        elif overlap_form == "huber":
-            delta = 0.5
-            overlap_loss = torch.where(
-                ovlap_area < delta,
-                0.5 * ovlap_area * ovlap_area,
-                delta * (ovlap_area - 0.5 * delta)
-            ).sum() * 0.5
+
+        if overlap_form == "gauss":
+            sigma_x_sq = sizes_x_pair * sizes_x_pair + 1e-6
+            sigma_y_sq = sizes_y_pair * sizes_y_pair + 1e-6
+            gauss = torch.exp(-(diff_x * diff_x / sigma_x_sq
+                                + diff_y * diff_y / sigma_y_sq))
+            overlap_loss = (gauss * eye_mask).sum() * 0.5
+            ovlap_area = torch.relu(sizes_x_pair - torch.abs(diff_x)) * \
+                         torch.relu(sizes_y_pair - torch.abs(diff_y)) * eye_mask
+        elif overlap_form == "coulomb":
+            soft_sq = (sizes_x_pair * sizes_x_pair + sizes_y_pair * sizes_y_pair) * 0.04
+            dist_sq = diff_x * diff_x + diff_y * diff_y + soft_sq
+            coulomb = 1.0 / dist_sq
+            overlap_loss = (coulomb * eye_mask).sum() * 0.5
+            ovlap_area = torch.relu(sizes_x_pair - torch.abs(diff_x)) * \
+                         torch.relu(sizes_y_pair - torch.abs(diff_y)) * eye_mask
+        elif overlap_form == "gauss_overlap":
+            sigma_x_sq = sizes_x_pair * sizes_x_pair + 1e-6
+            sigma_y_sq = sizes_y_pair * sizes_y_pair + 1e-6
+            gauss = torch.exp(-(diff_x * diff_x / sigma_x_sq
+                                + diff_y * diff_y / sigma_y_sq))
+            ovlap_x = torch.relu(sizes_x_pair - torch.abs(diff_x))
+            ovlap_y = torch.relu(sizes_y_pair - torch.abs(diff_y))
+            ovlap_area = ovlap_x * ovlap_y * eye_mask
+            overlap_loss = ((gauss + 5.0 * ovlap_area) * eye_mask).sum() * 0.5
         else:
-            overlap_loss = ovlap_area.sum() * 0.5
+            ovlap_x = torch.relu(sizes_x_pair - torch.abs(diff_x))
+            ovlap_y = torch.relu(sizes_y_pair - torch.abs(diff_y))
+            ovlap_area = (ovlap_x * ovlap_y) * eye_mask
+            if overlap_form == "quadratic":
+                overlap_loss = (ovlap_area * ovlap_area).sum() * 0.5
+            elif overlap_form == "cubic":
+                overlap_loss = (ovlap_area ** 3).sum() * 0.5
+            elif overlap_form == "huber":
+                delta = 0.5
+                overlap_loss = torch.where(
+                    ovlap_area < delta,
+                    0.5 * ovlap_area * ovlap_area,
+                    delta * (ovlap_area - 0.5 * delta)
+                ).sum() * 0.5
+            else:
+                overlap_loss = ovlap_area.sum() * 0.5
 
         cur_density_weight = density_weight
 
@@ -188,7 +223,34 @@ def gradient_demo(benchmark, plc, recorder=None, num_steps: int = 300,
         for g in optimizer.param_groups:
             g["lr"] = cur_lr
 
-        loss = wl + cur_density_weight * dpen + overlap_weight * overlap_loss
+        if cong_weight > 0 and padded is not None:
+            macro_idx, offsets, mask = padded
+            pin_xy = pos[macro_idx] + offsets
+            x = pin_xy[..., 0]
+            y = pin_xy[..., 1]
+            neg_inf = torch.finfo(pos.dtype).min
+            x_for_max = torch.where(mask, x, x.new_full((), neg_inf))
+            x_for_min = torch.where(mask, -x, x.new_full((), neg_inf))
+            y_for_max = torch.where(mask, y, y.new_full((), neg_inf))
+            y_for_min = torch.where(mask, -y, y.new_full((), neg_inf))
+            x_max = gamma * torch.logsumexp(x_for_max / gamma, dim=1)
+            x_min = -gamma * torch.logsumexp(x_for_min / gamma, dim=1)
+            y_max = gamma * torch.logsumexp(y_for_max / gamma, dim=1)
+            y_min = -gamma * torch.logsumexp(y_for_min / gamma, dim=1)
+            in_x = (torch.sigmoid((x_max[:, None] - cell_cx_t[None, :]) / cong_smooth_sigma)
+                    * torch.sigmoid((cell_cx_t[None, :] - x_min[:, None]) / cong_smooth_sigma))
+            in_y = (torch.sigmoid((y_max[:, None] - cell_cy_t[None, :]) / cong_smooth_sigma)
+                    * torch.sigmoid((cell_cy_t[None, :] - y_min[:, None]) / cong_smooth_sigma))
+            cell_demand = (in_y[:, :, None] * in_x[:, None, :]).sum(dim=0)
+            flat_demand = cell_demand.flatten()
+            top_k = max(1, int(flat_demand.numel() * cong_top_pct))
+            top_vals, _ = torch.topk(flat_demand, top_k)
+            cong_loss = top_vals.mean()
+        else:
+            cong_loss = pos.new_zeros(())
+
+        loss = (wl + cur_density_weight * dpen + overlap_weight * overlap_loss
+                + cong_weight * cong_loss)
         loss.backward()
         optimizer.step()
 
@@ -214,7 +276,8 @@ def gradient_demo(benchmark, plc, recorder=None, num_steps: int = 300,
             recorder.add(pos.detach().numpy().astype(np.float64),
                          f"grad step={step+1} "
                          f"λ_d={cur_density_weight:.2f} "
-                         f"λ_o={overlap_weight:.1f} ov={ovlap_val:.2f} "
+                         f"λ_o={overlap_weight:.1f} λ_c={cong_weight:.1f} "
+                         f"ov={ovlap_val:.2f} cong={float(cong_loss):.2f} "
                          f"lr={cur_lr:.3f}")
 
         if score_history is not None:
@@ -235,8 +298,10 @@ def gradient_demo(benchmark, plc, recorder=None, num_steps: int = 300,
                     "wl_smooth": float(wl.item()),
                     "dpen": float(dpen.item()),
                     "overlap_term": float(overlap_loss.item()),
+                    "cong_term": float(cong_loss.item()) if cong_weight > 0 else 0.0,
                     "lambda_d": density_weight,
                     "lambda_o": overlap_weight,
+                    "lambda_c": cong_weight,
                 })
         step += 1
 

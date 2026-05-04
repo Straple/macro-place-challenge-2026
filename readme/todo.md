@@ -287,3 +287,151 @@
 - Перед analytical: hierarchical clustering макросов (METIS / spectral) → использовать как **initial structural prior**
 - Multi-phase scheduling с stop conditions per phase (overflow target, gradient norm threshold)
 - На каждой фазе пересобирать density bins (увеличивать разрешение к концу)
+
+---
+
+## 8. Сессия 2026-05-04 (визуализация + gradient demo + GPU plans)
+
+### Что сделано
+
+**Visualizer (`submissions/straple/visualizer.py`)** — формат определяется по расширению output:
+- `.mp4` — видео через ffmpeg (libx264)
+- `.gif` — анимированный GIF
+- `.html` — интерактивный (canvas + JS): hover на макросы → tooltip с именем, ←/→ переключают кадры, space play/pause, FPS configurable
+- 2×2 layout: placement (canvas) / density heatmap / congestion heatmap / score history
+
+**Force-directed demo (`submissions/straple/force_demo.py`)** — `STRAPLE_DEMO=force`:
+- Random или center init
+- Repulsion (overlap-axis push) + spring (по нетам) + spread (long-range Coulomb)
+- Cooling damping (0.85→0.99), velocity cap decay
+- Random ops: teleport / swap / pull / shake / scatter_cluster (каждые N шагов)
+- Bounce от стен (bounce_factor=-0.7)
+- Score history PNG (`STRAPLE_DEMO_SCORE_PNG=path.png`)
+
+**Gradient demo (`submissions/straple/gradient_demo.py`)** — `STRAPLE_DEMO=gradient`, **наш аналог DREAMPlace для демо**:
+- Adam optimizer
+- Loss = WL_smooth (LSE) + λ_d × density_bell + λ_o × overlap_term
+- Adaptive density_weight (растёт при overflow > stop_overflow)
+- Cooling gamma (γ_start=1.5 × base → γ_end=0.3 × base)
+- Cooling LR (lr × 0.05 to end)
+- 6 overlap forms: linear / quadratic / cubic / huber / **gauss** / **gauss_overlap** / **coulomb**
+- Optional Lagrangian update (`λ_o += ρ × overlap`)
+- Optional finishing C++ legalize (`STRAPLE_DEMO_FINISH_LEGALIZE=1`)
+- Score history с tracking loss components
+
+**Best result (ibm01, 600 шагов, ~100с CPU)**:
+- `OVERLAP_FORM=gauss_overlap` + `FINISH_LEGALIZE=0` → proxy=1.5800, **VALID 0 overlaps**, чисто PyTorch
+- `OVERLAP_W=0` + `FINISH_LEGALIZE=1` → proxy=**1.4288**, 0 overlaps (best metrics)
+- vs наш ALNS submission: 1.0584 (то есть demo гораздо хуже, но это только seed phase)
+
+### План когда будет GPU (T4 + 16 vCPU + 64GB RAM, 100GB disk)
+
+**Disk requirements**:
+- DREAMPlace Docker image: 20 GB
+- Native install + CUDA + PyTorch: ~10 GB
+- Наш проект: 2 GB
+- Builds + outputs + checkpoints: 50 GB
+- **Минимум 50 GB, комфортно 100 GB**
+
+**Phase 1: GPU-port текущего gradient_demo (1 день)**
+1. Перевести все torch tensors на `device='cuda'` — 30 минут
+2. Multi-start через batch dimension `[K, n, 2]` — добавить outer dim во все ops
+3. Profile + tune для T4 (8.1 TFLOPS, 16GB)
+4. Hyperparam sweep: 64-128 starts с разными (lr, λ_d_max, target_util, gamma_frac)
+5. Best of K → seed для LNS polish
+
+Ожидание GPU speedup:
+- ibm01: 10× (мала задача)
+- ibm17: ~40× (n=760, n²=580K pairs)
+- Multi-start K=16 на T4: ~5 секунд на бенч (vs 60c CPU)
+- 17 бенчей × 8 multi-start: **~2 минуты** на T4 vs ~2 часа CPU
+
+**Phase 2: Congestion-aware loss (1-2 дня)**
+- Реализовать smooth bbox через LSE на пинах нета (есть для HPWL)
+- Routing demand grid: каждая ячейка получает sum bbox-ов проходящих
+- Smooth top-10% via soft-max → дифференцируема
+- Это закроет 66% метрики которую gradient сейчас не видит
+- Ожидание: -10..-20% на C компоненту → proxy ниже 1.0 на ibm01
+
+**Phase 3: DREAMPlace integration (3-5 дней)**
+- Билд DREAMPlace внутри Docker (image скачан, ~1 час компиляции)
+- Конвертер benchmark → LEF/DEF (есть `ProtobufToLEFDEF.py` от TILOS, нужен tqdm)
+- Wrapper в нашем placer'е: subprocess → run DREAMPlace → parse output → multi-start seed
+- Multi-start hyperparam sweep на T4 (target_density, density_weight, gamma — как Archgen)
+- LNS polish после DREAMPlace seed
+
+**Phase 4: Hybrid gradient + LNS (1 день)**
+- Gradient seed (наш или DREAMPlace) → 0 overlaps
+- ALNS polish на seed (наш существующий)
+- Gradient даёт хороший basin, LNS делает локальную оптимизацию
+
+### Ожидаемые улучшения по AVG17
+
+| Подход | AVG17 | Ранг |
+|---|---|---|
+| Текущий submission | 1.4445 | ~16 |
+| GPU-port + multi-start (Phase 1) | ~1.42 | ~13-14 |
+| + Congestion-aware loss (Phase 2) | ~1.36-1.40 | ~9-12 |
+| + DREAMPlace integration (Phase 3) | ~1.34-1.38 | ~7-10 |
+| + Full hybrid (Phase 4) | ~1.30-1.34 | топ-5..7 |
+
+**Реалистично топ-7 квалификация на Гран-при** (≤1.3479) при выполнении Phase 1-3 за ~1 неделю на T4.
+
+### Optimizer / loss tuning candidates (когда будет GPU)
+
+**Optimizer**:
+- Nesterov accelerated gradient (DREAMPlace's choice)
+- AdamW с weight decay
+- Lookahead optimizer (slow + fast updates)
+
+**Schedule**:
+- DREAMPlace overflow-based gamma update: `coef = 10^((overflow - 0.1) × 20/9 - 1)`
+- Density quadratic penalty (auto-Lagrangian)
+- Reduce-on-plateau LR
+
+**Loss components**:
+- Congestion-aware (см. Phase 2)
+- Per-region density (для structural constraints как у MTK)
+- Pin-side affinity (макросы с >K IO-пинов прижимаются к краям)
+
+### Параметры текущего gradient_demo (env vars)
+
+```bash
+STRAPLE_DEMO=gradient                    # mode: force | gradient
+STRAPLE_DEMO_INIT=center                 # center | random
+STRAPLE_DEMO_ITERS=600                   # шагов градиента
+STRAPLE_DEMO_TIME_BUDGET=120             # ИЛИ time budget в секундах (вместо ITERS)
+STRAPLE_DEMO_LR=0.3
+STRAPLE_DEMO_LR_END_FACTOR=0.05          # LR cooling: 0.3 → 0.015
+STRAPLE_DEMO_LAMBDA_START=0.01           # density_weight start
+STRAPLE_DEMO_LAMBDA_GROWTH=1.05          # multiplicative growth per step
+STRAPLE_DEMO_LAMBDA_MAX=200
+STRAPLE_DEMO_GAMMA_FRAC=0.05             # WL_smooth gamma = canvas_min × frac
+STRAPLE_DEMO_GAMMA_START=1.5             # cooling start factor
+STRAPLE_DEMO_GAMMA_END=0.3               # cooling end factor
+STRAPLE_DEMO_TARGET_UTIL=0.3             # density target
+STRAPLE_DEMO_OVERLAP_W=20                # overlap penalty weight
+STRAPLE_DEMO_OVERLAP_W_GROWTH=1.005
+STRAPLE_DEMO_OVERLAP_W_MAX=2000
+STRAPLE_DEMO_OVERLAP_FORM=gauss_overlap  # linear|quadratic|cubic|huber|gauss|gauss_overlap|coulomb
+STRAPLE_DEMO_LAGRANGIAN=0                # use λ += ρ × overlap (additive) instead of multiplicative
+STRAPLE_DEMO_RHO=5.0                     # Lagrangian rho
+STRAPLE_DEMO_FINISH_LEGALIZE=0           # 1 = run C++ legalize at end
+# Visualization:
+STRAPLE_VIS_VIDEO=vis/output.html        # path with .html / .mp4 / .gif extension
+STRAPLE_VIS_MAX_FRAMES=240
+STRAPLE_VIS_FPS=24
+STRAPLE_VIS_INTERVAL=100                 # for LNS mode
+STRAPLE_DEMO_SCORE_PNG=vis/score.png     # static PNG of score history
+STRAPLE_DEMO_SCORE_SAMPLE_S=1.0          # sampling interval for score
+```
+
+### Файлы (uncommitted)
+
+- `submissions/straple/visualizer.py` — HTML/MP4/GIF visualizer
+- `submissions/straple/force_demo.py` — physics demo
+- `submissions/straple/gradient_demo.py` — gradient (DREAMPlace-style) demo
+- Изменения в `submissions/straple/placer.py` — env-var dispatch для demo modes
+- `vis/*.html`, `vis/*.png`, `vis/*.mp4` — артефакты экспериментов
+
+Все три demo файла — **только для визуализации**, не используются submitted placer'ом. Default behavior `evaluate submissions/straple/placer.py` без env vars = baseline ALNS pipeline (1.4445 AVG17).
