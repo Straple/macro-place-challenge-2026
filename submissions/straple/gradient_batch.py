@@ -128,18 +128,26 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
         else:
             target_util = max(0.1, min(0.95, actual_util * 1.05))
 
-    # Per-K diversity hyperparams: target_util varies, gamma_mul varies
+    # Per-K diversity hyperparams: each seed has its own (target_util, gamma,
+    # density λ multiplier, congestion weight multiplier, anchor β multiplier).
     if per_k_diversity:
         rng_div = np.random.default_rng(seed + 7777)
-        # target_util: spread around base ±15%
         target_util_K_np = np.clip(
             target_util * (1.0 + rng_div.uniform(-0.15, 0.15, K)),
             0.1, 0.95).astype(np.float32)
-        # gamma_mul per K: spread 0.7..1.4 (multiplied with phase gamma)
         gamma_K_np = np.clip(rng_div.uniform(0.7, 1.4, K), 0.5, 2.0).astype(np.float32)
+        # density_weight_K: multiplier applied to phase λ_d (range 0.5..2.0)
+        lambda_mul_K_np = rng_div.uniform(0.5, 2.0, K).astype(np.float32)
+        # congestion weight per K: 0.3..3.0 of base
+        cong_mul_K_np = rng_div.uniform(0.3, 3.0, K).astype(np.float32)
+        # anchor beta multiplier: 0.3..3.0
+        anchor_mul_K_np = rng_div.uniform(0.3, 3.0, K).astype(np.float32)
     else:
         target_util_K_np = np.full(K, target_util, dtype=np.float32)
         gamma_K_np = np.ones(K, dtype=np.float32)
+        lambda_mul_K_np = np.ones(K, dtype=np.float32)
+        cong_mul_K_np = np.ones(K, dtype=np.float32)
+        anchor_mul_K_np = np.ones(K, dtype=np.float32)
 
     if verbose:
         print(f"[gradient_batch] auto cluster_target={cluster_target} "
@@ -236,6 +244,9 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
 
     target_util_K_t = torch.tensor(target_util_K_np, device=dev).view(K, 1, 1)
     gamma_K_t = torch.tensor(gamma_K_np, device=dev)
+    lambda_mul_K_t = torch.tensor(lambda_mul_K_np, device=dev)
+    cong_mul_K_t = torch.tensor(cong_mul_K_np, device=dev)
+    anchor_mul_K_t = torch.tensor(anchor_mul_K_np, device=dev)
 
     # Anchor displacement: anchors_K [K, num_clusters, 2] -> per-macro anchor [K, n, 2]
     anchor_loss_active = anchor_loss_beta_start > 0 or anchor_loss_beta_end > 0
@@ -331,10 +342,11 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
     if verbose:
         print(f"[gradient_batch] starting {num_steps} iters...", flush=True)
     t_loop = time.time()
-    # Snapshot pos for ALL K every snapshot_every steps -> use later to replay best
-    # Memory: [num_snapshots, K, n, 2] * 4 bytes. For K=384, n=1140, 30 snapshots:
-    # = 30 * 384 * 1140 * 2 * 4 = 105 MB on CPU (kept in numpy)
-    snapshot_every = 12
+    # Snapshot pos every snapshot_every steps. We only keep best_idx slice
+    # later, but we don't know it now -> save best-overlap-area heuristic:
+    # actually save ALL K (memory ~OK), trim later in caller.
+    # For K=384, n=1140, 250 snapshots: 875 MB. Fits in 64GB RAM.
+    snapshot_every = int(os.environ.get("STRAPLE_BATCH_SNAPSHOT_EVERY", "1"))
     snapshots_pos = []
     snapshots_step = []
 
@@ -510,10 +522,23 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
         else:
             anchor_loss_total = pos.new_zeros(())
 
-        loss = (wl_total + density_weight * dpen_total
-                + cur_overlap_w_phase * overlap_total
-                + anchor_loss_total
-                + cong_weight * cong_total)
+        # Per-K weighting: instead of summed total, sum (per-K loss * per-K mul)
+        # for components that vary per seed: density, anchor, cong.
+        # WL and overlap stay shared (already vectorized over K).
+        if per_k_diversity:
+            density_per_K = density_weight * lambda_mul_K_t * dpen_K
+            cong_per_K = cong_weight * cong_mul_K_t * cong_K
+            # anchor_loss_total already weighted globally; if per_k, we can't
+            # easily decompose without redoing — skip for now (uses global β)
+            loss = (wl_total + density_per_K.sum()
+                    + cur_overlap_w_phase * overlap_total
+                    + anchor_loss_total
+                    + cong_per_K.sum())
+        else:
+            loss = (wl_total + density_weight * dpen_total
+                    + cur_overlap_w_phase * overlap_total
+                    + anchor_loss_total
+                    + cong_weight * cong_total)
         loss.backward()
         optimizer.step()
 

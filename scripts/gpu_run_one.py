@@ -107,6 +107,7 @@ def main():
     use_eplace = os.environ.get("STRAPLE_BATCH_EPLACE", "0") == "1"
     eplace_grid_size = int(os.environ.get("STRAPLE_BATCH_EPLACE_GRID", "256"))
     cong_weight = float(os.environ.get("STRAPLE_BATCH_CONG_W", "0"))
+    per_k_diversity = os.environ.get("STRAPLE_BATCH_DIVERSITY", "0") == "1"
     pos_K, stats = gradient_batch(
         benchmark, plc, K=args.K,
         num_steps=20000,
@@ -122,6 +123,7 @@ def main():
         use_eplace_density=use_eplace,
         eplace_grid_size=eplace_grid_size,
         cong_weight=cong_weight,
+        per_k_diversity=per_k_diversity,
     )
     grad_time = time.time() - t0
     if torch.cuda.is_available():
@@ -271,47 +273,64 @@ def main():
     if args.no_vis:
         return
 
-    # Phase 3: HTML viz using ACTUAL snapshots from gradient_batch (best seed).
-    # Снимок каждые 30 шагов pos[best_idx] от GPU batch run — это РЕАЛЬНАЯ
-    # траектория лучшего сида с ePlace+cong+anchor.
-    print(f"\n[gpu_run_one] HTML viz from gradient_batch snapshots (k={best_idx})...",
-          flush=True)
+    # Phase 3: simple JS canvas HTML viz using ACTUAL snapshots from
+    # gradient_batch (best seed). Snapshot каждый step pos[best_idx] от GPU
+    # batch run — это РЕАЛЬНАЯ траектория с ePlace+cong+anchor. Браузер
+    # рендерит каждый кадр через canvas — никакого matplotlib.
+    print(f"\n[gpu_run_one] simple HTML viz (k={best_idx})...", flush=True)
     vis_path = REPO_ROOT / "vis" / f"{args.bench}_gpu_best.html"
     vis_path.parent.mkdir(parents=True, exist_ok=True)
 
-    from visualizer import PlacementRecorder
     from clustering import cluster_macros
+    from make_simple_viz import render_simple_html
 
     snapshots_pos = stats.get("snapshots_pos", None)
     snapshots_step = stats.get("snapshots_step", [])
-    recorder = PlacementRecorder(benchmark, plc, str(vis_path),
-                                 interval=1, max_frames=args.vis_frames)
     cluster_target = max(15, benchmark.num_macros // 30)
     cluster_id, num_clusters, _ = cluster_macros(
         benchmark, method="louvain", seed=42,
         max_net_size=20, target_num_clusters=cluster_target,
     )
-    recorder.set_cluster_ids(cluster_id)
 
     if snapshots_pos is not None and len(snapshots_step) > 0:
-        # snapshots_pos shape [num_snap, K, n, 2] — use [:, best_idx, :, :]
-        # Передаём FULL traj (включая soft) чтобы visualizer считал proxy
-        # с реальными soft positions от gradient — иначе он использует initial
-        # soft и выдаст высокий proxy.
         traj = snapshots_pos[:, best_idx, :, :]   # [num_snap, n_total, 2]
+        # Compute proxy for each snapshot — это медленно (sequential
+        # compute_proxy_cost) для 250 frames, но даёт точную метрику. Можем
+        # ускорить если нужно.
+        from macro_place.objective import compute_proxy_cost
+        full_template = benchmark.macro_positions.clone()
+        proxies = []
+        labels = []
+        t_proxy = time.time()
         for i, step_n in enumerate(snapshots_step):
-            recorder.add(traj[i].astype(np.float64),
-                         f"step={step_n}")
-    # Final post-legalize frame: full layout (legalized hard + gradient soft)
-    recorder.add(best_pos_full.astype(np.float64),
-                 f"FINAL legalized k={best_idx} proxy={best_proxy:.4f}")
+            full = full_template.clone()
+            full[:traj[i].shape[0]] = torch.tensor(traj[i], dtype=torch.float32)
+            c = compute_proxy_cost(full, benchmark, plc)
+            proxies.append(float(c["proxy_cost"]))
+            labels.append(f"step={step_n}")
+            if (i + 1) % 50 == 0:
+                print(f"[gpu_run_one] proxy snapshots {i+1}/{len(snapshots_step)}",
+                      flush=True)
+        # Final legalized
+        full_f = torch.tensor(best_pos_full, dtype=torch.float32)
+        cf = compute_proxy_cost(full_f, benchmark, plc)
+        proxies.append(float(cf["proxy_cost"]))
+        labels.append(f"FINAL legalized k={best_idx} proxy={best_proxy:.4f}")
+        print(f"[gpu_run_one] proxy compute: {time.time()-t_proxy:.1f}s",
+              flush=True)
 
-    print(f"[gpu_run_one] rendering HTML ({len(recorder.snapshots)} snapshots)...",
-          flush=True)
-    t_render = time.time()
-    recorder.render()
-    print(f"[gpu_run_one] HTML render: {time.time()-t_render:.1f}s", flush=True)
-    print(f"[gpu_run_one] saved {vis_path}", flush=True)
+        t_render = time.time()
+        render_simple_html(
+            str(vis_path), benchmark, traj, snapshots_step,
+            cluster_id, proxies, labels,
+            final_pos=best_pos_full,
+            final_proxy=best_proxy,
+            final_label=labels[-1],
+        )
+        print(f"[gpu_run_one] HTML render: {time.time()-t_render:.1f}s",
+              flush=True)
+    else:
+        print("[gpu_run_one] no snapshots, skipping HTML", flush=True)
 
     print(f"\n[gpu_run_one] === DONE === total={time.time()-t0:.1f}s "
           f"best_proxy={best_proxy:.4f}", flush=True)

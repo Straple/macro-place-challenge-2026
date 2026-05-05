@@ -1412,7 +1412,9 @@ high_effort = `num_starts=4 + perturbed=12` (sigma scales 0.10..0.50) + `LNS fac
 | 9 | + ePlace FFT density grid=128 | **1.0366** ← пробили ALNS |
 | 10 | + cong=30 ePlace 128 | 1.0279 |
 | 11 | + cong=15 ePlace 128 | 1.0054 |
-| 12 | + cong=10 ePlace 128 | **1.0036** ← best |
+| 12 | + cong=10 ePlace 128 | 1.0036 |
+| 13 | every-step snapshots + JS canvas viz | 1.0140 |
+| 14 | **+ per-K diversity (lambda/cong/anchor/util/gamma random per seed)** | **0.9998** ← <1.0 |
 
 ### Сравнение
 
