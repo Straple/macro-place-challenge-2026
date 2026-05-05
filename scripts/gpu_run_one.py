@@ -104,6 +104,9 @@ def main():
     # Default to 5000 steps then time_budget will cap.
     anchor_beta_start = float(os.environ.get("STRAPLE_BATCH_ANCHOR_BETA_START", "0"))
     anchor_beta_end = float(os.environ.get("STRAPLE_BATCH_ANCHOR_BETA_END", "0"))
+    use_eplace = os.environ.get("STRAPLE_BATCH_EPLACE", "0") == "1"
+    eplace_grid_size = int(os.environ.get("STRAPLE_BATCH_EPLACE_GRID", "256"))
+    cong_weight = float(os.environ.get("STRAPLE_BATCH_CONG_W", "0"))
     pos_K, stats = gradient_batch(
         benchmark, plc, K=args.K,
         num_steps=20000,
@@ -116,6 +119,9 @@ def main():
         anchor_jitter_frac=0.05,
         anchor_loss_beta_start=anchor_beta_start,
         anchor_loss_beta_end=anchor_beta_end,
+        use_eplace_density=use_eplace,
+        eplace_grid_size=eplace_grid_size,
+        cong_weight=cong_weight,
     )
     grad_time = time.time() - t0
     if torch.cuda.is_available():

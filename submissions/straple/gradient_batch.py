@@ -44,6 +44,8 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
                    spawn_adaptive: bool = True,
                    anchor_loss_beta_start: float = 0.0,
                    anchor_loss_beta_end: float = 0.0,
+                   cong_weight: float = 0.0,
+                   cong_top_pct: float = 0.10,
                    cluster_target: int = 0,
                    target_util: float = 0.0,
                    lambda_max: float = 0.0,
@@ -61,6 +63,8 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
                    verbose: bool = True,
                    anchor_jitter_frac: float = 0.05,
                    per_k_diversity: bool = False,
+                   use_eplace_density: bool = False,
+                   eplace_grid_size: int = 256,
                    multi_phase: bool = True,
                    phase_breaks: tuple = (0.30, 0.70),
                    phase1_gamma_mul: float = 3.0,
@@ -282,6 +286,41 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
     macro_areas = sizes_t[:, 0] * sizes_t[:, 1]  # [n]
     cell_capacity = cell_w * cell_h
 
+    # Congestion-aware loss: smooth bbox per net via LSE -> grid demand
+    if cong_weight > 0:
+        cong_smooth_sigma = (cell_w + cell_h) * 0.25
+        if verbose:
+            print(f"[gradient_batch] cong_weight={cong_weight}, "
+                  f"top_pct={cong_top_pct}", flush=True)
+
+    # ePlace electrostatic Poisson kernel on a HIGH-RES grid (independent of
+    # benchmark's proxy_cost grid). Use eplace_grid_size for FFT resolution.
+    if use_eplace_density:
+        ep_n = int(eplace_grid_size)
+        ep_cell_w = canvas_w / ep_n
+        ep_cell_h = canvas_h / ep_n
+        ep_grid_x = (torch.arange(ep_n, dtype=torch.float32, device=dev)
+                     * ep_cell_w + ep_cell_w / 2)
+        ep_grid_y = (torch.arange(ep_n, dtype=torch.float32, device=dev)
+                     * ep_cell_h + ep_cell_h / 2)
+        ep_sigma_x = ep_cell_w
+        ep_sigma_y = ep_cell_h
+        kx = torch.fft.fftfreq(ep_n, d=ep_cell_w, device=dev) * 2.0 * float(np.pi)
+        ky = torch.fft.fftfreq(ep_n, d=ep_cell_h, device=dev) * 2.0 * float(np.pi)
+        kx_g, ky_g = torch.meshgrid(kx, ky, indexing="xy")
+        k_sq = kx_g * kx_g + ky_g * ky_g                     # [ep_n, ep_n]
+        k_sq[0, 0] = 1.0
+        inv_k_sq = 1.0 / k_sq
+        inv_k_sq[0, 0] = 0.0
+        total_macro_area = float(macro_areas.sum().item())
+        canvas_area = canvas_w * canvas_h
+        target_density_eplace = total_macro_area / canvas_area
+        if verbose:
+            ep_mem_mb = K * ep_n * ep_n * 8 / 1e6  # complex64 storage estimate
+            print(f"[gradient_batch] ePlace density ON: grid={ep_n}x{ep_n}, "
+                  f"target={target_density_eplace:.3f}, est_density_mem~{ep_mem_mb:.0f} MB",
+                  flush=True)
+
     gamma_base = canvas_min * gamma_frac
     half_w_t = half_w
     half_h_t = half_h
@@ -366,6 +405,34 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
         wl_K = ((max_x - min_x) + (max_y - min_y)).sum(dim=1)        # [K]
         wl_total = wl_K.sum()
 
+        # Congestion-aware loss: net bbox dimensions (max_x - min_x, max_y - min_y)
+        # already computed above. Smooth indicator if cell is inside bbox -> sum
+        # over all nets -> top-k cells. Larger bbox = more cells covered = more demand.
+        if cong_weight > 0:
+            # bbox per net per K: x_lo, x_hi [K, num_nets]
+            x_hi = max_x   # [K, num_nets]
+            x_lo = min_x
+            y_hi = max_y
+            y_lo = min_y
+            # Sigmoid indicator: cell c contributes to net n if x_lo <= cx <= x_hi (similar for y)
+            # in_x [K, num_nets, ncols] = sigmoid((x_hi - cx)/σ) * sigmoid((cx - x_lo)/σ)
+            cx_e = grid_x[None, None, :]   # [1, 1, ncols]
+            cy_e = grid_y[None, None, :]   # [1, 1, nrows]
+            in_x = (torch.sigmoid((x_hi[..., None] - cx_e) / cong_smooth_sigma)
+                    * torch.sigmoid((cx_e - x_lo[..., None]) / cong_smooth_sigma))  # [K, num_nets, ncols]
+            in_y = (torch.sigmoid((y_hi[..., None] - cy_e) / cong_smooth_sigma)
+                    * torch.sigmoid((cy_e - y_lo[..., None]) / cong_smooth_sigma))  # [K, num_nets, nrows]
+            # cell_demand [K, nrows, ncols] = sum over nets in_y[K,n,r] * in_x[K,n,c]
+            cell_demand = torch.einsum("knr,knc->krc", in_y, in_x)
+            flat = cell_demand.reshape(K, -1)
+            top_k = max(1, int(flat.shape[-1] * cong_top_pct))
+            top_vals, _ = torch.topk(flat, top_k, dim=-1)
+            cong_K = top_vals.mean(dim=-1)   # [K]
+            cong_total = cong_K.sum()
+        else:
+            cong_total = pos.new_zeros(())
+            cong_K = pos.new_zeros(K)
+
         # Density (batched)
         # bell_x [K, n, ncols], bell_y [K, n, nrows]
         dx = pos[..., 0:1] - grid_x[None, None, :]   # [K, n, ncols]
@@ -378,9 +445,39 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
         cell_density = (macro_areas[None, :, None, None]
                         * norm_y[:, :, :, None]
                         * norm_x[:, :, None, :]).sum(dim=1)
-        excess = (cell_density / cell_capacity - target_util_K_t).clamp_min(0.0)
-        dpen_K = (excess * excess).sum(dim=(1, 2))   # [K]
-        dpen_total = dpen_K.sum()
+        if use_eplace_density:
+            # Hi-res ePlace density via chunked accumulation over n.
+            # cell_density_ep [K, ep_n, ep_n] = Σ_i area_i * gauss_y(i) * gauss_x(i)
+            # Memory peak per chunk: K * chunk_n * ep_n * 4 bytes (gauss_x slab)
+            # For ep_n=256, K=384, chunk_n=64 -> 16 MB. Manageable.
+            ep_cell_capacity = ep_cell_w * ep_cell_h
+            cell_density_ep = torch.zeros(K, ep_n, ep_n, device=dev, dtype=pos.dtype)
+            chunk_n = 64
+            for i0 in range(0, n_active, chunk_n):
+                i1 = min(i0 + chunk_n, n_active)
+                pos_c = pos[:, i0:i1, :]
+                area_c = macro_areas[i0:i1]
+                ep_dx_c = pos_c[..., 0:1] - ep_grid_x[None, None, :]   # [K, c, ep_n]
+                ep_dy_c = pos_c[..., 1:2] - ep_grid_y[None, None, :]
+                ep_bx_c = torch.exp(-(ep_dx_c * ep_dx_c) / (2 * ep_sigma_x * ep_sigma_x))
+                ep_by_c = torch.exp(-(ep_dy_c * ep_dy_c) / (2 * ep_sigma_y * ep_sigma_y))
+                ep_nx_c = ep_bx_c / ep_bx_c.sum(dim=2, keepdim=True).clamp_min(1e-12)
+                ep_ny_c = ep_by_c / ep_by_c.sum(dim=2, keepdim=True).clamp_min(1e-12)
+                # contribution [K, ep_n, ep_n] = Σ_i area * ep_ny[K,c,r] * ep_nx[K,c,c2]
+                cell_density_ep = cell_density_ep + (
+                    area_c[None, :, None, None]
+                    * ep_ny_c[:, :, :, None]
+                    * ep_nx_c[:, :, None, :]).sum(dim=1)
+            rho = cell_density_ep / ep_cell_capacity - target_density_eplace
+            rho_fft = torch.fft.fft2(rho, dim=(-2, -1))
+            phi_fft = rho_fft * inv_k_sq[None, ...]
+            phi = torch.fft.ifft2(phi_fft, dim=(-2, -1)).real
+            dpen_K = 0.5 * (rho * phi).sum(dim=(-2, -1))
+            dpen_total = dpen_K.sum()
+        else:
+            excess = (cell_density / cell_capacity - target_util_K_t).clamp_min(0.0)
+            dpen_K = (excess * excess).sum(dim=(1, 2))   # [K]
+            dpen_total = dpen_K.sum()
 
         # Overlap (only between hard pairs, batched over K)
         pos_hard = pos[:, :n_hard, :]   # [K, nh, 2]
@@ -409,7 +506,8 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
 
         loss = (wl_total + density_weight * dpen_total
                 + cur_overlap_w_phase * overlap_total
-                + anchor_loss_total)
+                + anchor_loss_total
+                + cong_weight * cong_total)
         loss.backward()
         optimizer.step()
 

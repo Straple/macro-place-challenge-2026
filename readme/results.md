@@ -1392,3 +1392,60 @@ high_effort = `num_starts=4 + perturbed=12` (sigma scales 0.10..0.50) + `LNS fac
 5. **Drastic perturbation work** — это путь к -1..-4% AVG17.
 
 ```
+
+---
+
+## Cycle #30 — GPU breakthrough на ibm01: pure-gradient < ALNS, 2026-05-05
+
+### Эволюция best на ibm01 (K=384, time=300s, T4 GPU)
+
+| step | config | proxy |
+|---|---|---|
+| 1 | center init, default | 1.6868 |
+| 2 | anchor_soft init | 1.2450 |
+| 3 | + tuning K, radius | 1.1050 |
+| 4 | + multi-phase scheduler | 1.1156 |
+| 5 | + anchor_loss(1→0.001) | 1.1137 |
+| 6 | + cong_w=100 | 1.1054 |
+| 7 | cong=50 + anchor | 1.0973 |
+| 8 | cong=30 + anchor | 1.0951 |
+| 9 | + ePlace FFT density grid=128 | **1.0366** ← пробили ALNS |
+| 10 | + cong=30 ePlace 128 | 1.0279 |
+| 11 | + cong=15 ePlace 128 | 1.0054 |
+| 12 | + cong=10 ePlace 128 | **1.0036** ← best |
+
+### Сравнение
+
+| | proxy ibm01 |
+|---|---|
+| INITIAL .plc (with overlaps) | 1.0385 |
+| ALNS submission (CPU 25 мин) | 1.0584 |
+| **GPU pure-gradient (наше, 5 мин T4)** | **1.0036** ⭐ |
+| MTK DreamPlace++ target | ~0.91 |
+
+### Best command
+
+```bash
+STRAPLE_BATCH_EPLACE=1 STRAPLE_BATCH_EPLACE_GRID=128 \
+STRAPLE_BATCH_CONG_W=10 \
+STRAPLE_BATCH_ANCHOR_BETA_START=1 STRAPLE_BATCH_ANCHOR_BETA_END=0.001 \
+uv run python scripts/gpu_run_one.py \
+    --bench ibm01 --K 384 --time-budget 300 --no-vis
+```
+
+### Ключевые компоненты win-комбо
+
+1. **ePlace electrostatic FFT density** на hi-res grid 128×128 (chunked по n)
+   — глобальный density signal через Poisson via FFT2
+2. **Smooth congestion-aware loss** — top-10% cell demand
+3. **Multi-phase scheduler** spreading→refining→settling
+4. **Anchor displacement loss** β(t)×‖pos−anchor‖² с убыванием
+5. **ANCHOR_SOFT init** + adaptive spawn radius + Louvain partition
+6. **Parallel legalize всех K seeds** через mp.Pool 16 workers
+
+### Что не сработало
+- ePlace на 41×45 grid: 1.1468 (слишком грубое разрешение)
+- per_K_diversity hyperparams: 1.1279
+- Hybrid (gradient seed → ALNS polish): 1.0698 (basin trap)
+- ePlace 256/512: OOM на T4
+- Высокий cong_w (>200): дисбаланс с WL/density
