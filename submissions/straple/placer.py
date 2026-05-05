@@ -308,6 +308,30 @@ class StraplePlacer:
         bench_label = getattr(benchmark, "name", "?")
         self._log(f"[{bench_label}] === StraplePlacer.place() ===")
 
+        preset = os.environ.get("STRAPLE_PRESET", "")
+        if preset == "high_effort":
+            n_total_for_preset = benchmark.num_macros
+            if n_total_for_preset < 1500:
+                n_orig, n_pert = 4, 12
+                lns_factor, lns_cap = 120, 80000
+            elif n_total_for_preset < 2500:
+                n_orig, n_pert = 3, 9
+                lns_factor, lns_cap = 90, 65000
+            else:
+                n_orig, n_pert = 2, 6
+                lns_factor, lns_cap = 70, 55000
+            os.environ.setdefault("STRAPLE_NUM_STARTS", str(n_orig))
+            os.environ.setdefault("STRAPLE_PERTURB_EXTRA_STARTS", str(n_pert))
+            os.environ.setdefault(
+                "STRAPLE_PERTURB_SCALES",
+                "0.10,0.20,0.30,0.50,0.10,0.20,0.30,0.50,0.10,0.20,0.30,0.50",
+            )
+            os.environ.setdefault("STRAPLE_LNS_OUTER_FACTOR", str(lns_factor))
+            os.environ.setdefault("STRAPLE_LNS_OUTER_CAP", str(lns_cap))
+            os.environ.setdefault("STRAPLE_DESTROY_CAP", "32")
+            self._log(f"[{bench_label}] PRESET=high_effort: "
+                      f"starts={n_orig}+{n_pert} factor={lns_factor} cap={lns_cap}")
+
         n_hard = benchmark.num_hard_macros
         plc = _load_plc(benchmark.name)
 
@@ -417,9 +441,32 @@ class StraplePlacer:
 
         gradient_hard_pos = None
         gradient_soft_pos = None
+
+        # External gradient seed file (from scripts/gpu_batch_search.py)
+        seed_file = os.environ.get("STRAPLE_GRADIENT_SEED_FILE", "")
+        if seed_file and Path(seed_file).exists():
+            try:
+                import pickle
+                with open(seed_file, "rb") as f:
+                    seed_data = pickle.load(f)
+                hp = np.asarray(seed_data["hard"], dtype=np.float64)
+                sp = np.asarray(seed_data["soft"], dtype=np.float64)
+                if hp.shape[0] == n_hard:
+                    gradient_hard_pos = hp.copy()
+                    self._log(f"[{bench_label}] loaded external gradient hard "
+                              f"from {seed_file} (proxy={seed_data.get('proxy', '?')})")
+                if sp.shape[0] == benchmark.num_soft_macros and \
+                        os.environ.get("STRAPLE_GRADIENT_SEED_USE_SOFT", "0") == "1":
+                    gradient_soft_pos = sp.copy()
+                    self._log(f"[{bench_label}] loaded external gradient soft")
+            except Exception as exc:
+                print(f"[{bench_label}] failed to load external seed: {exc}",
+                      file=sys.stderr)
+
         use_gradient_seed = (
             os.environ.get("STRAPLE_USE_GRADIENT_SEED", "0") == "1"
             and plc is not None
+            and gradient_hard_pos is None
         )
         if use_gradient_seed:
             _STRAPLE_DIR = str(Path(__file__).resolve().parent)
@@ -774,7 +821,10 @@ class StraplePlacer:
         grid_cols = int(plc.grid_col)
         congested_percent = 0.05
 
-        adaptive_destroy = max(self.lns_destroy_size, min(16, math.ceil(0.025 * num_movable)))
+        destroy_cap = int(os.environ.get("STRAPLE_DESTROY_CAP", "16"))
+        destroy_pct = float(os.environ.get("STRAPLE_DESTROY_PCT", "0.025"))
+        adaptive_destroy = max(self.lns_destroy_size,
+                               min(destroy_cap, math.ceil(destroy_pct * num_movable)))
         outer_cap = int(os.environ.get("STRAPLE_LNS_OUTER_CAP", "50000"))
         outer_factor = float(os.environ.get("STRAPLE_LNS_OUTER_FACTOR", "60.0"))
         adaptive_outer = max(self.lns_outer_iters, min(outer_cap, math.ceil(outer_factor * num_movable)))

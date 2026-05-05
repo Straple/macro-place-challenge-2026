@@ -10,11 +10,16 @@ PY_EXT="$($HOME/.local/bin/uv run python -c 'import sysconfig; print(sysconfig.g
 PLACER_OUT="$SCRIPT_DIR/_placer_core${PY_EXT}"
 PROXY_OUT="$SCRIPT_DIR/_proxy_cost${PY_EXT}"
 
-c++ -O3 -Wall -Wextra -std=c++17 -shared -fPIC -undefined dynamic_lookup \
+UNDEF_FLAG=""
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    UNDEF_FLAG="-undefined dynamic_lookup"
+fi
+
+c++ -O3 -Wall -Wextra -std=c++17 -shared -fPIC $UNDEF_FLAG \
     -I"$PYBIND_INCLUDE" -I"$PY_INCLUDE" \
     "$SCRIPT_DIR/placer_core.cpp" -o "$PLACER_OUT"
 
-c++ -O3 -Wall -Wextra -std=c++17 -shared -fPIC -undefined dynamic_lookup \
+c++ -O3 -Wall -Wextra -std=c++17 -shared -fPIC $UNDEF_FLAG \
     -I"$PYBIND_INCLUDE" -I"$PY_INCLUDE" \
     "$SCRIPT_DIR/proxy_cost.cpp" -o "$PROXY_OUT"
 

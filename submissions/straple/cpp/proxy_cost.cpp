@@ -747,7 +747,7 @@ struct ProxyEvaluator
     {
         if (!congestionCacheValid)
         {
-            return py::array_t<double>({0, 0});
+            return py::array_t<double>(py::array::ShapeContainer({0, 0}));
         }
         py::array_t<double> result({gridRows, gridCols});
         auto buf = result.mutable_unchecked<2>();
@@ -766,7 +766,7 @@ struct ProxyEvaluator
     {
         if (!congestionCacheValid)
         {
-            return py::array_t<double>({0, 3});
+            return py::array_t<double>(py::array::ShapeContainer({0, 3}));
         }
         const int totalCells = gridCols * gridRows;
         std::vector<double> combinedPerCell(totalCells, 0.0);

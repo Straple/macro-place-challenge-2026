@@ -36,13 +36,25 @@ def _import_analytical():
 
 def gradient_demo(benchmark, plc, recorder=None, num_steps: int = 300,
                   seed: int = 42, time_budget: float = 0.0,
-                  score_png: str = "", score_sample_every_s: float = 1.0):
+                  score_png: str = "", score_sample_every_s: float = 1.0,
+                  device: str = ""):
     import torch
     from macro_place.objective import compute_proxy_cost
 
     (_build_net_pin_tensors, _build_net_pin_tensors_full,
      _build_padded_net_tensors,
      _smooth_hpwl_padded, _density_penalty) = _import_analytical()
+
+    if not device:
+        device = os.environ.get("STRAPLE_DEMO_DEVICE", "cpu")
+    if device == "cuda" and not torch.cuda.is_available():
+        print("[gradient_demo] CUDA requested but not available, fallback to CPU",
+              flush=True)
+        device = "cpu"
+    dev = torch.device(device)
+    if device == "cuda":
+        print(f"[gradient_demo] using GPU: {torch.cuda.get_device_name(0)}",
+              flush=True)
 
     n_hard = benchmark.num_hard_macros
     n_total = benchmark.num_macros
@@ -53,11 +65,11 @@ def gradient_demo(benchmark, plc, recorder=None, num_steps: int = 300,
     canvas_h = float(benchmark.canvas_height)
     canvas_min = min(canvas_w, canvas_h)
 
-    sizes_t = benchmark.macro_sizes[:n_active].float()
+    sizes_t = benchmark.macro_sizes[:n_active].float().to(dev)
     half_w = sizes_t[:, 0] / 2.0
     half_h = sizes_t[:, 1] / 2.0
-    movable = benchmark.get_movable_mask()[:n_active]
-    fixed_pos = benchmark.macro_positions[:n_active].float().clone()
+    movable = benchmark.get_movable_mask()[:n_active].to(dev)
+    fixed_pos = benchmark.macro_positions[:n_active].float().clone().to(dev)
 
     rng_np = np.random.default_rng(seed)
     init_mode = os.environ.get("STRAPLE_DEMO_INIT", "center")
@@ -66,8 +78,8 @@ def gradient_demo(benchmark, plc, recorder=None, num_steps: int = 300,
     if init_mode == "current":
         pos_np[:] = benchmark.macro_positions[:n_active].cpu().numpy().astype(np.float32)
     elif init_mode == "random":
-        pos_np[:, 0] = rng_np.uniform(half_w.numpy(), canvas_w - half_w.numpy())
-        pos_np[:, 1] = rng_np.uniform(half_h.numpy(), canvas_h - half_h.numpy())
+        pos_np[:, 0] = rng_np.uniform(half_w.cpu().numpy(), canvas_w - half_w.cpu().numpy())
+        pos_np[:, 1] = rng_np.uniform(half_h.cpu().numpy(), canvas_h - half_h.cpu().numpy())
     elif init_mode == "anchor_soft":
         from clustering import cluster_macros, anchor_soft_init
         cluster_method = os.environ.get("STRAPLE_DEMO_CLUSTER_METHOD", "louvain")
@@ -115,11 +127,11 @@ def gradient_demo(benchmark, plc, recorder=None, num_steps: int = 300,
         pos_np[:, 0] = canvas_w / 2.0 + rng_np.normal(0, spawn_jitter, n_active)
         pos_np[:, 1] = canvas_h / 2.0 + rng_np.normal(0, spawn_jitter, n_active)
         pos_np[:, 0] = np.clip(pos_np[:, 0],
-                               half_w.numpy(), canvas_w - half_w.numpy())
+                               half_w.cpu().numpy(), canvas_w - half_w.cpu().numpy())
         pos_np[:, 1] = np.clip(pos_np[:, 1],
-                               half_h.numpy(), canvas_h - half_h.numpy())
-    fixed_idx = (~movable).numpy()
-    pos_np[fixed_idx] = fixed_pos.numpy()[fixed_idx]
+                               half_h.cpu().numpy(), canvas_h - half_h.cpu().numpy())
+    fixed_idx = (~movable).cpu().numpy()
+    pos_np[fixed_idx] = fixed_pos.cpu().numpy()[fixed_idx]
 
     if cluster_id_arr is not None and recorder is not None:
         if hasattr(recorder, "set_cluster_ids"):
@@ -130,8 +142,8 @@ def gradient_demo(benchmark, plc, recorder=None, num_steps: int = 300,
         and os.environ.get("STRAPLE_DEMO_ANCHOR_LOSS", "0") == "1"
     )
     if anchor_loss_enabled:
-        cluster_id_t = torch.tensor(cluster_id_active, dtype=torch.long)
-        anchors_t = torch.tensor(anchors_np, dtype=torch.float32)
+        cluster_id_t = torch.tensor(cluster_id_active, dtype=torch.long, device=dev)
+        anchors_t = torch.tensor(anchors_np, dtype=torch.float32, device=dev)
         anchor_beta_start = float(
             os.environ.get("STRAPLE_DEMO_ANCHOR_BETA_START", "10.0"))
         anchor_beta_end = float(
@@ -144,7 +156,7 @@ def gradient_demo(benchmark, plc, recorder=None, num_steps: int = 300,
         cluster_id_t = None
         anchors_t = None
 
-    pos = torch.tensor(pos_np, dtype=torch.float32, requires_grad=True)
+    pos = torch.tensor(pos_np, dtype=torch.float32, requires_grad=True, device=dev)
 
     lr = float(os.environ.get("STRAPLE_DEMO_LR", "0.3"))
     optimizer = torch.optim.Adam([pos], lr=lr)
@@ -241,19 +253,24 @@ def gradient_demo(benchmark, plc, recorder=None, num_steps: int = 300,
     sizes_hard = sizes_t[:n_hard]
     sizes_x_pair = (sizes_hard[:, 0:1] + sizes_hard[:, 0].unsqueeze(0)) * 0.5
     sizes_y_pair = (sizes_hard[:, 1:2] + sizes_hard[:, 1].unsqueeze(0)) * 0.5
-    eye_mask = (1.0 - torch.eye(n_hard, dtype=torch.float32))
+    eye_mask = (1.0 - torch.eye(n_hard, dtype=torch.float32, device=dev))
 
     grid_rows = int(benchmark.grid_rows)
     grid_cols = int(benchmark.grid_cols)
 
     cell_w_t = canvas_w / grid_cols
     cell_h_t = canvas_h / grid_rows
-    cell_cx_t = (torch.arange(grid_cols, dtype=torch.float32) + 0.5) * cell_w_t
-    cell_cy_t = (torch.arange(grid_rows, dtype=torch.float32) + 0.5) * cell_h_t
+    cell_cx_t = (torch.arange(grid_cols, dtype=torch.float32, device=dev) + 0.5) * cell_w_t
+    cell_cy_t = (torch.arange(grid_rows, dtype=torch.float32, device=dev) + 0.5) * cell_h_t
     cong_smooth_sigma = (cell_w_t + cell_h_t) * 0.25
 
+    # Move padded net tensors to dev
+    if padded is not None:
+        macro_idx_p, offsets_p, mask_p = padded
+        padded = (macro_idx_p.to(dev), offsets_p.to(dev), mask_p.to(dev))
+
     if recorder is not None:
-        recorder.add(pos.detach().numpy().astype(np.float64),
+        recorder.add(pos.detach().cpu().numpy().astype(np.float64),
                      f"gradient: init lambda={density_weight:.4f}")
 
     score_history = [] if (time_budget > 0 or score_png) else None
@@ -424,13 +441,13 @@ def gradient_demo(benchmark, plc, recorder=None, num_steps: int = 300,
         if (trigger_op
                 and op_warmup_progress <= progress <= op_max_progress
                 and restart_on_plateau):
-            cur_pos_np = pos.detach().numpy().astype(np.float64).copy()
+            cur_pos_np = pos.detach().cpu().numpy().astype(np.float64).copy()
             cpp_dir = str(Path(__file__).resolve().parent / "cpp")
             if cpp_dir not in sys.path:
                 sys.path.insert(0, cpp_dir)
             import _placer_core
-            sizes_np_hard = sizes_t[:n_hard].numpy().astype(np.float64)
-            movable_np_hard = movable[:n_hard].numpy().astype(np.bool_)
+            sizes_np_hard = sizes_t[:n_hard].cpu().numpy().astype(np.float64)
+            movable_np_hard = movable[:n_hard].cpu().numpy().astype(np.bool_)
             try_state = _placer_core.PlacerState()
             try_state.initialize(
                 cur_pos_np[:n_hard].copy(), sizes_np_hard, movable_np_hard,
@@ -454,12 +471,12 @@ def gradient_demo(benchmark, plc, recorder=None, num_steps: int = 300,
             restart_count += 1
             restart_rng = np.random.default_rng(seed + 7000 + restart_count)
             new_pos = np.zeros((n_active, 2), dtype=np.float32)
-            half_w_np = (sizes_t[:, 0].numpy() / 2.0)
-            half_h_np = (sizes_t[:, 1].numpy() / 2.0)
+            half_w_np = (sizes_t[:, 0].cpu().numpy() / 2.0)
+            half_h_np = (sizes_t[:, 1].cpu().numpy() / 2.0)
             new_pos[:, 0] = restart_rng.uniform(half_w_np, canvas_w - half_w_np)
             new_pos[:, 1] = restart_rng.uniform(half_h_np, canvas_h - half_h_np)
-            mov_np = movable.numpy().astype(np.bool_)
-            fixed_np = fixed_pos.numpy().astype(np.float32)
+            mov_np = movable.cpu().numpy().astype(np.bool_)
+            fixed_np = fixed_pos.cpu().numpy().astype(np.float32)
             new_pos[~mov_np] = fixed_np[~mov_np]
             with torch.no_grad():
                 pos.data.copy_(torch.tensor(new_pos, dtype=torch.float32))
@@ -486,12 +503,12 @@ def gradient_demo(benchmark, plc, recorder=None, num_steps: int = 300,
                 and op_warmup_progress <= progress <= op_max_progress
                 and len(op_kinds) > 0):
                 from force_demo import _apply_random_op
-                pos_np = pos.detach().numpy().astype(np.float64)
+                pos_np = pos.detach().cpu().numpy().astype(np.float64)
                 velocity_np = np.zeros_like(pos_np)
-                sizes_np = sizes_t.numpy().astype(np.float64)
+                sizes_np = sizes_t.cpu().numpy().astype(np.float64)
                 half_w_np = (sizes_np[:, 0] / 2.0)
                 half_h_np = (sizes_np[:, 1] / 2.0)
-                movable_np = movable.numpy().astype(np.bool_)
+                movable_np = movable.cpu().numpy().astype(np.bool_)
                 edges_a_np = np.zeros(0, dtype=np.int32)
                 edges_b_np = np.zeros(0, dtype=np.int32)
                 op_label_grad = _apply_random_op(
@@ -540,7 +557,7 @@ def gradient_demo(benchmark, plc, recorder=None, num_steps: int = 300,
                      f"lr={cur_lr:.3f}")
             if op_label_grad:
                 label = f"⚡ {op_label_grad} | " + label
-            recorder.add(pos.detach().numpy().astype(np.float64), label)
+            recorder.add(pos.detach().cpu().numpy().astype(np.float64), label)
 
         if score_history is not None:
             now = time.time()
@@ -567,15 +584,15 @@ def gradient_demo(benchmark, plc, recorder=None, num_steps: int = 300,
                 })
         step += 1
 
-    final_pos = pos.detach().numpy().astype(np.float64)
+    final_pos = pos.detach().cpu().numpy().astype(np.float64)
 
     if restart_on_plateau:
         cpp_dir = str(Path(__file__).resolve().parent / "cpp")
         if cpp_dir not in sys.path:
             sys.path.insert(0, cpp_dir)
         import _placer_core
-        sizes_np_hard = sizes_t[:n_hard].numpy().astype(np.float64)
-        movable_np_hard = movable[:n_hard].numpy().astype(np.bool_)
+        sizes_np_hard = sizes_t[:n_hard].cpu().numpy().astype(np.float64)
+        movable_np_hard = movable[:n_hard].cpu().numpy().astype(np.bool_)
         end_state = _placer_core.PlacerState()
         end_state.initialize(
             final_pos[:n_hard].copy(), sizes_np_hard, movable_np_hard,
@@ -607,8 +624,8 @@ def gradient_demo(benchmark, plc, recorder=None, num_steps: int = 300,
         if cpp_dir not in sys.path:
             sys.path.insert(0, cpp_dir)
         import _placer_core
-        sizes_np_hard = sizes_t[:n_hard].numpy().astype(np.float64)
-        movable_np_hard = movable[:n_hard].numpy().astype(np.bool_)
+        sizes_np_hard = sizes_t[:n_hard].cpu().numpy().astype(np.float64)
+        movable_np_hard = movable[:n_hard].cpu().numpy().astype(np.bool_)
         state = _placer_core.PlacerState()
         state.initialize(
             final_pos[:n_hard].copy(), sizes_np_hard, movable_np_hard,
