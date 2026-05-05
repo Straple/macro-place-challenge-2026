@@ -108,6 +108,8 @@ def main():
     eplace_grid_size = int(os.environ.get("STRAPLE_BATCH_EPLACE_GRID", "256"))
     cong_weight = float(os.environ.get("STRAPLE_BATCH_CONG_W", "0"))
     per_k_diversity = os.environ.get("STRAPLE_BATCH_DIVERSITY", "0") == "1"
+    cohesion_beta_start = float(os.environ.get("STRAPLE_BATCH_COHESION_START", "0"))
+    cohesion_beta_end = float(os.environ.get("STRAPLE_BATCH_COHESION_END", "0"))
     pos_K, stats = gradient_batch(
         benchmark, plc, K=args.K,
         num_steps=20000,
@@ -120,6 +122,8 @@ def main():
         anchor_jitter_frac=0.05,
         anchor_loss_beta_start=anchor_beta_start,
         anchor_loss_beta_end=anchor_beta_end,
+        cohesion_beta_start=cohesion_beta_start,
+        cohesion_beta_end=cohesion_beta_end,
         use_eplace_density=use_eplace,
         eplace_grid_size=eplace_grid_size,
         cong_weight=cong_weight,

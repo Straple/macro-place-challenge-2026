@@ -44,6 +44,8 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
                    spawn_adaptive: bool = True,
                    anchor_loss_beta_start: float = 0.0,
                    anchor_loss_beta_end: float = 0.0,
+                   cohesion_beta_start: float = 0.0,
+                   cohesion_beta_end: float = 0.0,
                    cong_weight: float = 0.0,
                    cong_top_pct: float = 0.10,
                    cluster_target: int = 0,
@@ -260,6 +262,23 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
         if verbose:
             print(f"[gradient_batch] anchor_loss enabled: "
                   f"beta {anchor_loss_beta_start}->{anchor_loss_beta_end}",
+                  flush=True)
+
+    # Cluster cohesion: dynamic per-cluster centroid -> attract members.
+    # Adaptive — anchor пересчитывается каждый step (vs fixed initial anchor).
+    cohesion_active = cohesion_beta_start > 0 or cohesion_beta_end > 0
+    if cohesion_active:
+        cluster_id_for_scatter = torch.tensor(cluster_id_np, dtype=torch.long,
+                                              device=dev)
+        # Counts per cluster (same across K)
+        cluster_counts = torch.bincount(cluster_id_for_scatter,
+                                        minlength=num_clusters).float()
+        cluster_counts_safe = cluster_counts.clamp_min(1.0).view(1, num_clusters, 1)
+        cohesion_norm_factor = canvas_min * canvas_min
+        movable_t_coh = movable.float()
+        if verbose:
+            print(f"[gradient_batch] cluster_cohesion enabled: "
+                  f"beta {cohesion_beta_start}->{cohesion_beta_end}",
                   flush=True)
 
     # Build padded net tensors
@@ -498,18 +517,28 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
             dpen_total = dpen_K.sum()
 
         # Overlap (only between hard pairs, batched over K)
+        # Form is configurable via STRAPLE_BATCH_OVERLAP_FORM env (default 'rect_quad'):
+        #   'rect_quad': pure ovlap_area² — penalty ТОЛЬКО при actual overlap (no
+        #                halo / dead zones around hard rects). Match MTK style.
+        #   'rect_lin':  pure ovlap_area
+        #   'gauss_overlap': gauss + 5×area (legacy, creates circular dead zones)
         pos_hard = pos[:, :n_hard, :]   # [K, nh, 2]
         diff_x = pos_hard[:, :, 0:1] - pos_hard[:, :, 0].unsqueeze(1)   # [K, nh, nh]
         diff_y = pos_hard[:, :, 1:2] - pos_hard[:, :, 1].unsqueeze(1)
         ovlap_x = torch.relu(sizes_x_pair[None, :, :] - torch.abs(diff_x))
         ovlap_y = torch.relu(sizes_y_pair[None, :, :] - torch.abs(diff_y))
         ovlap_area = ovlap_x * ovlap_y * eye_mask[None, :, :]
-        # gauss_overlap form (best from prior experiments)
-        sigma_x_sq = sizes_x_pair * sizes_x_pair + 1e-6
-        sigma_y_sq = sizes_y_pair * sizes_y_pair + 1e-6
-        gauss = torch.exp(-(diff_x * diff_x / sigma_x_sq[None, :, :]
-                            + diff_y * diff_y / sigma_y_sq[None, :, :]))
-        overlap_K = ((gauss + 5.0 * ovlap_area) * eye_mask[None, :, :]).sum(dim=(1, 2)) * 0.5
+        ov_form = os.environ.get("STRAPLE_BATCH_OVERLAP_FORM", "rect_quad")
+        if ov_form == "rect_quad":
+            overlap_K = (ovlap_area * ovlap_area).sum(dim=(1, 2)) * 0.5
+        elif ov_form == "rect_lin":
+            overlap_K = ovlap_area.sum(dim=(1, 2)) * 0.5
+        else:  # gauss_overlap legacy
+            sigma_x_sq = sizes_x_pair * sizes_x_pair + 1e-6
+            sigma_y_sq = sizes_y_pair * sizes_y_pair + 1e-6
+            gauss = torch.exp(-(diff_x * diff_x / sigma_x_sq[None, :, :]
+                                + diff_y * diff_y / sigma_y_sq[None, :, :]))
+            overlap_K = ((gauss + 5.0 * ovlap_area) * eye_mask[None, :, :]).sum(dim=(1, 2)) * 0.5
         overlap_total = overlap_K.sum()
 
         # Anchor displacement loss: keep clusters tight in early phases, release in late
@@ -522,6 +551,23 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
         else:
             anchor_loss_total = pos.new_zeros(())
 
+        # Cluster cohesion loss: attract members to dynamic cluster centroid.
+        # MTK-style "sticky cluster" — макросы одного кластера движутся группой.
+        if cohesion_active:
+            # Sum positions per cluster: [K, num_clusters, 2]
+            sum_pos = pos.new_zeros(K, num_clusters, 2)
+            idx = cluster_id_for_scatter.view(1, n_active, 1).expand(K, n_active, 2)
+            sum_pos.scatter_add_(1, idx, pos)
+            centroid_dyn = sum_pos / cluster_counts_safe                # [K, num_clusters, 2]
+            anchor_per_macro_dyn = centroid_dyn[:, cluster_id_for_scatter, :]
+            sq_coh = (pos - anchor_per_macro_dyn).pow(2).sum(dim=2)
+            sq_coh = sq_coh * movable_t_coh[None, :]
+            beta_coh_t = cohesion_beta_start * (
+                (cohesion_beta_end / max(cohesion_beta_start, 1e-9)) ** progress)
+            cohesion_loss_total = (beta_coh_t * sq_coh.sum() / cohesion_norm_factor)
+        else:
+            cohesion_loss_total = pos.new_zeros(())
+
         # Per-K weighting: instead of summed total, sum (per-K loss * per-K mul)
         # for components that vary per seed: density, anchor, cong.
         # WL and overlap stay shared (already vectorized over K).
@@ -533,11 +579,13 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
             loss = (wl_total + density_per_K.sum()
                     + cur_overlap_w_phase * overlap_total
                     + anchor_loss_total
+                    + cohesion_loss_total
                     + cong_per_K.sum())
         else:
             loss = (wl_total + density_weight * dpen_total
                     + cur_overlap_w_phase * overlap_total
                     + anchor_loss_total
+                    + cohesion_loss_total
                     + cong_weight * cong_total)
         loss.backward()
         optimizer.step()
