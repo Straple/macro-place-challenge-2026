@@ -271,39 +271,41 @@ def main():
     if args.no_vis:
         return
 
-    # Phase 3: replay best seed via single-run gradient_demo with recorder
-    # to capture full evolution movie of the winning trajectory.
-    print(f"\n[gpu_run_one] replaying best seed (k={best_idx}) for HTML viz...",
+    # Phase 3: HTML viz using ACTUAL snapshots from gradient_batch (best seed).
+    # Снимок каждые 30 шагов pos[best_idx] от GPU batch run — это РЕАЛЬНАЯ
+    # траектория лучшего сида с ePlace+cong+anchor.
+    print(f"\n[gpu_run_one] HTML viz from gradient_batch snapshots (k={best_idx})...",
           flush=True)
     vis_path = REPO_ROOT / "vis" / f"{args.bench}_gpu_best.html"
     vis_path.parent.mkdir(parents=True, exist_ok=True)
 
     from visualizer import PlacementRecorder
-    from gradient_demo import gradient_demo
+    from clustering import cluster_macros
 
-    # Configure same hyperparams as gradient_batch
-    os.environ["STRAPLE_DEMO_INIT"] = "anchor_soft"
-    os.environ["STRAPLE_DEMO_PLACE_ALL"] = "1"
-    os.environ["STRAPLE_DEMO_FINISH_LEGALIZE"] = "1"
-    os.environ["STRAPLE_DEMO_ANCHOR_STRATEGY"] = "centroid"
-    os.environ["STRAPLE_DEMO_SPAWN_ADAPTIVE"] = "1"
-
-    vis_budget = args.vis_budget if args.vis_budget > 0 else min(120.0, args.time_budget / 3)
-    print(f"[gpu_run_one] replay budget {vis_budget:.0f}s "
-          f"(seed={42 + best_idx})", flush=True)
-
+    snapshots_pos = stats.get("snapshots_pos", None)
+    snapshots_step = stats.get("snapshots_step", [])
     recorder = PlacementRecorder(benchmark, plc, str(vis_path),
-                                 interval=10, max_frames=args.vis_frames)
-    t_replay = time.time()
-    gradient_demo(
-        benchmark, plc, recorder=recorder,
-        num_steps=10000,
-        seed=42 + best_idx,
-        time_budget=vis_budget,
-        score_png="",
-        score_sample_every_s=2.0,
+                                 interval=1, max_frames=args.vis_frames)
+    cluster_target = max(15, benchmark.num_macros // 30)
+    cluster_id, num_clusters, _ = cluster_macros(
+        benchmark, method="louvain", seed=42,
+        max_net_size=20, target_num_clusters=cluster_target,
     )
-    print(f"[gpu_run_one] replay: {time.time()-t_replay:.1f}s", flush=True)
+    recorder.set_cluster_ids(cluster_id)
+
+    if snapshots_pos is not None and len(snapshots_step) > 0:
+        # snapshots_pos shape [num_snap, K, n, 2] — use [:, best_idx, :, :]
+        # Передаём FULL traj (включая soft) чтобы visualizer считал proxy
+        # с реальными soft positions от gradient — иначе он использует initial
+        # soft и выдаст высокий proxy.
+        traj = snapshots_pos[:, best_idx, :, :]   # [num_snap, n_total, 2]
+        for i, step_n in enumerate(snapshots_step):
+            recorder.add(traj[i].astype(np.float64),
+                         f"step={step_n}")
+    # Final post-legalize frame: full layout (legalized hard + gradient soft)
+    recorder.add(best_pos_full.astype(np.float64),
+                 f"FINAL legalized k={best_idx} proxy={best_proxy:.4f}")
+
     print(f"[gpu_run_one] rendering HTML ({len(recorder.snapshots)} snapshots)...",
           flush=True)
     t_render = time.time()

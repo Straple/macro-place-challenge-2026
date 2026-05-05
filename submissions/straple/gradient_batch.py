@@ -331,6 +331,12 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
     if verbose:
         print(f"[gradient_batch] starting {num_steps} iters...", flush=True)
     t_loop = time.time()
+    # Snapshot pos for ALL K every snapshot_every steps -> use later to replay best
+    # Memory: [num_snapshots, K, n, 2] * 4 bytes. For K=384, n=1140, 30 snapshots:
+    # = 30 * 384 * 1140 * 2 * 4 = 105 MB on CPU (kept in numpy)
+    snapshot_every = 12
+    snapshots_pos = []
+    snapshots_step = []
 
     for step in range(num_steps):
         if time_budget > 0 and (time.time() - t_loop) >= time_budget:
@@ -545,6 +551,11 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
                   f"ovrlp={mean_ovlap_per_K:.3f} γ={gamma:.3f} λ_d={density_weight:.2f} "
                   f"λ_o={cur_overlap_w_phase:.1f}", flush=True)
 
+        # Snapshot every snapshot_every steps (CPU copy, no autograd link)
+        if (step + 1) % snapshot_every == 0 or step == 0:
+            snapshots_pos.append(pos.detach().cpu().numpy().astype(np.float32))
+            snapshots_step.append(step + 1)
+
     # Final overlap_K computation (clean, after step loop)
     with torch.no_grad():
         pos_hard = pos[:, :n_hard, :]
@@ -558,9 +569,15 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
     if verbose:
         print(f"[gradient_batch] {num_steps} steps in {time.time()-t_loop:.1f}s",
               flush=True)
+    # Add final snapshot if not already added
+    if not snapshots_step or snapshots_step[-1] != step:
+        snapshots_pos.append(pos.detach().cpu().numpy().astype(np.float32))
+        snapshots_step.append(step)
     return pos.detach().cpu().numpy(), {
         "wl_K": wl_K.detach().cpu().numpy(),
         "dpen_K": dpen_K.detach().cpu().numpy(),
         "overlap_K": overlap_K.detach().cpu().numpy(),
         "overlap_area_K": ovlap_area_K.detach().cpu().numpy(),
+        "snapshots_pos": np.stack(snapshots_pos, axis=0) if snapshots_pos else None,
+        "snapshots_step": snapshots_step,
     }
