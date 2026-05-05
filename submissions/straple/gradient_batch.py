@@ -51,9 +51,9 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
                    gamma_frac: float = 0.05,
                    gamma_start_factor: float = 1.5,
                    gamma_end_factor: float = 0.3,
-                   overlap_weight: float = 50.0,
-                   overlap_w_max: float = 500000.0,
-                   overlap_w_growth: float = 1.015,
+                   overlap_weight: float = 200.0,
+                   overlap_w_max: float = 5000000.0,
+                   overlap_w_growth: float = 1.025,
                    stop_overflow: float = 0.07,
                    lr: float = 0.3,
                    lr_end_factor: float = 0.05,
@@ -319,6 +319,16 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
                   f"ovrlp={mean_ovlap_per_K:.3f} λ_d={density_weight:.2f} "
                   f"λ_o={cur_overlap_w:.1f}", flush=True)
 
+    # Final overlap_K computation (clean, after step loop)
+    with torch.no_grad():
+        pos_hard = pos[:, :n_hard, :]
+        diff_x = pos_hard[:, :, 0:1] - pos_hard[:, :, 0].unsqueeze(1)
+        diff_y = pos_hard[:, :, 1:2] - pos_hard[:, :, 1].unsqueeze(1)
+        ovlap_x = torch.relu(sizes_x_pair[None, :, :] - torch.abs(diff_x))
+        ovlap_y = torch.relu(sizes_y_pair[None, :, :] - torch.abs(diff_y))
+        ovlap_area_K = (ovlap_x * ovlap_y * eye_mask[None, :, :]).sum(dim=(1, 2)) * 0.5
+        # ovlap_area_K[k] = total overlap area for k-th seed (smaller = better)
+
     if verbose:
         print(f"[gradient_batch] {num_steps} steps in {time.time()-t_loop:.1f}s",
               flush=True)
@@ -326,4 +336,5 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
         "wl_K": wl_K.detach().cpu().numpy(),
         "dpen_K": dpen_K.detach().cpu().numpy(),
         "overlap_K": overlap_K.detach().cpu().numpy(),
+        "overlap_area_K": ovlap_area_K.detach().cpu().numpy(),
     }

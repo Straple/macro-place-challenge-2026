@@ -60,7 +60,7 @@ def main():
     from gradient_batch import gradient_batch
 
     t_total = time.time()
-    pos_K, _ = gradient_batch(
+    pos_K, stats = gradient_batch(
         benchmark, plc, K=args.K, num_steps=args.steps, seed=args.seed_base,
         device=args.device, anchor_strategy=args.anchor_strategy,
         spawn_radius_frac=args.spawn_radius,
@@ -73,15 +73,26 @@ def main():
     # pos_K: [K, n_total, 2]
     print(f"[gpu_batch] pos shape={pos_K.shape}", flush=True)
 
-    # Evaluate proxy for each seed
+    # Filter top candidates by overlap_area (smaller = better, fastest GPU metric)
+    # Then eval only top-N via expensive compute_proxy_cost
     import torch
+    overlap_area_K = stats.get("overlap_area_K", None)
+    eval_topn = min(args.K, max(args.legalize_topn, 16))
+    if overlap_area_K is not None:
+        sorted_by_oa = np.argsort(overlap_area_K)
+        candidates = sorted_by_oa[:eval_topn].tolist()
+        print(f"[gpu_batch] sorted by overlap_area, eval top-{eval_topn}", flush=True)
+    else:
+        candidates = list(range(args.K))
+
     results = []
     best_proxy = float("inf")
     best_idx = -1
     best_pos = None
     full_template = benchmark.macro_positions.clone()
     t_eval = time.time()
-    for k in range(args.K):
+    # Eval candidates without legalize first (fast)
+    for k in candidates:
         full = full_template.clone()
         full[:n_hard] = torch.tensor(pos_K[k, :n_hard], dtype=torch.float32)
         if pos_K.shape[1] > n_hard:
@@ -97,12 +108,14 @@ def main():
             "cong": float(cost["congestion_cost"]),
             "ovrlp": int(cost["overlap_count"]),
             "valid": bool(valid),
+            "overlap_area": float(overlap_area_K[k]) if overlap_area_K is not None else 0.0,
         })
         if valid and cost["proxy_cost"] < best_proxy:
             best_proxy = cost["proxy_cost"]
-            best_idx = k
+            best_idx = int(k)
             best_pos = pos_K[k].copy()
-    print(f"[gpu_batch] eval: {time.time()-t_eval:.1f}s", flush=True)
+    print(f"[gpu_batch] eval pre-legalize: {time.time()-t_eval:.1f}s "
+          f"({len(candidates)} candidates)", flush=True)
 
     proxies_valid = [r["proxy"] for r in results if r["valid"]]
     print(f"\n[gpu_batch] DONE total={time.time()-t_total:.1f}s")
@@ -117,18 +130,23 @@ def main():
         print(f"[gpu_batch] top10 proxies: "
               f"{[round(r['proxy'], 4) for r in sorted_by_proxy[:10]]}")
 
-    # Optional: apply legalize on topN best, see if proxy improves
-    if args.legalize and best_pos is not None:
+    # ALWAYS legalize top-N by (proxy if valid else overlap_area) — works even
+    # when 0/K seeds are valid, because C++ legalize fixes the few overlaps.
+    if args.legalize:
         print(f"\n[gpu_batch] legalize top-{args.legalize_topn} candidates", flush=True)
         sys.path.insert(0, str(REPO_ROOT / "submissions" / "straple" / "cpp"))
         import _placer_core
         sizes_np = benchmark.macro_sizes[:n_hard].cpu().numpy().astype(np.float64)
         movable_np = benchmark.get_movable_mask()[:n_hard].cpu().numpy().astype(bool)
-        sorted_idx = sorted(range(args.K),
-                            key=lambda k: results[k]["proxy"] if results[k]["valid"] else float("inf"))
-        leg_best_proxy = float("inf")
-        leg_best_pos = None
-        for rank, k in enumerate(sorted_idx[:args.legalize_topn]):
+        # Sort: valid by proxy first, then non-valid by overlap_area
+        sorted_results = sorted(results, key=lambda r: (
+            r["proxy"] if r["valid"] else 1e9,
+            r["overlap_area"]))
+        leg_best_proxy = best_proxy
+        leg_best_pos = best_pos.copy() if best_pos is not None else None
+        leg_best_k = best_idx
+        for rank, r in enumerate(sorted_results[:args.legalize_topn]):
+            k = r["k"]
             cur_pos_hard = pos_K[k, :n_hard].astype(np.float64).copy()
             state = _placer_core.PlacerState()
             state.initialize(
@@ -149,14 +167,20 @@ def main():
             c = compute_proxy_cost(full, benchmark, plc)
             print(f"[gpu_batch] leg k={k}: proxy={c['proxy_cost']:.4f} "
                   f"ovrlp={c['overlap_count']} "
-                  f"(was {results[k]['proxy']:.4f})", flush=True)
+                  f"(was proxy={r['proxy']:.4f} ovrlp={r['ovrlp']})",
+                  flush=True)
             if c["overlap_count"] == 0 and c["proxy_cost"] < leg_best_proxy:
-                leg_best_proxy = c["proxy_cost"]
-                leg_pos_full = full.clone().cpu().numpy()
+                leg_best_proxy = float(c["proxy_cost"])
+                leg_pos_full = pos_K[k].copy()
+                leg_pos_full[:n_hard] = leg_hard
                 leg_best_pos = leg_pos_full
-        if leg_best_pos is not None:
-            print(f"\n[gpu_batch] LEG BEST proxy={leg_best_proxy:.4f}")
-            best_proxy = min(best_proxy, leg_best_proxy)
+                leg_best_k = int(k)
+        if leg_best_pos is not None and leg_best_proxy < best_proxy:
+            print(f"\n[gpu_batch] LEG BEST proxy={leg_best_proxy:.4f} (k={leg_best_k})")
+            best_proxy = leg_best_proxy
+            best_pos = leg_best_pos
+            best_idx = leg_best_k
+            proxies_valid = proxies_valid + [leg_best_proxy] if proxies_valid else [leg_best_proxy]
 
     out = {
         "bench": args.bench,

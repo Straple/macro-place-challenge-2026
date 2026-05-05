@@ -1319,4 +1319,76 @@ seeds 7,13,21,42,100,999 → proxy 1.1093, 1.1328, 1.2164, 1.2400, 1.2582, 1.144
 4. **Electrostatic potential** (ePlace formulation) — заменить bell-curve density на FFT-based Poisson
 5. **Per-cluster anchor displacement loss** — anchor remains stationary, members can drift; стабилизирует структуру
 
+---
+
+## Cycle #29 — GPU server (T4) + ALNS hybrid + drastic perturbation, 2026-05-05
+
+### Setup
+- GPU server: Intel Ice Lake + Tesla T4 (16 vCPU, 64GB RAM, 128GB disk).
+- run_remote.sh переделан под новый сервер: bootstrap, push, eval, gpu, sweep.
+- bootstrap ставит uv, deps, NVIDIA driver-535 (modprobe без reboot), torch CUDA 12.1.
+- C++ build (placer_core, proxy_cost) — fix Linux compat (-undefined dynamic_lookup только для Mac).
+
+### Что сделано (новое)
+
+1. **`submissions/straple/gradient_demo.py`** — добавлен device='cuda' через STRAPLE_DEMO_DEVICE.
+   Все tensors переносятся на GPU. Backward compat (cpu default).
+2. **`submissions/straple/gradient_batch.py`** — true K-parallel batch [K, n, 2] для GPU.
+   Все loss components (HPWL, density, overlap) vectorized over K dim. Один Adam.step
+   обновляет все K seeds. **13× speedup** vs sequential CPU на ibm01 (583ms vs 7.8s per seed).
+3. **`scripts/gpu_batch_search.py`** — runner для gradient_batch + per-K eval + C++ legalize
+   для top-N candidates. Сохраняет best в `results/gpu_seed_<bench>.pkl`.
+4. **`submissions/straple/placer.py::STRAPLE_GRADIENT_SEED_FILE`** — load external pre-computed
+   gradient seed (от gpu_batch_search), feed в ALNS как extra start.
+5. **`STRAPLE_PRESET=high_effort`** — adaptive preset с drastic perturbation (sigma 0.10..0.50),
+   16 starts на small benches, 12-8 для big, big LNS budget.
+
+### Метрики (GPU vs CPU, ibm01)
+
+| Mode | Time | Notes |
+|---|---|---|
+| Sequential CPU 1 seed gradient_demo | 7.8s | baseline |
+| Sequential GPU 1 seed gradient_demo | 11s | overhead launch >> compute, slower |
+| **Batch GPU K=64 (gradient_batch)** | **37s** | **13× speedup vs CPU** (583ms/seed) |
+| Batch GPU K=64 ibm17 | 600s | 9.5s/seed (n=2604, big benches scale linearly) |
+
+GPU **рабочий** только для **batch** mode. Sequential GPU медленнее CPU из-за launch overhead.
+
+### Pure-gradient sweep results (GPU batch K=64, with C++ legalize top-8)
+
+| bench | INITIAL (with overlaps) | gpu_batch best | ALNS baseline | gap vs ALNS |
+|---|---|---|---|---|
+| ibm01 | 1.0385 | 1.1139 | 1.0483 | +6.3% |
+| ibm04 | 1.3133 | 1.4273 | 1.2822 | +11.3% |
+| ibm10 | 1.3397 | 1.4181 (tuned) | 1.2434 | +14.0% |
+
+Pure-gradient + C++ legalize **не превосходит ALNS** на этих benches. ALNS уже хорошо
+оптимизирован.
+
+### ALNS hybrid (gradient seed → ALNS polish, ibm01)
+
+ALNS на gradient seed = **1.0714** vs baseline ALNS = **1.0483** (хуже на 2.2%).
+ALNS застряла в gradient'овском basin. На больших benches не помогло аналогично.
+
+### 🏆 Главный win: PRESET=high_effort (drastic perturbation 16 starts)
+
+| bench | baseline ALNS | high_effort | Δ |
+|---|---|---|---|
+| ibm01 | 1.0483 | **1.0432** | **−0.5%** |
+| ibm04 | 1.2822 | **1.2643** | **−1.4%** |
+| ibm10 | 1.2434 | TBD | — |
+| ibm14 | TBD | TBD | — |
+| ibm17 | TBD | TBD | — |
+
+high_effort = `num_starts=4 + perturbed=12` (sigma scales 0.10..0.50) + `LNS factor=120 cap=80000`
++ adaptive по размеру bench. Runtime растёт ~3.5× (но в пределах 1ч лимита per bench).
+
+### Insights
+
+1. **GPU полезна только для batch ops**. Single-run = overhead launch dominates.
+2. **gradient_batch** = единственная realistic GPU нагрузка. K=64 даёт реальный speedup.
+3. **Pure-gradient still уступает ALNS** на этих benches. Surrogate ≠ true objective.
+4. **ALNS уже near-optimal**. Gradient seeds не помогают (basin trap).
+5. **Drastic perturbation work** — это путь к -1..-4% AVG17.
+
 ```
