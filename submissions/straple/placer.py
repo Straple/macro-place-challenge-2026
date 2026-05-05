@@ -310,16 +310,22 @@ class StraplePlacer:
 
         preset = os.environ.get("STRAPLE_PRESET", "")
         if preset == "high_effort":
+            # Adaptive num_starts по размеру bench, чтобы вписаться в 1ч лимит
+            # per bench. На сервере (16 vCPU) baseline ALNS ibm17 = ~26-39 min,
+            # значит 16 starts там нереально (~10ч). Scale down для big benches.
             n_total_for_preset = benchmark.num_macros
-            if n_total_for_preset < 1500:
-                n_orig, n_pert = 4, 12
+            if n_total_for_preset < 1500:        # ibm01-04
+                n_orig, n_pert = 4, 12           # 16 starts
                 lns_factor, lns_cap = 120, 80000
-            elif n_total_for_preset < 2500:
-                n_orig, n_pert = 3, 9
-                lns_factor, lns_cap = 90, 65000
-            else:
-                n_orig, n_pert = 2, 6
+            elif n_total_for_preset < 2200:      # ibm14
+                n_orig, n_pert = 2, 4            # 6 starts
+                lns_factor, lns_cap = 80, 60000
+            elif n_total_for_preset < 2700:      # ibm10/15/17
+                n_orig, n_pert = 2, 3            # 5 starts
                 lns_factor, lns_cap = 70, 55000
+            else:                                # ibm18+
+                n_orig, n_pert = 2, 2            # 4 starts
+                lns_factor, lns_cap = 60, 50000
             os.environ.setdefault("STRAPLE_NUM_STARTS", str(n_orig))
             os.environ.setdefault("STRAPLE_PERTURB_EXTRA_STARTS", str(n_pert))
             os.environ.setdefault(
