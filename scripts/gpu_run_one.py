@@ -116,7 +116,7 @@ def main():
         time_budget=args.time_budget,
         seed=42,
         device="cuda" if torch.cuda.is_available() else "cpu",
-        anchor_strategy="centroid",
+        anchor_strategy=os.environ.get("STRAPLE_BATCH_ANCHOR_STRATEGY", "centroid"),
         spawn_radius_frac=0.05,
         spawn_adaptive=True,
         anchor_jitter_frac=0.05,

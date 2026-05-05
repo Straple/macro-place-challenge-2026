@@ -1416,7 +1416,9 @@ high_effort = `num_starts=4 + perturbed=12` (sigma scales 0.10..0.50) + `LNS fac
 | 13 | every-step snapshots + JS canvas viz | 1.0140 |
 | 14 | + per-K diversity (lambda/cong/anchor/util/gamma random per seed) | 0.9998 |
 | 15 | overlap_form rect_quad (no halo, just ovlap_area²) + diversity | **0.9707** |
-| 16 | + cluster_cohesion (dynamic centroid, β 10→0.01) | **0.9637** ← gap to MTK 0.91 = +5.9% |
+| 16 | + cluster_cohesion (dynamic centroid, β 10→0.01) | 0.9637 |
+| 17 | cohesion=5 + anchor=0 (anchor мешал!) | **0.9470** |
+| 18 | + time_budget 600s (10 мин) | **0.9453** ← gap to MTK 0.91 = +3.9% |
 
 ### Сравнение
 

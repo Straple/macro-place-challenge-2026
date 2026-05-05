@@ -181,6 +181,11 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
     if anchor_strategy == "centroid":
         anchors_base = distribute_anchors_initial_centroid(
             cluster_id, initial_pos_np, movable_np)
+    elif anchor_strategy == "center":
+        # MTK-style: ВСЕ anchors в центре canvas (one point start).
+        anchors_base = np.full((num_clusters, 2),
+                               [canvas_w / 2, canvas_h / 2],
+                               dtype=np.float64)
     else:
         rng_a = np.random.default_rng(seed)
         anchors_base = distribute_anchors_grid(
@@ -242,7 +247,20 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
     pos = torch.tensor(pos_init, dtype=torch.float32,
                        requires_grad=True, device=dev)
 
-    optimizer = torch.optim.Adam([pos], lr=lr)
+    # Optimizer: Adam (default), Nesterov SGD (DREAMPlace standard), or AdamW
+    opt_kind = os.environ.get("STRAPLE_BATCH_OPT", "adam")
+    if opt_kind == "nesterov":
+        optimizer = torch.optim.SGD([pos], lr=lr, momentum=0.95, nesterov=True)
+        if verbose:
+            print(f"[gradient_batch] Nesterov SGD lr={lr} momentum=0.95",
+                  flush=True)
+    elif opt_kind == "adamw":
+        wd = float(os.environ.get("STRAPLE_BATCH_WEIGHT_DECAY", "1e-4"))
+        optimizer = torch.optim.AdamW([pos], lr=lr, weight_decay=wd)
+        if verbose:
+            print(f"[gradient_batch] AdamW lr={lr} wd={wd}", flush=True)
+    else:
+        optimizer = torch.optim.Adam([pos], lr=lr)
 
     target_util_K_t = torch.tensor(target_util_K_np, device=dev).view(K, 1, 1)
     gamma_K_t = torch.tensor(gamma_K_np, device=dev)
@@ -533,6 +551,16 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
             overlap_K = (ovlap_area * ovlap_area).sum(dim=(1, 2)) * 0.5
         elif ov_form == "rect_lin":
             overlap_K = ovlap_area.sum(dim=(1, 2)) * 0.5
+        elif ov_form == "rect_cubic":
+            overlap_K = (ovlap_area * ovlap_area * ovlap_area).sum(dim=(1, 2)) * 0.5
+        elif ov_form == "rect_hinge":
+            # Ignore overlaps below δ (small overlaps OK), grow quadratic above
+            delta = 0.05
+            hinged = torch.relu(ovlap_area - delta)
+            overlap_K = (hinged * hinged).sum(dim=(1, 2)) * 0.5
+        elif ov_form == "rect_log":
+            # log(1 + a) — softer push for large overlaps
+            overlap_K = torch.log(1.0 + ovlap_area).sum(dim=(1, 2)) * 0.5
         else:  # gauss_overlap legacy
             sigma_x_sq = sizes_x_pair * sizes_x_pair + 1e-6
             sigma_y_sq = sizes_y_pair * sizes_y_pair + 1e-6
@@ -588,6 +616,10 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
                     + cohesion_loss_total
                     + cong_weight * cong_total)
         loss.backward()
+        # Optional gradient clipping for stability
+        grad_clip = float(os.environ.get("STRAPLE_BATCH_GRAD_CLIP", "0"))
+        if grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_([pos], max_norm=grad_clip)
         optimizer.step()
 
         # Clamp pos and zero gradients on fixed
