@@ -294,6 +294,10 @@ def gpu_congestion_google(
         _v_segment(b_col, row_min, row_max, w_chunk)
 
     # ---- 1b. Net routing demand (3-pin) — Google L/T/V/double-L cases ----
+    # Note: Google collapses duplicate cells via set() before deciding the
+    # routing scheme.  Three pins that land in 2 distinct cells become a
+    # 2-pin net; three pins in 1 cell are skipped.  We detect this before
+    # dispatching to L/T routing and route the collapsed nets as 2-pin.
     if e3 is not None and e3["pin_a_macro"].numel() > 0:
         a3 = e3["pin_a_macro"].to(dev)
         b3 = e3["pin_b_macro"].to(dev)
@@ -313,6 +317,36 @@ def gpu_congestion_google(
         b_row = (b_xy[..., 1] / cell_h).floor().clamp(0, grid_rows - 1).long()
         c_col = (c_xy[..., 0] / cell_w).floor().clamp(0, grid_cols - 1).long()
         c_row = (c_xy[..., 1] / cell_h).floor().clamp(0, grid_rows - 1).long()
+
+        # ----- Duplicate-cell collapse (mimics Google's set(node_gcells)) -----
+        eq_ab = (a_col == b_col) & (a_row == b_row)
+        eq_ac = (a_col == c_col) & (a_row == c_row)
+        eq_bc = (b_col == c_col) & (b_row == c_row)
+        # Number of distinct cells per net per K
+        n_distinct = 3 - eq_ab.long() - (eq_ac & ~eq_ab).long() - (
+            eq_bc & ~eq_ab & ~eq_ac).long()
+        is_3 = (n_distinct == 3)
+        is_2 = (n_distinct == 2)
+        # For 2-distinct case, route as 2-pin (driver source = a) between the
+        # two unique cells.  Pick the "other" cell:
+        #   if eq_ab → other = c
+        #   elif eq_ac → other = b
+        #   elif eq_bc → other = b (a vs b)
+        # Source row stays a_row (driver acts as source per Google's __split_net,
+        # but here for 3-pin Google uses sorted gcells; collapsing to 2-pin
+        # we follow Google's __two_pin_net_routing with a as source).
+        other_col = torch.where(eq_ab, c_col,
+                      torch.where(eq_ac, b_col, b_col))
+        other_row = torch.where(eq_ab, c_row,
+                      torch.where(eq_ac, b_row, b_row))
+        col_min2 = torch.minimum(a_col, other_col)
+        col_max2 = torch.maximum(a_col, other_col)
+        row_min2 = torch.minimum(a_row, other_row)
+        row_max2 = torch.maximum(a_row, other_row)
+        w2_collapsed = w3[None, :] * is_2.to(pos_K.dtype)
+        _h_segment(a_row, col_min2, col_max2, w2_collapsed)
+        _v_segment(other_col, row_min2, row_max2, w2_collapsed)
+
         # Sort the 3 pins by (col, row): build sort key, argsort, gather rows/cols.
         # Key = col * (grid_rows+1) + row; ties broken by row.
         max_row = grid_rows + 1
@@ -337,10 +371,12 @@ def gpu_congestion_google(
         case_doubleL = (y2 == y3) & ~case_L & ~case_Vx2
         case_T = ~ (case_L | case_Vx2 | case_doubleL)
 
-        wL = w3[None, :] * case_L.to(pos_K.dtype)
-        wVx2 = w3[None, :] * case_Vx2.to(pos_K.dtype)
-        wdL = w3[None, :] * case_doubleL.to(pos_K.dtype)
-        wT = w3[None, :] * case_T.to(pos_K.dtype)
+        # Apply weights only where ALL 3 cells are distinct.
+        only3 = is_3.to(pos_K.dtype)
+        wL = w3[None, :] * case_L.to(pos_K.dtype) * only3
+        wVx2 = w3[None, :] * case_Vx2.to(pos_K.dtype) * only3
+        wdL = w3[None, :] * case_doubleL.to(pos_K.dtype) * only3
+        wT = w3[None, :] * case_T.to(pos_K.dtype) * only3
 
         # Case L (Google __l_routing):
         #   H (x1, y1)..(x2, y1)        -> row=y1, col [x1, x2)
@@ -407,6 +443,25 @@ def gpu_congestion_google(
     grid_y_lo = (rows_arange.to(pos_K.dtype) * cell_h)
     grid_y_hi = grid_y_lo + cell_h
 
+    # Per-macro grid-cell extents (BL/UR rows and cols) for partial-overlap.
+    bl_row = (macro_y_lo / cell_h).floor().clamp(0, grid_rows - 1).long()
+    ur_row = (macro_y_hi / cell_h).floor().clamp(0, grid_rows - 1).long()
+    bl_col = (macro_x_lo / cell_w).floor().clamp(0, grid_cols - 1).long()
+    ur_col = (macro_x_hi / cell_w).floor().clamp(0, grid_cols - 1).long()
+    multi_row = (ur_row != bl_row)
+    multi_col = (ur_col != bl_col)
+    eps_overlap = 1e-5
+    # Partial-vertical: macro spans >1 rows AND its bl_row or ur_row is
+    # not fully covered (y_dist < cell_h there).
+    y_lo_partial = (macro_y_lo - bl_row.to(pos_K.dtype) * cell_h).abs() > eps_overlap
+    y_hi_partial = ((ur_row.to(pos_K.dtype) + 1) * cell_h - macro_y_hi).abs() > eps_overlap
+    partial_v = multi_row & (y_lo_partial | y_hi_partial)
+    x_lo_partial = (macro_x_lo - bl_col.to(pos_K.dtype) * cell_w).abs() > eps_overlap
+    x_hi_partial = ((ur_col.to(pos_K.dtype) + 1) * cell_w - macro_x_hi).abs() > eps_overlap
+    partial_h = multi_col & (x_lo_partial | x_hi_partial)
+    V_macro_flat = V_macro.view(K, grid_rows * grid_cols)
+    H_macro_flat = H_macro.view(K, grid_rows * grid_cols)
+
     for s in range(0, n_hard, macro_chunk):
         e = min(s + macro_chunk, n_hard)
         ix_lo = macro_x_lo[:, s:e, None, None]
@@ -421,10 +476,59 @@ def gpu_congestion_google(
         oy_pos = oy.clamp_min(0.0)        # [K, c, nrows, 1]
         touched_x = (ox_pos > 0).to(pos_K.dtype)
         touched_y = (oy_pos > 0).to(pos_K.dtype)
-        # full 2D touched mask
-        touched_2d = touched_x * touched_y    # [K, c, nrows, ncols]
+        touched_2d = touched_x * touched_y
         V_macro = V_macro + (ox_pos * vrouting_alloc * touched_2d).sum(dim=1)
         H_macro = H_macro + (oy_pos * hrouting_alloc * touched_2d).sum(dim=1)
+
+    # Refresh views after .view() may have decoupled from updated tensors.
+    V_macro_flat = V_macro.view(K, grid_rows * grid_cols)
+    H_macro_flat = H_macro.view(K, grid_rows * grid_cols)
+
+    # Partial-overlap subtraction for V_macro: in row=ur_row, col in [bl_col, ur_col],
+    # subtract x_dist * vrouting_alloc (where x_dist is overlap of macro with cell col).
+    for s in range(0, n_hard, macro_chunk):
+        e = min(s + macro_chunk, n_hard)
+        ix_lo = macro_x_lo[:, s:e, None]
+        ix_hi = macro_x_hi[:, s:e, None]
+        ox_cells = (torch.minimum(ix_hi, grid_x_hi[None, None, :])
+                    - torch.maximum(ix_lo, grid_x_lo[None, None, :])).clamp_min(0.0)
+        # mask cells in [bl_col, ur_col]
+        bl_c = bl_col[:, s:e, None]
+        ur_c = ur_col[:, s:e, None]
+        mask_c_v = ((cols_arange.view(1, 1, -1) >= bl_c)
+                    & (cols_arange.view(1, 1, -1) <= ur_c))
+        pv = partial_v[:, s:e, None].to(pos_K.dtype)
+        contrib_sub_v = -(ox_cells * vrouting_alloc
+                           * mask_c_v.to(pos_K.dtype) * pv)
+        ur_r = ur_row[:, s:e, None].expand(-1, -1, grid_cols)
+        flat_idx_v_sub = (ur_r * grid_cols
+                          + cols_arange.view(1, 1, -1).expand(K, e - s,
+                                                              grid_cols))
+        V_macro_flat.scatter_add_(
+            1, flat_idx_v_sub.contiguous().view(K, -1),
+            contrib_sub_v.view(K, -1))
+
+    # Partial-overlap subtraction for H_macro: in col=ur_col, rows in [bl_row, ur_row],
+    # subtract y_dist * hrouting_alloc.
+    for s in range(0, n_hard, macro_chunk):
+        e = min(s + macro_chunk, n_hard)
+        iy_lo = macro_y_lo[:, s:e, None]
+        iy_hi = macro_y_hi[:, s:e, None]
+        oy_cells = (torch.minimum(iy_hi, grid_y_hi[None, None, :])
+                    - torch.maximum(iy_lo, grid_y_lo[None, None, :])).clamp_min(0.0)
+        bl_r = bl_row[:, s:e, None]
+        ur_r = ur_row[:, s:e, None]
+        mask_r_h = ((rows_arange.view(1, 1, -1) >= bl_r)
+                    & (rows_arange.view(1, 1, -1) <= ur_r))
+        ph = partial_h[:, s:e, None].to(pos_K.dtype)
+        contrib_sub_h = -(oy_cells * hrouting_alloc
+                           * mask_r_h.to(pos_K.dtype) * ph)
+        ur_c = ur_col[:, s:e, None].expand(-1, -1, grid_rows)
+        flat_idx_h_sub = (rows_arange.view(1, 1, -1).expand(K, e - s, grid_rows)
+                          * grid_cols + ur_c)
+        H_macro_flat.scatter_add_(
+            1, flat_idx_h_sub.contiguous().view(K, -1),
+            contrib_sub_h.view(K, -1))
 
     # ---- 3. Normalise ----
     V_net = V_net / grid_v_routes
