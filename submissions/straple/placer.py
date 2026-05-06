@@ -336,7 +336,8 @@ class StraplePlacer:
         from gradient_batch import gradient_batch
         from analytical_seed import (_build_net_pin_tensors_full,
                                       _build_padded_net_tensors)
-        from gpu_proxy import (build_routing_edges, build_smooth_matrices,
+        from gpu_proxy import (build_routing_edges_full,
+                                build_smooth_matrices,
                                 build_routing_consts, build_wl_pkg_full)
         from macro_place.objective import compute_proxy_cost
 
@@ -445,7 +446,7 @@ class StraplePlacer:
             name_to_global[plc.modules_w_pins[idx].get_name()] = bidx
         for sidx, idx in enumerate(plc.soft_macro_indices):
             name_to_global[plc.modules_w_pins[idx].get_name()] = n_hard + sidx
-        edges_pkg = build_routing_edges(plc, name_to_global)
+        edges_pkg = build_routing_edges_full(plc, name_to_global, n_total)
         routing_consts = build_routing_consts(
             plc, canvas_w, canvas_h,
             int(benchmark.grid_rows), int(benchmark.grid_cols))

@@ -199,12 +199,14 @@ def build_routing_edges_full(plc, name_to_global, n_total: int):
     p2_a_m, p2_a_off = [], []
     p2_b_m, p2_b_off = [], []
     p2_w = []
-    p2_net_id = []          # net id for dedup (same id => same multi-pin net)
+    p2_net_id = []          # legacy field, all -1 now
     p3_a_m, p3_a_off = [], []
     p3_b_m, p3_b_off = [], []
     p3_c_m, p3_c_off = [], []
     p3_w = []
-    next_multi_id = 0
+    mp_pin_macros = []      # ≥4-pin nets: list[list[int]] (driver first)
+    mp_pin_offsets = []     # list[list[(ox, oy)]]
+    mp_weights = []
 
     for driver, sinks in plc.nets.items():
         d_idx = plc.mod_name_to_indices.get(driver, -1)
@@ -242,33 +244,16 @@ def build_routing_edges_full(plc, name_to_global, n_total: int):
             p3_c_m.append(m2); p3_c_off.append(list(o2))
             p3_w.append(w)
         else:
-            net_id = next_multi_id
-            next_multi_id += 1
-            for sm, soff in valid:
-                p2_a_m.append(d_macro); p2_a_off.append(list(d_offset))
-                p2_b_m.append(sm); p2_b_off.append(list(soff))
-                p2_w.append(w)
-                p2_net_id.append(net_id)
+            # ≥4 pins: store as multi-pin group (driver + sinks).  Routing
+            # is dispatched per-K based on the count of distinct grid
+            # cells the pins fall into, matching Google's set(node_gcells)
+            # semantics in get_routing.
+            mp_pin_macros.append([d_macro] + [m for m, _ in valid])
+            mp_pin_offsets.append([list(d_offset)] + [list(o) for _, o in valid])
+            mp_weights.append(w)
 
     def _zero2(): return torch.zeros((0, 2), dtype=torch.float32)
-    # ---- Group multi-pin edges by net_id (for per-K cell dedup) ----
-    multi_groups = {}
-    for ei, nid in enumerate(p2_net_id):
-        if nid < 0:
-            continue
-        multi_groups.setdefault(nid, []).append(ei)
-    multi_groups = {k: v for k, v in multi_groups.items() if len(v) > 1}
-    G = len(multi_groups)
-    if G > 0:
-        max_ng = max(len(v) for v in multi_groups.values())
-        group_edges = torch.full((G, max_ng), -1, dtype=torch.long)
-        for gi, idxs in enumerate(multi_groups.values()):
-            for j, eid in enumerate(idxs):
-                group_edges[gi, j] = eid
-        group_pad = (group_edges >= 0)
-    else:
-        group_edges = torch.zeros((0, 0), dtype=torch.long)
-        group_pad = torch.zeros((0, 0), dtype=torch.bool)
+
     edges_2pin = {
         "pin_a_macro": torch.tensor(p2_a_m, dtype=torch.long),
         "pin_a_offset": torch.tensor(p2_a_off, dtype=torch.float32) if p2_a_off else _zero2(),
@@ -276,8 +261,6 @@ def build_routing_edges_full(plc, name_to_global, n_total: int):
         "pin_b_offset": torch.tensor(p2_b_off, dtype=torch.float32) if p2_b_off else _zero2(),
         "weight": torch.tensor(p2_w, dtype=torch.float32),
         "net_id": torch.tensor(p2_net_id, dtype=torch.long),
-        "multi_group_edges": group_edges,        # [G, max_ng] edge ids (-1 pad)
-        "multi_group_pad": group_pad,            # [G, max_ng] valid mask
     }
     edges_3pin = {
         "pin_a_macro": torch.tensor(p3_a_m, dtype=torch.long),
@@ -288,11 +271,39 @@ def build_routing_edges_full(plc, name_to_global, n_total: int):
         "pin_c_offset": torch.tensor(p3_c_off, dtype=torch.float32) if p3_c_off else _zero2(),
         "weight": torch.tensor(p3_w, dtype=torch.float32),
     }
+
+    # ---- Multi-pin (>3 pins) nets: padded driver+sinks tensor for per-K
+    # ---- distinct-cells dispatch (Google set(node_gcells) semantics).
+    G = len(mp_weights)
+    if G > 0:
+        max_pins = max(len(p) for p in mp_pin_macros)
+        mp_macros_t = torch.zeros((G, max_pins), dtype=torch.long)
+        mp_offsets_t = torch.zeros((G, max_pins, 2), dtype=torch.float32)
+        mp_pad_t = torch.zeros((G, max_pins), dtype=torch.bool)
+        for gi, (mlist, olist) in enumerate(zip(mp_pin_macros, mp_pin_offsets)):
+            p = len(mlist)
+            mp_macros_t[gi, :p] = torch.tensor(mlist, dtype=torch.long)
+            mp_offsets_t[gi, :p] = torch.tensor(olist, dtype=torch.float32)
+            mp_pad_t[gi, :p] = True
+    else:
+        max_pins = 0
+        mp_macros_t = torch.zeros((0, 0), dtype=torch.long)
+        mp_offsets_t = torch.zeros((0, 0, 2), dtype=torch.float32)
+        mp_pad_t = torch.zeros((0, 0), dtype=torch.bool)
+    multi_pin_pkg = {
+        "pin_macro": mp_macros_t,         # [G, max_pins]
+        "pin_offset": mp_offsets_t,       # [G, max_pins, 2]
+        "pin_pad": mp_pad_t,              # [G, max_pins]
+        "weight": torch.tensor(mp_weights, dtype=torch.float32),
+        "max_pins": max_pins,
+    }
+
     port_positions = (torch.tensor(port_pos_list, dtype=torch.float32)
                        if port_pos_list else _zero2())
     return {
         "edges_2pin": edges_2pin,
         "edges_3pin": edges_3pin,
+        "multi_pin": multi_pin_pkg,
         "port_positions": port_positions,
         "n_total": n_total,
         # Back-compat
@@ -510,44 +521,8 @@ def gpu_congestion_google(
     pin_b_off = e2["pin_b_offset"].to(dev)
     weights = e2["weight"].to(dev)
     E = pin_a_m.shape[0]
-
-    # ----- Per-K dedup of multi-pin (>3) split edges --------------------
-    # Google routes a >3-pin net via __split_net which builds a *set* of
-    # (source, sink_gcell) pairs, deduplicating duplicate sink cells.
-    # Build a per-K multiplier `effective_w_K [K, E]` that zeroes duplicates.
-    edge_w_K = weights[None, :].expand(K, E).contiguous().clone()
-    group_edges_t = e2.get("multi_group_edges", None)
-    if group_edges_t is not None and group_edges_t.numel() > 0:
-        group_edges_t = group_edges_t.to(dev)
-        group_pad_t = e2["multi_group_pad"].to(dev)
-        G_, max_ng = group_edges_t.shape
-        # All-edge sink cells per K (we only need cell index; recompute fast):
-        b_xy_all = combined_pos[:, pin_b_m, :] + pin_b_off[None, :, :]
-        b_col_all = (b_xy_all[..., 0] / cell_w).floor().clamp(0, grid_cols - 1).long()
-        b_row_all = (b_xy_all[..., 1] / cell_h).floor().clamp(0, grid_rows - 1).long()
-        sink_cell_all = b_row_all * grid_cols + b_col_all     # [K, E]
-        # Pad-safe gather: -1 indices clamped to 0 (we'll mask later).
-        idx_safe = group_edges_t.clamp_min(0)                  # [G, max_ng]
-        gathered = sink_cell_all[:, idx_safe.flatten()].view(K, G_, max_ng)
-        # has_earlier_dup[k, g, j] = exists i<j with same sink_cell within group
-        eq = gathered.unsqueeze(-1) == gathered.unsqueeze(-2)  # [K, G, ng, ng]
-        # tril without diagonal: True for i<j
-        ng = max_ng
-        tril = torch.tril(
-            torch.ones(ng, ng, device=dev, dtype=torch.bool), diagonal=-1)
-        # Pad mask: ignore non-valid edges as "earlier" comparators
-        pad_mask_2d = group_pad_t.unsqueeze(-1) & group_pad_t.unsqueeze(-2)  # [G, ng, ng]
-        full_mask = tril.unsqueeze(0) & pad_mask_2d                          # [G, ng, ng]
-        has_earlier = (eq & full_mask.unsqueeze(0)).any(dim=-1)              # [K, G, ng]
-        alive = group_pad_t.unsqueeze(0) & ~has_earlier                     # [K, G, ng]
-        kill = (group_pad_t.unsqueeze(0) & ~alive).view(K, -1)              # [K, G*ng]
-        idx_flat = group_edges_t.view(-1)                                    # [G*ng]
-        valid_flat = group_pad_t.view(-1)
-        for k in range(K):
-            kill_k = kill[k]
-            ids_k = idx_flat[kill_k & valid_flat]
-            if ids_k.numel() > 0:
-                edge_w_K[k, ids_k] = 0.0
+    # 2-pin edges always carry their full weight (2-pin nets only).
+    edge_w_K = weights[None, :].expand(K, E).contiguous()
 
     cols_arange = torch.arange(grid_cols, device=dev)
     rows_arange = torch.arange(grid_rows, device=dev)
@@ -750,6 +725,163 @@ def gpu_congestion_google(
         _h_segment(ty2, xmin_T, xmax_T, wT)
         _v_segment(tx1, torch.minimum(ty1, ty2), torch.maximum(ty1, ty2), wT)
         _v_segment(tx3, torch.minimum(ty2, ty3), torch.maximum(ty2, ty3), wT)
+
+    # ---- 1c. Net routing demand (≥4 pins) — per-K dynamic dispatch
+    # ---- following Google's `set(node_gcells)` semantics:
+    # ----   distinct == 2 → 2-pin route between the 2 unique cells
+    # ----   distinct == 3 → 3-pin L/T/V/double-L on the 3 unique cells
+    # ----   distinct ≥ 4 → split-net (driver → each unique sink cell)
+    mp = edges_pkg.get("multi_pin", None)
+    if mp is not None and int(mp.get("max_pins", 0)) >= 2 and mp["weight"].numel() > 0:
+        mp_macro = mp["pin_macro"].to(dev)         # [G, P]
+        mp_off = mp["pin_offset"].to(dev)
+        mp_pad = mp["pin_pad"].to(dev)
+        mp_w = mp["weight"].to(dev)                # [G]
+        G_mp, P_mp = mp_macro.shape
+
+        # Per-K pin coords / cells.
+        mp_xy = combined_pos[:, mp_macro.flatten(), :].view(K, G_mp, P_mp, 2) \
+            + mp_off[None, :, :, :]                 # [K, G, P, 2]
+        mp_col = (mp_xy[..., 0] / cell_w).floor().clamp(0, grid_cols - 1).long()
+        mp_row = (mp_xy[..., 1] / cell_h).floor().clamp(0, grid_rows - 1).long()
+
+        # Cell hash; pad pins get a sentinel so they never collide with real cells.
+        SENTINEL = grid_rows * grid_cols
+        cell_hash = mp_row * grid_cols + mp_col      # [K, G, P]
+        pad_b = mp_pad[None, :, :].expand(K, -1, -1)
+        cell_hash = torch.where(pad_b, cell_hash,
+                                 torch.full_like(cell_hash, SENTINEL))
+
+        # Sort cell hashes within each (K, G); pads (sentinel) end up last.
+        sorted_hash, sort_idx = cell_hash.sort(dim=-1, stable=True)
+        prev_hash = torch.cat([
+            torch.full((K, G_mp, 1), -1, device=dev, dtype=sorted_hash.dtype),
+            sorted_hash[..., :-1]], dim=-1)
+        is_first = (sorted_hash != prev_hash) & (sorted_hash != SENTINEL)
+        n_distinct = is_first.sum(dim=-1)            # [K, G]
+
+        d_row = mp_row[..., 0]
+        d_col = mp_col[..., 0]
+
+        # Gather rows/cols by sort_idx for distinct-rep extraction.
+        gathered_row = torch.gather(mp_row, -1, sort_idx)
+        gathered_col = torch.gather(mp_col, -1, sort_idx)
+        rank = is_first.cumsum(dim=-1)               # [K, G, P]; rank-of-each
+        rep_max = min(4, P_mp)
+        rep_row = torch.zeros((K, G_mp, rep_max), device=dev, dtype=torch.long)
+        rep_col = torch.zeros((K, G_mp, rep_max), device=dev, dtype=torch.long)
+        for j in range(rep_max):
+            target_mask = (rank == (j + 1)) & is_first      # [K, G, P]
+            slot = target_mask.long().argmax(dim=-1)         # [K, G]
+            rep_row[..., j] = torch.gather(gathered_row, -1,
+                                            slot.unsqueeze(-1)).squeeze(-1)
+            rep_col[..., j] = torch.gather(gathered_col, -1,
+                                            slot.unsqueeze(-1)).squeeze(-1)
+
+        # ---- distinct == 2 ----
+        case2 = (n_distinct == 2)
+        if case2.any():
+            w2 = mp_w[None, :] * case2.to(pos_K.dtype)
+            r0_eq_d = ((rep_row[..., 0] == d_row) & (rep_col[..., 0] == d_col))
+            other_row = torch.where(r0_eq_d, rep_row[..., 1], rep_row[..., 0])
+            other_col = torch.where(r0_eq_d, rep_col[..., 1], rep_col[..., 0])
+            cmin = torch.minimum(d_col, other_col)
+            cmax = torch.maximum(d_col, other_col)
+            rmin = torch.minimum(d_row, other_row)
+            rmax = torch.maximum(d_row, other_row)
+            _h_segment(d_row, cmin, cmax, w2)
+            _v_segment(other_col, rmin, rmax, w2)
+
+        # ---- distinct == 3 ----
+        case3 = (n_distinct == 3)
+        if case3.any():
+            w3_mp = mp_w[None, :] * case3.to(pos_K.dtype)
+            r0r, r0c = rep_row[..., 0], rep_col[..., 0]
+            r1r, r1c = rep_row[..., 1], rep_col[..., 1]
+            r2r, r2c = rep_row[..., 2], rep_col[..., 2]
+            mr_max = grid_rows + 1
+            keys_xy = torch.stack([
+                r0c * mr_max + r0r,
+                r1c * mr_max + r1r,
+                r2c * mr_max + r2r,
+            ], dim=-1)
+            rows_stk = torch.stack([r0r, r1r, r2r], dim=-1)
+            cols_stk = torch.stack([r0c, r1c, r2c], dim=-1)
+            ord_xy = keys_xy.argsort(dim=-1, stable=True)
+            sr_xy = torch.gather(rows_stk, -1, ord_xy)
+            sc_xy = torch.gather(cols_stk, -1, ord_xy)
+            xx1, xx2, xx3 = sc_xy.unbind(-1)
+            yy1, yy2, yy3 = sr_xy.unbind(-1)
+            cL = ((xx1 < xx2) & (xx2 < xx3)
+                  & (torch.minimum(yy1, yy3) < yy2)
+                  & (torch.maximum(yy1, yy3) > yy2))
+            cVx2 = ((xx2 == xx3) & (xx1 < xx2)
+                    & (yy1 < torch.minimum(yy2, yy3)))
+            cdL = (yy2 == yy3) & ~cL & ~cVx2
+            cT = ~ (cL | cVx2 | cdL)
+            wL = w3_mp * cL.to(pos_K.dtype)
+            wVx2 = w3_mp * cVx2.to(pos_K.dtype)
+            wdL = w3_mp * cdL.to(pos_K.dtype)
+            wT = w3_mp * cT.to(pos_K.dtype)
+
+            keys_yx = torch.stack([
+                r0r * (grid_cols + 1) + r0c,
+                r1r * (grid_cols + 1) + r1c,
+                r2r * (grid_cols + 1) + r2c,
+            ], dim=-1)
+            ord_yx = keys_yx.argsort(dim=-1, stable=True)
+            sr_t = torch.gather(rows_stk, -1, ord_yx)
+            sc_t = torch.gather(cols_stk, -1, ord_yx)
+            ty1, ty2_, ty3 = sr_t.unbind(-1)
+            tx1, tx2_, tx3 = sc_t.unbind(-1)
+
+            _h_segment(yy1, xx1, xx2, wL)
+            _h_segment(yy2, xx2, xx3, wL)
+            _v_segment(xx2, torch.minimum(yy1, yy2),
+                        torch.maximum(yy1, yy2), wL)
+            _v_segment(xx3, torch.minimum(yy2, yy3),
+                        torch.maximum(yy2, yy3), wL)
+            _h_segment(yy1, xx1, xx2, wVx2)
+            _v_segment(xx2, yy1, torch.maximum(yy2, yy3), wVx2)
+            _h_segment(yy1, xx1, xx2, wdL)
+            _h_segment(yy2, xx2, xx3, wdL)
+            _v_segment(xx2, torch.minimum(yy1, yy2),
+                        torch.maximum(yy1, yy2), wdL)
+            xmin_T = torch.minimum(torch.minimum(tx1, tx2_), tx3)
+            xmax_T = torch.maximum(torch.maximum(tx1, tx2_), tx3)
+            _h_segment(ty2_, xmin_T, xmax_T, wT)
+            _v_segment(tx1, torch.minimum(ty1, ty2_),
+                        torch.maximum(ty1, ty2_), wT)
+            _v_segment(tx3, torch.minimum(ty2_, ty3),
+                        torch.maximum(ty2_, ty3), wT)
+
+        # ---- distinct ≥ 4 ----
+        case4 = (n_distinct >= 4)
+        if case4.any():
+            d_hash = d_row * grid_cols + d_col            # [K, G]
+            sink_mask = (is_first
+                         & (sorted_hash != d_hash.unsqueeze(-1))
+                         & (sorted_hash != SENTINEL))     # [K, G, P]
+            w4_mp = mp_w[None, :] * case4.to(pos_K.dtype)
+            d_row_b = d_row.unsqueeze(-1).expand(-1, -1, P_mp).reshape(K, -1)
+            d_col_b = d_col.unsqueeze(-1).expand(-1, -1, P_mp).reshape(K, -1)
+            s_row_b = gathered_row.reshape(K, -1)
+            s_col_b = gathered_col.reshape(K, -1)
+            mw_b = (w4_mp.unsqueeze(-1).expand(-1, -1, P_mp).reshape(K, -1)
+                     * sink_mask.reshape(K, -1).to(pos_K.dtype))
+            cmin4 = torch.minimum(d_col_b, s_col_b)
+            cmax4 = torch.maximum(d_col_b, s_col_b)
+            rmin4 = torch.minimum(d_row_b, s_row_b)
+            rmax4 = torch.maximum(d_row_b, s_row_b)
+            # Chunk over edges to keep mask tensors [K, chunk, grid_dim]
+            # under a reasonable memory footprint.
+            n_e4 = d_row_b.shape[1]
+            for s in range(0, n_e4, edge_chunk):
+                e = min(s + edge_chunk, n_e4)
+                _h_segment(d_row_b[:, s:e], cmin4[:, s:e],
+                            cmax4[:, s:e], mw_b[:, s:e])
+                _v_segment(s_col_b[:, s:e], rmin4[:, s:e],
+                            rmax4[:, s:e], mw_b[:, s:e])
 
     # ---- 2. Macro routing demand (hard macros only) ----
     V_macro = torch.zeros_like(V_net)
