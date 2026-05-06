@@ -743,3 +743,106 @@ default initial с overlaps).
 4. **Real congestion-aware loss** (smooth net bbox → cell demand → top-k mean) — проводился эксп, не сходился
 5. **ePlace electrostatic FFT density** — переход с bell-curve density penalty на правильный physics-based
 
+---
+
+## 11. Сессия 2026-05-05/06 — GPU breakthrough на T4
+
+### Best ibm01 = 0.9453 (10 мин на T4 GPU)
+
+**Pipeline:**
+- ePlace FFT density на hi-res grid 128×128 (Poisson via FFT2, chunked over n)
+- Rect_quad overlap (pure ovlap_area² — НЕТ gauss halo / circular dead zones)
+- Cluster cohesion с dynamic centroid (scatter_add, β decay 5→0.001)
+- Per-K diversity (target_util/gamma/lambda/cong/anchor multipliers per seed)
+- NO anchor_loss (он конфликтовал с cohesion — best с anchor=0)
+- K=384 параллельных seeds, parallel C++ legalize всех 384
+
+**Результаты ibm01:**
+- ALNS submission (CPU 25 мин): 1.0584
+- **GPU pure-gradient (T4, 10 мин)**: **0.9453** (-10.7% vs ALNS)
+- MTK target: 0.91 (gap +3.9%)
+
+Variance ~±0.02 между runs (cohesion=5 даёт 0.9453 ↔ 0.9667).
+
+### Что не сработало
+- Nesterov optimizer с lr=0.3 → 11.15 (catastrophic, нужен lr=0.05)
+- AdamW + grad_clip → 0.9676 (как baseline)
+- rect_cubic / rect_hinge → хуже rect_quad
+- MTK center init (single point) → 1.16 (наш centroid лучше)
+- cohesion=2/3/7/10/20/50 → все хуже cohesion=5
+- ePlace grid=256/512 → OOM (нужен chunked для всего, не только density)
+- per_k_diversity без cohesion → хуже single-config
+
+---
+
+## 12. План для следующего агента (2026-05-06+)
+
+### Constraints (не нарушать)
+- **Только на GPU server** (89.169.164.17 evyukhnevich, T4 16GB, 16 vCPU)
+- **Только ibm01** пока пользователь не скажет другое
+- **Submission лимит = 1 час** на bench → можем использовать `--time-budget 3000` (50 мин на gradient, 10 мин на eval+legalize)
+
+### Приоритетные идеи
+
+**A. Distribution stats** (уже частично в коде, gpu_run_one.py)
+- Показывать: min, p05, p25, median, mean ± std, p75, p95, max + 90% CI
+- Сохранять в `results/gpu_stats_ibm01.json` per run
+- **Сравнивать конфиги по distribution**, не только по min
+- При comparison: лучше config с `mean=0.96 std=0.01` чем `mean=0.99 std=0.02 min=0.94`
+  (стабильность важна для AVG17)
+
+**B. Plateau escape (random ops)** ⭐⭐⭐
+- Detect plateau: track loss trajectory, если |Δloss| < ε за last N steps → plateau
+- Random ops для **каждого** K seed индивидуально (некоторые в плато, другие нет):
+  - **Teleport k random macros** в random new position (cluster-aware: keep cluster compact)
+  - **Swap k pairs**: обменять позиции
+  - **Shake**: gaussian perturbation σ=0.05·canvas
+  - **Cluster shuffle**: переcмешать anchors одного кластера
+- Adam state: zero exp_avg для перетеленных macros чтобы не тянуть назад
+- Trigger: progress > 0.4 (после spreading) + plateau detected
+
+**C. Genetic evolution** ⭐⭐⭐ (САМАЯ перспективная)
+- Каждый seed K = "геном" = pos [n_total, 2]
+- **Periodic generation step**: после каждых N итераций (или при plateau):
+  1. Compute proxy для всех K (быстро через current loss approximation)
+  2. Keep top-K/4 (elite)
+  3. Generate новый K-3K/4 потомков:
+     - **Crossover**: возьми pos[i, :] от родителя A для половины macros, от B для другой
+     - **Subset crossover**: pick random clusters, take их positions от parent A, остальные от B
+     - **Mutation**: small gaussian noise + occasional random teleport
+  4. Заменить остальные в pos_K
+- Adam state: reset для новых genomes
+- Это даёт реальную diversity которая **отбирается по fitness**, не random
+- Можно сделать **island GA**: split K на K/8 islands, эволюционируй internally, иногда migrate between islands
+
+**D. Multi-resolution density** ⭐⭐
+- Coarse grid 32×32 + fine grid 128×128 одновременно
+- λ_coarse в P1 (большая структура), λ_fine в P2-3 (детали)
+- Память: +50 MB (coarse мало)
+
+**E. Adaptive time scheduling**
+- Sense plateau → switch phase early
+- Если overlap=0 на step T → можно P3 settling короче
+
+**F. Submission-quality config**
+- time_budget=3000 (50 мин) → ~9500 шагов на ibm01
+- K=384 (max safe для 16GB T4)
+- diversity ON
+- best of 384 после parallel legalize
+
+### Что использовать обязательно
+- `STRAPLE_BATCH_EPLACE=1 STRAPLE_BATCH_EPLACE_GRID=128`
+- `STRAPLE_BATCH_OVERLAP_FORM=rect_quad` (default)
+- `STRAPLE_BATCH_CONG_W=10`
+- `STRAPLE_BATCH_COHESION_START=5 STRAPLE_BATCH_COHESION_END=0.001`
+- `STRAPLE_BATCH_DIVERSITY=1`
+- БЕЗ anchor_loss (BETA_START=0)
+- `STRAPLE_BATCH_OPT=adam` (default)
+
+### Что НЕ делать
+- Не запускать local (только server)
+- Не делать multi-seed-runs c разными RNG (это просто variance check, не diversity)
+- Не использовать gauss_overlap (создаёт circular dead zones)
+- Не запускать без `--no-vis` если нужны long runs (HTML render медленный)
+- Не пытаться anchor_loss + cohesion одновременно (конфликтуют)
+

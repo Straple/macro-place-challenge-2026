@@ -242,6 +242,47 @@ def main():
     print(f"[gpu_run_one] legalize all: {time.time()-t_all:.1f}s "
           f"({n_workers} workers)", flush=True)
 
+    # ===== Distribution stats: видеть качество gradient'а, не только min =====
+    valid_mask_for_stats = all_overlaps == 0
+    n_valid = int(valid_mask_for_stats.sum())
+    print(f"\n[gpu_run_one] === all-K stats (after legalize) ===", flush=True)
+    print(f"[gpu_run_one] valid: {n_valid}/{args.K} "
+          f"({100*n_valid/args.K:.1f}%)", flush=True)
+    if n_valid > 0:
+        valid_proxies = all_proxies[valid_mask_for_stats]
+        stats_dict = {
+            "min": float(valid_proxies.min()),
+            "p05": float(np.percentile(valid_proxies, 5)),
+            "p25": float(np.percentile(valid_proxies, 25)),
+            "median": float(np.median(valid_proxies)),
+            "mean": float(valid_proxies.mean()),
+            "p75": float(np.percentile(valid_proxies, 75)),
+            "p95": float(np.percentile(valid_proxies, 95)),
+            "max": float(valid_proxies.max()),
+            "std": float(valid_proxies.std()),
+            "ci90_lo": float(np.percentile(valid_proxies, 5)),
+            "ci90_hi": float(np.percentile(valid_proxies, 95)),
+        }
+        print(f"[gpu_run_one] proxy distribution (valid only):", flush=True)
+        print(f"[gpu_run_one]   min     = {stats_dict['min']:.4f} "
+              f"(seed k={int(np.argmin(np.where(valid_mask_for_stats, all_proxies, np.inf)))})",
+              flush=True)
+        print(f"[gpu_run_one]   p05/p25 = {stats_dict['p05']:.4f} / {stats_dict['p25']:.4f}",
+              flush=True)
+        print(f"[gpu_run_one]   median  = {stats_dict['median']:.4f}",
+              flush=True)
+        print(f"[gpu_run_one]   mean±σ  = {stats_dict['mean']:.4f} ± {stats_dict['std']:.4f}",
+              flush=True)
+        print(f"[gpu_run_one]   p75/p95 = {stats_dict['p75']:.4f} / {stats_dict['p95']:.4f}",
+              flush=True)
+        print(f"[gpu_run_one]   max     = {stats_dict['max']:.4f}",
+              flush=True)
+        print(f"[gpu_run_one]   90% CI  = [{stats_dict['ci90_lo']:.4f}, "
+              f"{stats_dict['ci90_hi']:.4f}]", flush=True)
+    else:
+        stats_dict = None
+        print(f"[gpu_run_one] no valid solutions in {args.K} seeds!", flush=True)
+
     # Update best from all-K (after legalize, more accurate than top-32 only)
     valid_mask = all_overlaps == 0
     if valid_mask.any():
@@ -273,6 +314,24 @@ def main():
     )
     print(f"[gpu_run_one] saved legalized pos_K to {grid_path} "
           f"({grid_path.stat().st_size / 1e6:.1f} MB)", flush=True)
+
+    # Save distribution stats JSON for offline config comparison
+    if stats_dict is not None:
+        import json
+        stats_path = REPO_ROOT / "results" / f"gpu_stats_{args.bench}.json"
+        cfg = {k: v for k, v in os.environ.items()
+               if k.startswith("STRAPLE_BATCH_") or k.startswith("STRAPLE_DEMO_")}
+        with open(stats_path, "w") as f:
+            json.dump({
+                "bench": args.bench,
+                "K": args.K,
+                "time_budget": args.time_budget,
+                "n_valid": int(n_valid),
+                "stats": stats_dict,
+                "config": cfg,
+                "best_idx": int(best_idx),
+            }, f, indent=2)
+        print(f"[gpu_run_one] stats saved to {stats_path}", flush=True)
 
     if args.no_vis:
         return
