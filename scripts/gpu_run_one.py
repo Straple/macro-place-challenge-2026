@@ -48,6 +48,26 @@ def _proxy_worker_compute(args):
             int(cost["overlap_count"]))
 
 
+# Worker: ТОЛЬКО legalize (без compute_proxy_cost).  Используется когда
+# proxy считается батчем на GPU после pool.  ~150 ms vs ~2 sec для full eval.
+def _legalize_only(k, pos_hard, sizes_np, movable_np,
+                   canvas_w, canvas_h, seed):
+    import numpy as _np
+    sys.path.insert(0, str(REPO_ROOT / "submissions" / "straple" / "cpp"))
+    import _placer_core
+    state = _placer_core.PlacerState()
+    state.initialize(
+        pos_hard.copy(), sizes_np, movable_np,
+        _np.zeros((0, 2), dtype=_np.int32),
+        _np.zeros(0, dtype=_np.float64),
+        float(canvas_w), float(canvas_h),
+        int(seed),
+    )
+    state.legalize_min_displacement(500)
+    state.legalize()
+    return (k, state.current_positions())
+
+
 # Worker для multiprocessing — legalize одного seed и compute proxy.
 # Импорты внутри чтобы fork не дублировал большие tensor'ы.
 def _legalize_and_eval(k, pos_hard, pos_soft, bench_dir_str):

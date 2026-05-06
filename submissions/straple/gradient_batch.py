@@ -77,7 +77,8 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
                    phase3_lambda_min: float = 1000.0,
                    phase1_overlap_mul: float = 0.1,
                    phase2_overlap_mul: float = 1.0,
-                   phase3_overlap_mul: float = 10.0):
+                   phase3_overlap_mul: float = 10.0,
+                   proxy_pkgs: dict = None):
     import torch
     (_build_net_pin_tensors_full, _build_padded_net_tensors,
      cluster_macros, distribute_anchors_initial_centroid,
@@ -420,6 +421,37 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
     fitness_history = []          # list of np arrays [K] per step
     overlap_area_history = []     # list of np arrays [K] per step
 
+    # GPU proxy_cost as fitness ----------------------------------
+    # GPU proxy as fitness is OPT-IN: between refreshes the cached proxy
+    # is constant, which collapses plateau detection.  Default off — fitness
+    # falls back to the per-step weighted gradient loss.  We still compute
+    # proxy_history (sparse) for monitoring/plot purposes, see below.
+    use_gpu_proxy_fitness = (
+        proxy_pkgs is not None
+        and os.environ.get("STRAPLE_BATCH_USE_GPU_PROXY", "0") == "1")
+    # Recording proxy_history is OFF by default — overhead even with sparse
+    # refresh (one full GPU proxy compute every proxy_interval steps), and
+    # the submission only needs the final selection.  Enable explicitly
+    # for plotting / diagnostics.
+    record_proxy_history = (
+        proxy_pkgs is not None
+        and os.environ.get("STRAPLE_BATCH_RECORD_PROXY", "0") == "1")
+    proxy_interval = int(os.environ.get(
+        "STRAPLE_BATCH_PROXY_INTERVAL", "20"))
+    proxy_K_cached = None         # last cached gpu proxy_K [K]
+    proxy_history = []            # list of (step_idx, proxy_K_np) tuples
+    _gpu_proxy_batched = None
+    if use_gpu_proxy_fitness or record_proxy_history:
+        from gpu_proxy import gpu_proxy_batched as _gpu_proxy_batched
+        _gp_edges = proxy_pkgs["edges_pkg"]
+        _gp_smooth = proxy_pkgs["smooth_matrices"]
+        _gp_routing = proxy_pkgs["routing_consts"]
+        _gp_wl = proxy_pkgs["wl_pkg"]
+        if verbose:
+            mode = "FITNESS" if use_gpu_proxy_fitness else "RECORD only"
+            print(f"[gradient_batch] GPU proxy {mode}: "
+                  f"interval={proxy_interval} step", flush=True)
+
     for step in range(num_steps):
         if time_budget > 0 and (time.time() - t_loop) >= time_budget:
             if verbose:
@@ -700,17 +732,45 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
             wl_K_d = wl_K.detach()
             dpen_K_d = dpen_K.detach()
             overlap_K_d = overlap_K.detach()
+            # Default fitness — weighted gradient loss (always cheap).
             if per_k_diversity:
-                fitness_K = (wl_K_d
-                             + density_weight * lambda_mul_K_t * dpen_K_d
-                             + cur_overlap_w_phase * overlap_K_d
-                             + cong_weight * cong_mul_K_t * cong_K.detach())
+                fitness_grad = (wl_K_d
+                                + density_weight * lambda_mul_K_t * dpen_K_d
+                                + cur_overlap_w_phase * overlap_K_d
+                                + cong_weight * cong_mul_K_t * cong_K.detach())
             else:
-                fitness_K = (wl_K_d
-                             + density_weight * dpen_K_d
-                             + cur_overlap_w_phase * overlap_K_d
-                             + cong_weight * cong_K.detach())
-            # Always collect per-step history for plot (cheap CPU copy).
+                fitness_grad = (wl_K_d
+                                + density_weight * dpen_K_d
+                                + cur_overlap_w_phase * overlap_K_d
+                                + cong_weight * cong_K.detach())
+
+            # If GPU proxy fitness enabled, refresh every proxy_interval
+            # steps and use as primary selection signal.  Between refreshes
+            # we keep the cached proxy values (placement changes slowly per
+            # step so this is fine for plateau / GA use).
+            do_proxy_refresh = (
+                _gpu_proxy_batched is not None
+                and (step % proxy_interval == 0 or proxy_K_cached is None))
+            if do_proxy_refresh:
+                proxy_K_now, _comp = _gpu_proxy_batched(
+                    pos.detach(), sizes_t,
+                    macro_idx_p, offsets_p, mask_p,
+                    canvas_w, canvas_h,
+                    int(benchmark.grid_rows), int(benchmark.grid_cols),
+                    macro_idx_p.shape[0],
+                    n_hard=n_hard,
+                    edges_pkg=_gp_edges,
+                    smooth_matrices=_gp_smooth,
+                    routing_consts=_gp_routing,
+                    wl_pkg=_gp_wl,
+                )
+                proxy_K_cached = proxy_K_now
+                proxy_history.append(
+                    (step + 1, proxy_K_now.cpu().numpy().astype(np.float32)))
+            if use_gpu_proxy_fitness and proxy_K_cached is not None:
+                fitness_K = proxy_K_cached
+            else:
+                fitness_K = fitness_grad
             fitness_cpu = fitness_K.cpu().numpy().astype(np.float32)
             fitness_history.append(fitness_cpu)
             # Pair-wise overlap area per K (raw geometry — independent of weight).
@@ -876,4 +936,9 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
         "seeds_recombined_total": seeds_recombined_total,
         "fitness_history": fitness_history_np,
         "overlap_area_history": overlap_area_history_np,
+        "proxy_history": (
+            np.stack([p for _, p in proxy_history], axis=0)
+            if proxy_history else None),
+        "proxy_history_steps": [s for s, _ in proxy_history],
+        "fitness_is_proxy": bool(use_gpu_proxy_fitness),
     }

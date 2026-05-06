@@ -25,6 +25,11 @@ import torch
 from macro_place.benchmark import Benchmark
 
 
+def _np_isfinite_any(arr):
+    import numpy as _np
+    return bool(_np.isfinite(arr).any())
+
+
 _CPP_DIR = Path(__file__).resolve().parent / "cpp"
 if str(_CPP_DIR) not in sys.path:
     sys.path.insert(0, str(_CPP_DIR))
@@ -275,6 +280,658 @@ class StraplePlacer:
         if self.verbose:
             print(msg, flush=True)
 
+    def _estimate_peak_per_K_mb(self, n_total, n_hard, num_nets, max_pins,
+                                  grid_rows, grid_cols, eplace_grid):
+        """Estimate per-seed peak GPU memory (MB) of one gradient_batch step.
+
+        Calibrated against a known operating point — K=384 with ibm01
+        (n_total=1140, n_hard=246, num_nets=5747, max_pins=18,
+        grid_rows=41, grid_cols=45, eplace_grid=128) consumed ≈9.3 GB peak
+        on T4 (≈25 MB/seed).  Calibrated multiplier captures autograd
+        doubling, optimizer state, temp tensors, and FFT scratch.
+        """
+        f4 = 4.0     # bytes per fp32 cell
+        bytes_per_K = (
+            # pin_xy [num_nets, max_pins, 2] (forward) + autograd dup
+            num_nets * max_pins * 2 * f4 * 2.0
+            # density grid + scatter buffers (multi-phase ε)
+            + grid_rows * grid_cols * f4 * 6.0
+            # ePlace FFT chunked (complex64 = 8B)
+            + eplace_grid * eplace_grid * 8.0 * 2.0
+            # pos + Adam state (exp_avg, exp_avg_sq) + grad
+            + n_total * 2 * f4 * 4.0
+            # overlap pair tables [n_hard, n_hard] (diff_x, diff_y, ovlap_x/y)
+            + (n_hard * n_hard) * f4 * 4.0
+            # congestion smooth bbox in_x/in_y (when cong_w>0)
+            + num_nets * (grid_rows + grid_cols) * f4 * 2.0
+        )
+        # Empirical multiplier — covers autograd doubling, optimizer state,
+        # ephemeral 4D density tensors, FFT scratch, framework overhead.
+        # Calibrated against an OOM at K=448 on T4 (where peak hit ≈11 GB
+        # on the cell_density allocation step).  5.5× lands at ≈33 MB/seed.
+        multiplier = 5.5
+        return (bytes_per_K * multiplier) / (1024 ** 2)
+
+    def _place_gradient_batch(self, benchmark, plc, bench_label):
+        """Submission entry: K parallel gradient seeds with GPU proxy fitness.
+
+        K is sized from free VRAM and the per-seed memory footprint of
+        gradient_batch (pin_xy + overlap pair-table + ePlace FFT + density
+        + autograd doubling).  See ``_estimate_peak_per_K_mb`` for the model.
+
+        ENV overrides:
+            STRAPLE_BATCH_K              — fixed K (skips the auto-sizer)
+            STRAPLE_BATCH_K_MIN          — minimum K (default 32)
+            STRAPLE_BATCH_K_MAX          — upper cap (default 1024)
+            STRAPLE_BATCH_VRAM_SAFETY_GB — reserve free GB (default 1.5)
+            STRAPLE_BATCH_TIME_BUDGET    — gradient budget (sec, default 3000)
+            STRAPLE_BATCH_LEGALIZE_TOPN  — legalize top-N candidates only
+        """
+        import time as _time
+        import multiprocessing as _mp
+        _STRAPLE_DIR = str(Path(__file__).resolve().parent)
+        if _STRAPLE_DIR not in sys.path:
+            sys.path.insert(0, _STRAPLE_DIR)
+
+        from gradient_batch import gradient_batch
+        from analytical_seed import (_build_net_pin_tensors_full,
+                                      _build_padded_net_tensors)
+        from gpu_proxy import (build_routing_edges, build_smooth_matrices,
+                                build_routing_consts, build_wl_pkg_full)
+        from macro_place.objective import compute_proxy_cost
+
+        n_hard = benchmark.num_hard_macros
+        n_soft = benchmark.num_soft_macros
+        n_total = benchmark.num_macros
+        canvas_w = float(benchmark.canvas_width)
+        canvas_h = float(benchmark.canvas_height)
+
+        # ---- Adaptive K from free VRAM ----
+        time_budget = float(os.environ.get(
+            "STRAPLE_BATCH_TIME_BUDGET", "3000"))
+        legalize_topn = int(os.environ.get(
+            "STRAPLE_BATCH_LEGALIZE_TOPN", "0"))   # 0 = all
+
+        # Probe net structure to estimate per-K cost accurately.
+        net_macro_idx, net_pin_offsets = _build_net_pin_tensors_full(
+            benchmark, plc)
+        padded_probe = _build_padded_net_tensors(
+            net_macro_idx, net_pin_offsets)
+        if padded_probe is not None:
+            num_nets_probe = int(padded_probe[0].shape[0])
+            max_pins_probe = int(padded_probe[0].shape[1])
+        else:
+            num_nets_probe = max(1, len(plc.nets))
+            max_pins_probe = 18
+        ep_n = int(os.environ.get("STRAPLE_BATCH_EPLACE_GRID", "128"))
+        grid_rows = int(benchmark.grid_rows)
+        grid_cols = int(benchmark.grid_cols)
+
+        peak_per_K_mb = self._estimate_peak_per_K_mb(
+            n_total=n_total, n_hard=n_hard,
+            num_nets=num_nets_probe, max_pins=max_pins_probe,
+            grid_rows=grid_rows, grid_cols=grid_cols, eplace_grid=ep_n)
+
+        K_min = int(os.environ.get("STRAPLE_BATCH_K_MIN", "32"))
+        K_max = int(os.environ.get("STRAPLE_BATCH_K_MAX", "1024"))
+        # Initial conservative safety used for the *probe* — large enough
+        # that the probe itself never OOMs even on a poorly-calibrated GPU.
+        probe_safety_gb = float(os.environ.get(
+            "STRAPLE_BATCH_VRAM_SAFETY_GB", "1.5"))
+        # Final fill fraction: how close to total VRAM the real run is
+        # allowed to push.  0.92 leaves ~8 % for transient jitter (cuFFT
+        # plan reallocation, allocator fragmentation).
+        fill_frac = float(os.environ.get(
+            "STRAPLE_BATCH_VRAM_FILL_FRAC", "0.92"))
+        K_align = int(os.environ.get("STRAPLE_BATCH_K_ALIGN", "32"))
+
+        def _round_K(K_raw, fits_pred):
+            K_floor = (K_raw // K_align) * K_align
+            K_ceil = ((K_raw + K_align - 1) // K_align) * K_align
+            if K_ceil > 0 and fits_pred(K_ceil):
+                return K_ceil, "↑"
+            return K_floor, "↓"
+
+        try:
+            import torch as _t
+            cuda_avail = _t.cuda.is_available()
+            if cuda_avail:
+                free_b, total_b = _t.cuda.mem_get_info()
+                free_gb = free_b / 1e9
+                total_gb = total_b / 1e9
+            else:
+                free_gb = total_gb = 0.0
+        except Exception:
+            cuda_avail = False
+            free_gb = total_gb = 0.0
+
+        k_env = os.environ.get("STRAPLE_BATCH_K", "")
+        if k_env:
+            K_initial = int(k_env)
+            self._log(f"[{bench_label}] K={K_initial} (env override; "
+                      f"probe will validate but not grow)")
+            do_probe = bool(cuda_avail) and (free_gb > 0)
+            env_override = True
+        else:
+            env_override = False
+            usable_probe_mb = max(0.0, (free_gb - probe_safety_gb) * 1024.0)
+            K_raw = int(usable_probe_mb // max(peak_per_K_mb, 1.0))
+            K_init_aligned, _dir = _round_K(
+                K_raw,
+                lambda K: K * peak_per_K_mb <= usable_probe_mb)
+            K_init_aligned = max(K_align, K_init_aligned)
+            K_initial = max(K_min, min(K_max, K_init_aligned))
+            self._log(
+                f"[{bench_label}] auto-K initial: VRAM free={free_gb:.1f} GB "
+                f"/ {total_gb:.1f} GB, probe_safety={probe_safety_gb} GB → "
+                f"per-K≈{peak_per_K_mb:.1f} MB est → K_initial={K_initial}")
+            do_probe = bool(cuda_avail) and (free_gb > 0)
+        K = K_initial
+
+        if not cuda_avail:
+            self._log(f"[{bench_label}] CUDA unavailable — falling back to "
+                      f"single-thread CPU gradient (K reduced to 8)")
+            K = min(K, 8)
+
+        # ---- Build name_to_global, proxy packages ----
+        name_to_global = {}
+        for bidx, idx in enumerate(plc.hard_macro_indices):
+            name_to_global[plc.modules_w_pins[idx].get_name()] = bidx
+        for sidx, idx in enumerate(plc.soft_macro_indices):
+            name_to_global[plc.modules_w_pins[idx].get_name()] = n_hard + sidx
+        edges_pkg = build_routing_edges(plc, name_to_global)
+        routing_consts = build_routing_consts(
+            plc, canvas_w, canvas_h,
+            int(benchmark.grid_rows), int(benchmark.grid_cols))
+        smooth_matrices = build_smooth_matrices(
+            int(benchmark.grid_rows), int(benchmark.grid_cols),
+            routing_consts["smooth_range"])
+        wl_pkg = build_wl_pkg_full(plc, name_to_global, n_total)
+        proxy_pkgs = {
+            "edges_pkg": edges_pkg,
+            "smooth_matrices": smooth_matrices,
+            "routing_consts": routing_consts,
+            "wl_pkg": wl_pkg,
+        }
+
+        self._log(f"[{bench_label}] gradient_batch preset: K={K} "
+                  f"time_budget={time_budget:.0f}s n_total={n_total} "
+                  f"(hard={n_hard} soft={n_soft})")
+
+        # ---- Gradient batch: K parallel seeds with GPU proxy fitness ----
+        # Default knobs tuned on ibm01 — match best-of submission run.
+        os.environ.setdefault("STRAPLE_BATCH_EPLACE", "1")
+        os.environ.setdefault("STRAPLE_BATCH_EPLACE_GRID", "128")
+        os.environ.setdefault("STRAPLE_BATCH_CONG_W", "10")
+        os.environ.setdefault("STRAPLE_BATCH_COHESION_START", "5")
+        os.environ.setdefault("STRAPLE_BATCH_COHESION_END", "0.001")
+        os.environ.setdefault("STRAPLE_BATCH_DIVERSITY", "1")
+        os.environ.setdefault("STRAPLE_BATCH_OVERLAP_FORM", "rect_quad")
+        # Plateau-detect + per-seed crossover OFF by default for submission —
+        # plain gradient with multi-start diversity has been more reliable.
+        # Re-enable with STRAPLE_BATCH_PLATEAU_OPS=1.
+        os.environ.setdefault("STRAPLE_BATCH_PLATEAU_OPS", "0")
+        os.environ.setdefault("STRAPLE_BATCH_PLATEAU_PATIENCE", "30")
+        os.environ.setdefault("STRAPLE_BATCH_PLATEAU_INTERVAL", "20")
+        os.environ.setdefault("STRAPLE_BATCH_PLATEAU_EPS", "0.005")
+        os.environ.setdefault("STRAPLE_BATCH_GA_ELITE_PCT", "0.25")
+        os.environ.setdefault("STRAPLE_BATCH_GA_MUTATION_RATE", "0.01")
+        os.environ.setdefault("STRAPLE_BATCH_GA_MUTATION_SIGMA", "0.005")
+        # GPU proxy: used ONLY for end-of-run selection by default.
+        #   STRAPLE_BATCH_USE_GPU_PROXY=1 — proxy as in-loop fitness (slow,
+        #     and sparse refresh causes false plateaus — experimental).
+        #   STRAPLE_BATCH_RECORD_PROXY=1  — record proxy_history for plots
+        #     (adds overhead).  Submission has both OFF.
+        os.environ.setdefault("STRAPLE_BATCH_USE_GPU_PROXY", "0")
+        os.environ.setdefault("STRAPLE_BATCH_RECORD_PROXY", "0")
+        os.environ.setdefault("STRAPLE_BATCH_PROXY_INTERVAL", "50")
+        # Snapshots only needed for the HTML viz / plots; submission skips.
+        os.environ.setdefault("STRAPLE_BATCH_SNAPSHOT_EVERY", "999")
+
+        anchor_beta_start = float(os.environ.get(
+            "STRAPLE_BATCH_ANCHOR_BETA_START", "0"))
+        anchor_beta_end = float(os.environ.get(
+            "STRAPLE_BATCH_ANCHOR_BETA_END", "0"))
+        use_eplace = os.environ.get("STRAPLE_BATCH_EPLACE", "0") == "1"
+        eplace_grid = int(os.environ.get("STRAPLE_BATCH_EPLACE_GRID", "128"))
+        cong_weight = float(os.environ.get("STRAPLE_BATCH_CONG_W", "0"))
+        per_k_div = os.environ.get("STRAPLE_BATCH_DIVERSITY", "0") == "1"
+        cohesion_start = float(os.environ.get(
+            "STRAPLE_BATCH_COHESION_START", "0"))
+        cohesion_end = float(os.environ.get(
+            "STRAPLE_BATCH_COHESION_END", "0"))
+
+        gb_kwargs_common = dict(
+            seed=self.seed,
+            device="cuda" if cuda_avail else "cpu",
+            anchor_strategy=os.environ.get(
+                "STRAPLE_BATCH_ANCHOR_STRATEGY", "centroid"),
+            spawn_radius_frac=0.05, spawn_adaptive=True,
+            anchor_jitter_frac=0.05,
+            anchor_loss_beta_start=anchor_beta_start,
+            anchor_loss_beta_end=anchor_beta_end,
+            cohesion_beta_start=cohesion_start,
+            cohesion_beta_end=cohesion_end,
+            use_eplace_density=use_eplace,
+            eplace_grid_size=eplace_grid,
+            cong_weight=cong_weight,
+            per_k_diversity=per_k_div,
+        )
+
+        # ---- Probe step: measure real per-seed peak, then size K to
+        # ---- fill_frac of total VRAM (default 0.92 — close to OOM but with
+        # ---- ~8 % jitter margin).  On OOM we shrink K by 20 % per retry
+        # ---- (rather than halving) and try again, up to a bounded number
+        # ---- of attempts.  This keeps us close to the real capacity even
+        # ---- when the initial estimate was just slightly optimistic.
+        if do_probe:
+            import torch as _t
+            probe_shrink = float(os.environ.get(
+                "STRAPLE_BATCH_PROBE_SHRINK", "0.8"))
+            t_probe_total = _time.time()
+            attempt = 0
+            lo_K = None         # largest K known to fit
+            hi_K = None         # smallest K known to OOM
+            best_per_K_mb = None
+            best_target_mb = None
+
+            def _try_probe(K_try):
+                """Run a probe at K_try.  Returns (peak_mb, real_per_K_mb,
+                fill_target_mb) on success, or None on OOM.  Cleans up
+                allocations either way.
+                """
+                nonlocal attempt
+                attempt += 1
+                _t.cuda.empty_cache()
+                _t.cuda.reset_peak_memory_stats()
+                t_attempt = _time.time()
+                try:
+                    pp, ps = gradient_batch(
+                        benchmark, plc, K=K_try, num_steps=2,
+                        time_budget=0.0,
+                        proxy_pkgs=None,
+                        verbose=False,
+                        **gb_kwargs_common,
+                    )
+                    peak_b = _t.cuda.max_memory_allocated()
+                    del pp, ps
+                    _t.cuda.empty_cache()
+                    _t.cuda.reset_peak_memory_stats()
+                    peak_mb = peak_b / (1024 ** 2)
+                    per_K = peak_mb / max(K_try, 1)
+                    _, total_b2 = _t.cuda.mem_get_info()
+                    total_gb_real = total_b2 / 1e9
+                    # Absolute target: fill_frac of TOTAL VRAM.  We don't
+                    # subtract "current free" because the PyTorch allocator
+                    # pool stays reserved after empty_cache() and would
+                    # falsely shrink the target.
+                    fill_target = total_gb_real * fill_frac * 1024.0
+                    self._log(
+                        f"[{bench_label}] probe attempt #{attempt} "
+                        f"({_time.time()-t_attempt:.2f}s): K={K_try} OK → "
+                        f"peak={peak_mb:.0f} MB, per-K={per_K:.1f} MB, "
+                        f"fill_target={fill_target:.0f} MB")
+                    return (peak_mb, per_K, fill_target)
+                except _t.cuda.OutOfMemoryError:
+                    _t.cuda.empty_cache()
+                    self._log(
+                        f"[{bench_label}] probe attempt #{attempt} "
+                        f"({_time.time()-t_attempt:.2f}s): K={K_try} OOM")
+                    return None
+
+            # Phase 1: shrink until fits.
+            attempt_K = K_initial
+            while True:
+                r = _try_probe(attempt_K)
+                if r is not None:
+                    lo_K = attempt_K
+                    best_per_K_mb = r[1]
+                    best_target_mb = r[2]
+                    break
+                hi_K = attempt_K
+                next_K = max(
+                    K_align,
+                    (int(attempt_K * probe_shrink) // K_align) * K_align)
+                if next_K >= attempt_K or next_K < K_min:
+                    break
+                attempt_K = next_K
+
+            # Phase 1.5: adaptive growth — if probe at lo_K fit easily and
+            # the formula says we have headroom (real per-K < expected),
+            # try a bigger K to discover an upper bound.  This kicks in
+            # whenever Phase 1 succeeded on first attempt (hi_K is None).
+            if lo_K is not None and hi_K is None:
+                while True:
+                    K_target_grow = int(
+                        best_target_mb // max(best_per_K_mb, 1.0))
+                    K_target_grow = (K_target_grow // K_align) * K_align
+                    K_target_grow = min(K_max, K_target_grow)
+                    if K_target_grow <= lo_K:
+                        break
+                    r = _try_probe(K_target_grow)
+                    if r is not None:
+                        lo_K = K_target_grow
+                        best_per_K_mb = r[1]
+                        best_target_mb = r[2]
+                        # If at K_max, we can't grow further.
+                        if lo_K >= K_max:
+                            break
+                    else:
+                        hi_K = K_target_grow
+                        break
+
+            # Phase 2: binary-search upward between lo_K and hi_K to find
+            # the largest aligned K that still fits.  This recovers capacity
+            # lost to the coarse shrink step.
+            if lo_K is not None and hi_K is not None and hi_K - lo_K > K_align:
+                while True:
+                    mid_raw = (lo_K + hi_K) // 2
+                    mid = (mid_raw // K_align) * K_align
+                    if mid <= lo_K or mid >= hi_K:
+                        break
+                    r = _try_probe(mid)
+                    if r is not None:
+                        lo_K = mid
+                        best_per_K_mb = r[1]
+                        best_target_mb = r[2]
+                    else:
+                        hi_K = mid
+
+            if lo_K is None:
+                # Probe never succeeded — fall back to estimate-shrink result.
+                K = max(K_min, attempt_K)
+                self._log(
+                    f"[{bench_label}] probe failed after {attempt} "
+                    f"attempts; fallback K={K} "
+                    f"(probe wall {_time.time()-t_probe_total:.1f}s)")
+            else:
+                # Pick K_final from real per-K under the fill_frac target,
+                # capped by the known-OK lo_K (since anything above it has
+                # not been verified during this run except by binary search,
+                # which already advanced lo_K).
+                K_raw_real = int(
+                    best_target_mb // max(best_per_K_mb, 1.0))
+                K_aligned_real, dir2 = _round_K(
+                    K_raw_real,
+                    lambda Kx: Kx * best_per_K_mb <= best_target_mb)
+                K_aligned_real = max(K_align, K_aligned_real)
+                K_final = max(K_min, min(K_max, K_aligned_real))
+                # Never exceed the largest probed-OK K.
+                K_final = min(K_final, lo_K)
+                if env_override:
+                    K_final = min(K_final, K_initial)
+                self._log(
+                    f"[{bench_label}] probe DONE in "
+                    f"{_time.time()-t_probe_total:.1f}s, {attempt} attempts: "
+                    f"lo_K={lo_K} hi_K={hi_K} per_K={best_per_K_mb:.1f} MB "
+                    f"target={best_target_mb:.0f} MB → K={K_final} "
+                    f"(est peak={K_final * best_per_K_mb / 1024.0:.2f} GB)")
+                K = K_final
+
+        t_grad = _time.time()
+        pos_K, stats = gradient_batch(
+            benchmark, plc, K=K, num_steps=20000,
+            time_budget=time_budget,
+            proxy_pkgs=proxy_pkgs,
+            verbose=bool(self.verbose),
+            **gb_kwargs_common,
+        )
+        self._log(f"[{bench_label}] gradient: {_time.time()-t_grad:.1f}s "
+                  f"plateau={stats.get('plateau_events',0)} "
+                  f"recombined={stats.get('seeds_recombined_total',0)}")
+
+        # ---- Pick best by GPU proxy fitness ----
+        proxy_K_last = stats.get("proxy_history", None)
+        if proxy_K_last is not None and len(proxy_K_last) > 0:
+            cand_proxy = proxy_K_last[-1]
+        elif "fitness_history" in stats and stats["fitness_history"] is not None:
+            cand_proxy = stats["fitness_history"][-1]
+        else:
+            ova = stats.get("overlap_area_K")
+            cand_proxy = (ova if ova is not None
+                          else np.zeros(K, dtype=np.float32))
+        topn = legalize_topn if legalize_topn > 0 else K
+        cand_idx = np.argsort(cand_proxy)[:topn].tolist()
+
+        # ---- Parallel legalize candidates and pick the best valid ----
+        sys.path.insert(0, str(_CPP_DIR))
+        bench_dir_str = str(Path(
+            "external/MacroPlacement/Testcases/ICCAD04") / benchmark.name)
+        if not Path(bench_dir_str).exists():
+            # NG45 fallback: use ng45_dir mapping (same as _load_plc).
+            ng45 = {
+                "ariane133_ng45": "ariane133",
+                "ariane136_ng45": "ariane136",
+                "nvdla_ng45": "nvdla",
+                "mempool_tile_ng45": "mempool_tile",
+            }
+            d = ng45.get(benchmark.name)
+            if d:
+                bench_dir_str = str(
+                    Path("external/MacroPlacement/Flows/NanGate45") / d
+                    / "netlist" / "output_CT_Grouping")
+
+        scripts_dir = str(
+            Path(__file__).resolve().parent.parent.parent / "scripts")
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        from gpu_run_one import _legalize_only as _leg_only
+
+        sizes_np = benchmark.macro_sizes[:n_hard].cpu().numpy().astype(np.float64)
+        movable_np = (benchmark.get_movable_mask()[:n_hard]
+                       .cpu().numpy().astype(bool))
+        pos_hard_list = [
+            pos_K[k, :n_hard].astype(np.float64).copy() for k in cand_idx]
+        n_workers = min(_mp.cpu_count(), 16)
+        t_leg = _time.time()
+        with _mp.get_context("fork").Pool(n_workers) as pool:
+            results_leg = pool.starmap(_leg_only, [
+                (cand_idx[j], pos_hard_list[j], sizes_np, movable_np,
+                 float(canvas_w), float(canvas_h),
+                 int(self.seed) + cand_idx[j])
+                for j in range(len(cand_idx))])
+        self._log(f"[{bench_label}] legalize-only {len(cand_idx)} candidates: "
+                  f"{_time.time()-t_leg:.1f}s ({n_workers} workers)")
+
+        # ---- Build legalized full pos for ALL candidates and proxy on GPU ----
+        import torch as _t
+        dev = _t.device("cuda" if _t.cuda.is_available() else "cpu")
+        Nc = len(results_leg)
+        pos_full_K = (benchmark.macro_positions.clone()
+                      .unsqueeze(0).expand(Nc, -1, -1).contiguous()
+                      .to(_t.float32))
+        cand_idx_after = []
+        for slot, (k, leg_hard) in enumerate(results_leg):
+            pos_full_K[slot, :n_hard] = _t.tensor(leg_hard, dtype=_t.float32)
+            if pos_K.shape[1] > n_hard:
+                pos_full_K[slot, n_hard:n_hard + n_soft] = _t.tensor(
+                    pos_K[k, n_hard:n_hard + n_soft], dtype=_t.float32)
+            cand_idx_after.append(k)
+        pos_full_K = pos_full_K.to(dev)
+        sizes_t = benchmark.macro_sizes[:n_total].to(dev, _t.float32)
+
+        # GPU pairwise overlap_count to flag invalid candidates
+        half_w = sizes_t[:n_hard, 0] / 2.0
+        half_h = sizes_t[:n_hard, 1] / 2.0
+        sx = (sizes_t[:n_hard, 0:1] + sizes_t[:n_hard, 0].unsqueeze(0)) * 0.5
+        sy = (sizes_t[:n_hard, 1:2] + sizes_t[:n_hard, 1].unsqueeze(0)) * 0.5
+        eye = (1.0 - _t.eye(n_hard, dtype=_t.float32, device=dev))
+        ph = pos_full_K[:, :n_hard]
+        dx = ph[:, :, 0:1] - ph[:, :, 0].unsqueeze(1)
+        dy = ph[:, :, 1:2] - ph[:, :, 1].unsqueeze(1)
+        ox = _t.relu(sx[None, :, :] - _t.abs(dx))
+        oy = _t.relu(sy[None, :, :] - _t.abs(dy))
+        ov_area_pair = ox * oy * eye[None, :, :]
+        # Google's overlap threshold is 0.4% of cell area; legalize should
+        # bring everything to 0, but we use 1e-6 here as a safety floor.
+        invalid_mask = (ov_area_pair > 1e-6).any(dim=(1, 2))
+        n_invalid = int(invalid_mask.sum().item())
+
+        # GPU batched proxy_cost (Google PlacementCost reproduction).
+        from gpu_proxy import gpu_proxy_batched
+        macro_idx_p = padded_probe[0].to(dev)
+        offsets_p = padded_probe[1].to(dev)
+        mask_p = padded_probe[2].to(dev)
+        t_proxy = _time.time()
+        proxy_K_eval, _comp = gpu_proxy_batched(
+            pos_full_K, sizes_t, macro_idx_p, offsets_p, mask_p,
+            canvas_w, canvas_h, grid_rows, grid_cols,
+            macro_idx_p.shape[0],
+            n_hard=n_hard,
+            edges_pkg=edges_pkg, smooth_matrices=smooth_matrices,
+            routing_consts=routing_consts, wl_pkg=wl_pkg,
+        )
+        proxy_np = proxy_K_eval.cpu().numpy()
+        proxy_np_for_pick = proxy_np.copy()
+        proxy_np_for_pick[invalid_mask.cpu().numpy()] = float("inf")
+        self._log(f"[{bench_label}] GPU proxy on {Nc} legalized: "
+                  f"{_time.time()-t_proxy:.2f}s, invalid={n_invalid}")
+
+        if not _np_isfinite_any(proxy_np_for_pick):
+            self._log(f"[{bench_label}] WARN: every legalized candidate "
+                      f"still has overlap; returning lowest-overlap raw")
+            ova = stats.get("overlap_area_K")
+            order = np.argsort(ova) if ova is not None else np.arange(K)
+            k = int(order[0])
+            full_b = benchmark.macro_positions.clone()
+            full_b[:n_hard] = torch.tensor(
+                pos_K[k, :n_hard], dtype=torch.float32)
+            if pos_K.shape[1] > n_hard:
+                full_b[n_hard:n_hard + n_soft] = torch.tensor(
+                    pos_K[k, n_hard:n_hard + n_soft], dtype=torch.float32)
+            return full_b
+
+        best_slot = int(np.argmin(proxy_np_for_pick))
+        best_proxy = float(proxy_np_for_pick[best_slot])
+        best_k = int(cand_idx_after[best_slot])
+        self._log(f"[{bench_label}] BEST proxy={best_proxy:.4f} "
+                  f"(legalized seed k={best_k})")
+
+        # ---- Optional evolution plot (env-gated) ----
+        if os.environ.get("STRAPLE_BATCH_PLOT", "0") == "1":
+            try:
+                self._save_evolution_plot(
+                    benchmark, bench_label, stats,
+                    final_proxy_K=proxy_np, final_overlap_K=invalid_mask.cpu().numpy(),
+                    best_slot=best_slot, best_k=best_k, best_proxy=best_proxy,
+                )
+            except Exception as e:
+                self._log(f"[{bench_label}] plot skipped: {e}")
+
+        return pos_full_K[best_slot].cpu()
+
+    def _save_evolution_plot(self, benchmark, bench_label, stats,
+                              final_proxy_K, final_overlap_K,
+                              best_slot, best_k, best_proxy):
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        repo_root = Path(__file__).resolve().parent.parent.parent
+        out_dir = repo_root / "vis"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{benchmark.name}_submission_evolution.png"
+
+        fit_hist = stats.get("fitness_history", None)
+        ov_hist = stats.get("overlap_area_history", None)
+        proxy_hist = stats.get("proxy_history", None)
+        proxy_steps = stats.get("proxy_history_steps", []) or []
+
+        n_panels = 1 + (1 if ov_hist is not None and len(ov_hist) > 0 else 0)
+        n_panels += 1 if proxy_hist is not None and len(proxy_hist) > 0 else 0
+        # Always add a final-distribution panel (after legalize) if we have it.
+        n_panels += 1
+        fig, axes = plt.subplots(n_panels, 1, figsize=(12, 3.5 * n_panels),
+                                  sharex=False)
+        if n_panels == 1:
+            axes = [axes]
+        ai = 0
+
+        if fit_hist is not None and len(fit_hist) > 0:
+            steps = np.arange(1, fit_hist.shape[0] + 1)
+            f_min = fit_hist.min(axis=1)
+            f_p25 = np.percentile(fit_hist, 25, axis=1)
+            f_med = np.median(fit_hist, axis=1)
+            f_p75 = np.percentile(fit_hist, 75, axis=1)
+            f_max = fit_hist.max(axis=1)
+            ax = axes[ai]; ai += 1
+            ax.fill_between(steps, f_min, f_max, alpha=0.15,
+                            color="C0", label="min..max")
+            ax.fill_between(steps, f_p25, f_p75, alpha=0.30,
+                            color="C0", label="p25..p75")
+            ax.plot(steps, f_med, color="C0", lw=1.5, label="median")
+            ax.plot(steps, f_min, color="C2", lw=1.0, label="min")
+            ax.set_yscale("log")
+            ax.set_ylabel("fitness (gradient loss)")
+            ax.set_title(f"{benchmark.name}: per-step fitness across "
+                         f"K={fit_hist.shape[1]} seeds")
+            ax.legend(loc="upper right", fontsize=8)
+            ax.grid(True, alpha=0.3)
+            ax.set_xlabel("step")
+
+        if ov_hist is not None and len(ov_hist) > 0:
+            steps = np.arange(1, ov_hist.shape[0] + 1)
+            o_min = ov_hist.min(axis=1)
+            o_med = np.median(ov_hist, axis=1)
+            o_max = ov_hist.max(axis=1)
+            ax = axes[ai]; ai += 1
+            ax.fill_between(steps, o_min, o_max, alpha=0.20,
+                            color="C3", label="min..max")
+            ax.plot(steps, o_med, color="C3", lw=1.2, label="median")
+            ax.plot(steps, o_min, color="C2", lw=1.0, label="min")
+            ax.set_yscale("symlog")
+            ax.set_ylabel("overlap area (raw)")
+            ax.set_xlabel("step")
+            ax.legend(loc="upper right", fontsize=8)
+            ax.grid(True, alpha=0.3)
+
+        if proxy_hist is not None and len(proxy_hist) > 0 and proxy_steps:
+            ps = np.array(proxy_steps)
+            P = proxy_hist
+            p_min = np.nanmin(P, axis=1)
+            p_p25 = np.nanpercentile(P, 25, axis=1)
+            p_med = np.nanmedian(P, axis=1)
+            p_p75 = np.nanpercentile(P, 75, axis=1)
+            p_max = np.nanmax(P, axis=1)
+            ax = axes[ai]; ai += 1
+            ax.fill_between(ps, p_min, p_max, alpha=0.15,
+                            color="C4", label="min..max")
+            ax.fill_between(ps, p_p25, p_p75, alpha=0.30,
+                            color="C4", label="p25..p75")
+            ax.plot(ps, p_med, color="C4", lw=1.5, label="median")
+            ax.plot(ps, p_min, color="#117733", lw=1.5,
+                    marker="o", ms=3, label="min (best raw)")
+            ax.set_ylabel("proxy_cost (GPU repro, raw)")
+            ax.set_xlabel("step")
+            ax.set_title("In-loop proxy across all K seeds (no legalize)")
+            ax.legend(loc="upper right", fontsize=8)
+            ax.grid(True, alpha=0.3)
+
+        # Final distribution after legalize
+        ax = axes[ai]; ai += 1
+        valid_mask = ~final_overlap_K.astype(bool)
+        proxy_valid = final_proxy_K[valid_mask]
+        proxy_invalid = final_proxy_K[~valid_mask]
+        if len(proxy_valid):
+            ax.hist(proxy_valid, bins=40, alpha=0.7, color="C2",
+                    label=f"valid ({len(proxy_valid)})")
+        if len(proxy_invalid):
+            ax.hist(proxy_invalid, bins=20, alpha=0.5, color="C3",
+                    label=f"invalid ({len(proxy_invalid)})")
+        ax.axvline(best_proxy, color="black", lw=1.5,
+                   label=f"BEST k={best_k} → {best_proxy:.4f}")
+        ax.set_xlabel("proxy_cost (after legalize, GPU)")
+        ax.set_ylabel("seeds")
+        ax.set_title(f"Post-legalize proxy distribution "
+                     f"(K={len(final_proxy_K)})")
+        ax.legend(loc="upper right", fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=110)
+        plt.close(fig)
+        self._log(f"[{bench_label}] evolution plot → {out_path}")
+
     def _perturb_initial(self, args, start_idx):
         rng = np.random.default_rng(self.seed + start_idx * 1000 + 7)
         canvas_min = min(args["canvas_w"], args["canvas_h"])
@@ -366,6 +1023,18 @@ class StraplePlacer:
         t_after_edges = time.time()
         self._log(f"[{bench_label}] _extract_edges: {t_after_edges - t_after_plc:.2f}s "
                   f"(edges={len(edges)})")
+
+        # ===== GPU batch placement preset: K parallel seeds + GA + GPU proxy =====
+        # Activated by STRAPLE_PRESET=gradient_batch (or STRAPLE_BATCH_PRESET=1).
+        # Uses gradient_batch.py as the primary placer, scoring inside the
+        # loop with the GPU reproduction of Google's PlacementCost.
+        gb_preset = (preset == "gradient_batch"
+                      or os.environ.get("STRAPLE_BATCH_PRESET", "0") == "1")
+        if gb_preset and plc is not None:
+            full = self._place_gradient_batch(benchmark, plc, bench_label)
+            self._log(f"[{bench_label}] === gradient_batch preset done "
+                      f"total={time.time()-t_place_start:.2f}s ===")
+            return full
 
         demo_mode = os.environ.get("STRAPLE_DEMO", "")
         if demo_mode in ("force", "gradient") and plc is not None:
