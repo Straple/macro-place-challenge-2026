@@ -349,43 +349,62 @@ def main():
     print(f"[gpu_run_one] saved legalized pos_K to {grid_path} "
           f"({grid_path.stat().st_size / 1e6:.1f} MB)", flush=True)
 
-    # ===== Per-step proxy_cost trajectory across ALL K seeds =====
-    if (snapshots_pos_all is not None and len(snapshots_step_all) > 0):
+    # ===== Per-step proxy_cost trajectory across ALL K seeds (GPU batch) =====
+    use_gpu_proxy = os.environ.get("STRAPLE_GPU_PROXY", "1") == "1"
+    if (snapshots_pos_all is not None and len(snapshots_step_all) > 0
+            and use_gpu_proxy and torch.cuda.is_available()):
+        sys.path.insert(0, str(REPO_ROOT / "submissions" / "straple"))
+        from gpu_proxy import gpu_proxy_batched
+        from analytical_seed import (
+            _build_net_pin_tensors_full, _build_padded_net_tensors)
+        net_macro_idx, net_pin_offsets = _build_net_pin_tensors_full(
+            benchmark, plc)
+        padded = _build_padded_net_tensors(net_macro_idx, net_pin_offsets)
+        macro_idx_p, offsets_p, mask_p = padded
+        dev = torch.device("cuda")
+        macro_idx_p = macro_idx_p.to(dev)
+        offsets_p = offsets_p.to(dev)
+        mask_p = mask_p.to(dev)
+        sizes_t = benchmark.macro_sizes[:n_hard + n_soft].float().to(dev)
+        num_nets_used = int(macro_idx_p.shape[0])
+
         n_snap = len(snapshots_step_all)
         proxy_max_snap = int(os.environ.get("STRAPLE_PROXY_TRAJ_SNAPS", "30"))
         sub_n = min(n_snap, proxy_max_snap)
         sub_indices = np.linspace(0, n_snap - 1, sub_n).astype(int)
-        n_seeds_pos = snapshots_pos_all.shape[2]
-        full_template_np = full_template.cpu().numpy().astype(np.float32)
-        tasks = []
-        for snap_i, idx in enumerate(sub_indices):
-            for k in range(args.K):
-                full_np = full_template_np.copy()
-                full_np[:n_seeds_pos] = snapshots_pos_all[idx, k]
-                tasks.append((snap_i, k, full_np))
-        print(f"[gpu_run_one] proxy traj: {sub_n} snapshots × {args.K} seeds "
-              f"= {len(tasks)} compute_proxy_cost calls in pool...",
-              flush=True)
-        t_proxy = time.time()
-        n_workers_p = min(mp.cpu_count(), 16)
         proxy_arr = np.full((sub_n, args.K), np.nan, dtype=np.float32)
-        ovlp_arr = np.zeros((sub_n, args.K), dtype=np.int32)
-        with mp.get_context("fork").Pool(
-                n_workers_p,
-                initializer=_proxy_worker_init,
-                initargs=(bench_dir_str,)) as pool:
-            for snap_i, k, proxy, ovlp in pool.imap_unordered(
-                    _proxy_worker_compute, tasks, chunksize=8):
-                proxy_arr[snap_i, k] = proxy
-                ovlp_arr[snap_i, k] = ovlp
+        wl_arr = np.zeros((sub_n, args.K), dtype=np.float32)
+        den_arr = np.zeros((sub_n, args.K), dtype=np.float32)
+        cong_arr = np.zeros((sub_n, args.K), dtype=np.float32)
+        print(f"[gpu_run_one] gpu_proxy traj: {sub_n} snapshots × "
+              f"{args.K} seeds on GPU...", flush=True)
+        t_proxy = time.time()
+        for snap_i, idx in enumerate(sub_indices):
+            pos_K_t = torch.from_numpy(
+                snapshots_pos_all[idx]).to(dev).float()      # [K, n, 2]
+            with torch.no_grad():
+                p_K, comp = gpu_proxy_batched(
+                    pos_K_t, sizes_t, macro_idx_p, offsets_p, mask_p,
+                    float(benchmark.canvas_width),
+                    float(benchmark.canvas_height),
+                    int(benchmark.grid_rows), int(benchmark.grid_cols),
+                    num_nets_used,
+                )
+            proxy_arr[snap_i] = p_K.cpu().numpy()
+            wl_arr[snap_i] = comp["wl"].cpu().numpy()
+            den_arr[snap_i] = comp["density"].cpu().numpy()
+            cong_arr[snap_i] = comp["congestion"].cpu().numpy()
         proxy_traj = {
             "steps": np.array([int(snapshots_step_all[i])
                                for i in sub_indices]),
             "proxy_K": proxy_arr,
-            "overlap_K": ovlp_arr,
+            "overlap_K": np.zeros_like(proxy_arr, dtype=np.int32),
+            "wl_K": wl_arr,
+            "density_K": den_arr,
+            "congestion_K": cong_arr,
         }
-        print(f"[gpu_run_one] proxy traj done in {time.time()-t_proxy:.1f}s "
-              f"({n_workers_p} workers)", flush=True)
+        print(f"[gpu_run_one] gpu_proxy done in {time.time()-t_proxy:.2f}s",
+              flush=True)
 
     # ===== Evolution plot: fitness + overlap_area + proxy_cost panels =====
     if fit_hist is not None and len(fit_hist) > 0:
