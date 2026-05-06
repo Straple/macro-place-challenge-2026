@@ -348,8 +348,11 @@ class StraplePlacer:
         canvas_h = float(benchmark.canvas_height)
 
         # ---- Adaptive K from free VRAM ----
+        # 55 min default — judging TL is 1 h per bench; we leave 5 min for
+        # probe (~10-30 s), legalize-all (3-30 s), GPU proxy select (1 s)
+        # and the evaluator's own compute_proxy_cost reporting (a few s).
         time_budget = float(os.environ.get(
-            "STRAPLE_BATCH_TIME_BUDGET", "3000"))
+            "STRAPLE_BATCH_TIME_BUDGET", "3300"))
         legalize_topn = int(os.environ.get(
             "STRAPLE_BATCH_LEGALIZE_TOPN", "0"))   # 0 = all
 
@@ -374,7 +377,8 @@ class StraplePlacer:
             grid_rows=grid_rows, grid_cols=grid_cols, eplace_grid=ep_n)
 
         K_min = int(os.environ.get("STRAPLE_BATCH_K_MIN", "32"))
-        K_max = int(os.environ.get("STRAPLE_BATCH_K_MAX", "1024"))
+        # Upper cap is intentionally generous — probe handles VRAM ceiling.
+        K_max = int(os.environ.get("STRAPLE_BATCH_K_MAX", "8192"))
         # Initial conservative safety used for the *probe* — large enough
         # that the probe itself never OOMs even on a poorly-calibrated GPU.
         probe_safety_gb = float(os.environ.get(
@@ -1013,7 +1017,10 @@ class StraplePlacer:
         bench_label = getattr(benchmark, "name", "?")
         self._log(f"[{bench_label}] === StraplePlacer.place() ===")
 
-        preset = os.environ.get("STRAPLE_PRESET", "")
+        # Default to the GPU batched gradient path — that's our submission
+        # entry point.  Override with STRAPLE_PRESET=high_effort (legacy
+        # ALNS) or =""/something else to disable.
+        preset = os.environ.get("STRAPLE_PRESET", "gradient_batch")
         if preset == "high_effort":
             # Adaptive num_starts по размеру bench, чтобы вписаться в 1ч лимит
             # per bench. На сервере (16 vCPU) baseline ALNS ibm17 = ~26-39 min,
