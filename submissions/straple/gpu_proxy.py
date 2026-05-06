@@ -25,6 +25,258 @@ import math
 import torch
 
 
+def build_wl_pkg_full(plc, name_to_global, n_total: int):
+    """Build a wirelength-only net pin package that matches CPU exactly.
+
+    CPU iterates ``plc.nets``: each net contributes weighted HPWL of pin
+    positions of (driver + sinks).  Pins can be MACRO_PIN (offset within
+    parent macro) or PORT (its own absolute position, fixed).
+
+    To accommodate ports on GPU we append fixed port positions to the
+    movable macro tensor by extending the index space:
+        macro idx 0 .. n_total-1   -> movable macros (use pos_K[:, idx])
+        macro idx n_total + p      -> port p, position = port_positions[p]
+
+    Returns dict with:
+        port_positions [Np, 2]
+        macro_idx [N_nets, max_pins]
+        offsets [N_nets, max_pins, 2]
+        mask [N_nets, max_pins]
+        weights [N_nets]
+        net_cnt_total (CPU's plc.net_cnt)
+    """
+    port_pos_list = []
+    port_to_idx = {}
+    for idx, mod in enumerate(plc.modules_w_pins):
+        if mod.get_type() == "PORT":
+            port_to_idx[mod.get_name()] = len(port_pos_list)
+            x, y = mod.get_pos()
+            port_pos_list.append([float(x), float(y)])
+
+    nets_macros = []
+    nets_offsets = []
+    nets_mask = []
+    nets_weights = []
+    max_pins = 0
+
+    def _resolve(pin_name):
+        parent = pin_name.split("/")[0]
+        # First check PORT (named directly without slash sub-path).
+        if pin_name in port_to_idx:
+            return n_total + port_to_idx[pin_name], (0.0, 0.0)
+        if parent in port_to_idx:
+            return n_total + port_to_idx[parent], (0.0, 0.0)
+        if parent in name_to_global:
+            pin_idx = plc.mod_name_to_indices.get(pin_name, -1)
+            if pin_idx < 0:
+                return None
+            offset = plc.modules_w_pins[pin_idx].get_offset()
+            return name_to_global[parent], (float(offset[0]), float(offset[1]))
+        return None
+
+    for driver, sinks in plc.nets.items():
+        macros = []
+        offs = []
+        for pin_name in [driver] + list(sinks):
+            r = _resolve(pin_name)
+            if r is None:
+                continue
+            macros.append(r[0])
+            offs.append(list(r[1]))
+        if len(macros) < 2:
+            continue
+        d_idx = plc.mod_name_to_indices.get(driver, -1)
+        if d_idx >= 0:
+            try:
+                w = float(plc.modules_w_pins[d_idx].get_weight())
+            except Exception:
+                w = 1.0
+        else:
+            w = 1.0
+        if w <= 0:
+            w = 1.0
+        nets_macros.append(macros)
+        nets_offsets.append(offs)
+        nets_weights.append(w)
+        max_pins = max(max_pins, len(macros))
+
+    N = len(nets_macros)
+    macro_idx = torch.zeros((N, max_pins), dtype=torch.long)
+    offsets = torch.zeros((N, max_pins, 2), dtype=torch.float32)
+    mask = torch.zeros((N, max_pins), dtype=torch.bool)
+    for n, (m, o) in enumerate(zip(nets_macros, nets_offsets)):
+        p = len(m)
+        macro_idx[n, :p] = torch.tensor(m, dtype=torch.long)
+        offsets[n, :p] = torch.tensor(o, dtype=torch.float32)
+        mask[n, :p] = True
+    weights = torch.tensor(nets_weights, dtype=torch.float32)
+    port_positions = torch.tensor(port_pos_list, dtype=torch.float32) if port_pos_list else \
+        torch.zeros((0, 2), dtype=torch.float32)
+    return {
+        "macro_idx": macro_idx,
+        "offsets": offsets,
+        "mask": mask,
+        "weights": weights,
+        "port_positions": port_positions,
+        "net_cnt_total": float(getattr(plc, "net_cnt", len(plc.nets))),
+        "n_total": n_total,
+    }
+
+
+def build_net_weights_and_count(plc, name_to_global):
+    """Return per-net driver weight tensor whose row order EXACTLY matches
+    ``analytical_seed._build_net_pin_tensors_full`` (i.e., included iff
+    >=2 of the net's pins have a known parent macro), plus the total
+    ``len(plc.nets)`` used by CPU's wirelength normalisation.
+    """
+    weights = []
+    for driver, sinks in plc.nets.items():
+        valid_pins = 0
+        for pin_name in [driver] + list(sinks):
+            parent = pin_name.split("/")[0]
+            if parent not in name_to_global:
+                continue
+            if plc.mod_name_to_indices.get(pin_name, -1) < 0:
+                continue
+            valid_pins += 1
+        if valid_pins < 2:
+            continue
+        d_idx = plc.mod_name_to_indices.get(driver, -1)
+        if d_idx >= 0:
+            try:
+                w = float(plc.modules_w_pins[d_idx].get_weight())
+            except Exception:
+                w = 1.0
+        else:
+            w = 1.0
+        if w <= 0:
+            w = 1.0
+        weights.append(w)
+    # Google's PlacementCost.net_cnt is the WEIGHTED sum of nets (each
+    # weighted by its driver-pin weight, default 1).  This is the number
+    # used in CPU's wirelength normalisation: get_wirelength()/((W+H)*net_cnt).
+    plc_net_cnt = float(getattr(plc, "net_cnt", len(plc.nets)))
+    return {
+        "weights": torch.tensor(weights, dtype=torch.float32),
+        "net_cnt_total": plc_net_cnt,
+    }
+
+
+def build_routing_edges_full(plc, name_to_global, n_total: int):
+    """Like :func:`build_routing_edges` but also accepts PORTS as endpoints.
+
+    Returns two edge groups (2-pin + 3-pin) plus port_positions and the
+    combined index space n_total + n_ports.  Each macro/port idx i in
+    pin_*_macro is interpreted as:
+        i < n_total      → pos_K[:, i] (movable macro)
+        i >= n_total     → port_positions[i - n_total] (fixed)
+
+    The packs include a ``port_positions`` tensor for the caller to
+    concat with pos_K when computing pin_xy.
+    """
+    port_pos_list = []
+    port_to_idx = {}
+    for idx, mod in enumerate(plc.modules_w_pins):
+        if mod.get_type() == "PORT":
+            port_to_idx[mod.get_name()] = len(port_pos_list)
+            x, y = mod.get_pos()
+            port_pos_list.append([float(x), float(y)])
+
+    def _resolve(pin_name):
+        if pin_name in port_to_idx:
+            return n_total + port_to_idx[pin_name], (0.0, 0.0)
+        parent = pin_name.split("/")[0]
+        if parent in port_to_idx:
+            return n_total + port_to_idx[parent], (0.0, 0.0)
+        if parent in name_to_global:
+            pin_idx = plc.mod_name_to_indices.get(pin_name, -1)
+            if pin_idx < 0:
+                return None
+            offset = plc.modules_w_pins[pin_idx].get_offset()
+            return name_to_global[parent], (float(offset[0]), float(offset[1]))
+        return None
+
+    p2_a_m, p2_a_off = [], []
+    p2_b_m, p2_b_off = [], []
+    p2_w = []
+    p3_a_m, p3_a_off = [], []
+    p3_b_m, p3_b_off = [], []
+    p3_c_m, p3_c_off = [], []
+    p3_w = []
+
+    for driver, sinks in plc.nets.items():
+        d_idx = plc.mod_name_to_indices.get(driver, -1)
+        if d_idx < 0:
+            continue
+        d_pin = plc.modules_w_pins[d_idx]
+        try:
+            w = float(d_pin.get_weight())
+        except Exception:
+            w = 1.0
+        if w <= 0:
+            w = 1.0
+        d_res = _resolve(driver)
+        if d_res is None:
+            continue
+        d_macro, d_offset = d_res
+        valid = []
+        for sink in sinks:
+            r = _resolve(sink)
+            if r is not None:
+                valid.append(r)
+        if not valid:
+            continue
+        n_pins = 1 + len(valid)
+        if n_pins == 2:
+            sm, soff = valid[0]
+            p2_a_m.append(d_macro); p2_a_off.append(list(d_offset))
+            p2_b_m.append(sm); p2_b_off.append(list(soff))
+            p2_w.append(w)
+        elif n_pins == 3:
+            (m1, o1), (m2, o2) = valid
+            p3_a_m.append(d_macro); p3_a_off.append(list(d_offset))
+            p3_b_m.append(m1); p3_b_off.append(list(o1))
+            p3_c_m.append(m2); p3_c_off.append(list(o2))
+            p3_w.append(w)
+        else:
+            for sm, soff in valid:
+                p2_a_m.append(d_macro); p2_a_off.append(list(d_offset))
+                p2_b_m.append(sm); p2_b_off.append(list(soff))
+                p2_w.append(w)
+
+    def _zero2(): return torch.zeros((0, 2), dtype=torch.float32)
+    edges_2pin = {
+        "pin_a_macro": torch.tensor(p2_a_m, dtype=torch.long),
+        "pin_a_offset": torch.tensor(p2_a_off, dtype=torch.float32) if p2_a_off else _zero2(),
+        "pin_b_macro": torch.tensor(p2_b_m, dtype=torch.long),
+        "pin_b_offset": torch.tensor(p2_b_off, dtype=torch.float32) if p2_b_off else _zero2(),
+        "weight": torch.tensor(p2_w, dtype=torch.float32),
+    }
+    edges_3pin = {
+        "pin_a_macro": torch.tensor(p3_a_m, dtype=torch.long),
+        "pin_a_offset": torch.tensor(p3_a_off, dtype=torch.float32) if p3_a_off else _zero2(),
+        "pin_b_macro": torch.tensor(p3_b_m, dtype=torch.long),
+        "pin_b_offset": torch.tensor(p3_b_off, dtype=torch.float32) if p3_b_off else _zero2(),
+        "pin_c_macro": torch.tensor(p3_c_m, dtype=torch.long),
+        "pin_c_offset": torch.tensor(p3_c_off, dtype=torch.float32) if p3_c_off else _zero2(),
+        "weight": torch.tensor(p3_w, dtype=torch.float32),
+    }
+    port_positions = (torch.tensor(port_pos_list, dtype=torch.float32)
+                       if port_pos_list else _zero2())
+    return {
+        "edges_2pin": edges_2pin,
+        "edges_3pin": edges_3pin,
+        "port_positions": port_positions,
+        "n_total": n_total,
+        # Back-compat
+        "pin_a_macro": edges_2pin["pin_a_macro"],
+        "pin_a_offset": edges_2pin["pin_a_offset"],
+        "pin_b_macro": edges_2pin["pin_b_macro"],
+        "pin_b_offset": edges_2pin["pin_b_offset"],
+        "weight": edges_2pin["weight"],
+    }
+
+
 def build_routing_edges(plc, name_to_global):
     """Decompose every net into pin-tuples by Google's rules.
 
@@ -218,6 +470,13 @@ def gpu_congestion_google(
 
     e2 = edges_pkg.get("edges_2pin", edges_pkg)
     e3 = edges_pkg.get("edges_3pin", None)
+    port_pos = edges_pkg.get("port_positions", None)
+    if port_pos is not None and port_pos.shape[0] > 0:
+        port_pos_t = port_pos.to(dev, pos_K.dtype)
+        ports_K = port_pos_t.unsqueeze(0).expand(K, -1, -1)
+        combined_pos = torch.cat([pos_K, ports_K], dim=1)
+    else:
+        combined_pos = pos_K
     pin_a_m = e2["pin_a_macro"].to(dev)
     pin_a_off = e2["pin_a_offset"].to(dev)
     pin_b_m = e2["pin_b_macro"].to(dev)
@@ -278,8 +537,8 @@ def gpu_congestion_google(
         a_off = pin_a_off[s:e]
         b_off = pin_b_off[s:e]
         w_chunk = weights[s:e]
-        a_xy = pos_K[:, a_m, :] + a_off[None, :, :]
-        b_xy = pos_K[:, b_m, :] + b_off[None, :, :]
+        a_xy = combined_pos[:, a_m, :] + a_off[None, :, :]
+        b_xy = combined_pos[:, b_m, :] + b_off[None, :, :]
         a_col = (a_xy[..., 0] / cell_w).floor().clamp(0, grid_cols - 1).long()
         a_row = (a_xy[..., 1] / cell_h).floor().clamp(0, grid_rows - 1).long()
         b_col = (b_xy[..., 0] / cell_w).floor().clamp(0, grid_cols - 1).long()
@@ -308,9 +567,9 @@ def gpu_congestion_google(
         w3 = e3["weight"].to(dev)
         N3 = a3.shape[0]
         # Per-K cell coords
-        a_xy = pos_K[:, a3, :] + a3_off[None, :, :]
-        b_xy = pos_K[:, b3, :] + b3_off[None, :, :]
-        c_xy = pos_K[:, c3, :] + c3_off[None, :, :]
+        a_xy = combined_pos[:, a3, :] + a3_off[None, :, :]
+        b_xy = combined_pos[:, b3, :] + b3_off[None, :, :]
+        c_xy = combined_pos[:, c3, :] + c3_off[None, :, :]
         a_col = (a_xy[..., 0] / cell_w).floor().clamp(0, grid_cols - 1).long()
         a_row = (a_xy[..., 1] / cell_h).floor().clamp(0, grid_rows - 1).long()
         b_col = (b_xy[..., 0] / cell_w).floor().clamp(0, grid_cols - 1).long()
@@ -576,6 +835,9 @@ def gpu_proxy_batched(
     edges_pkg: dict | None = None,
     smooth_matrices: dict | None = None,
     routing_consts: dict | None = None,
+    net_weights: torch.Tensor | None = None,
+    wl_norm_net_cnt: int | None = None,
+    wl_pkg: dict | None = None,
     cong_smooth_sigma_frac: float = 0.5,
     cong_top_pct: float = 0.10,
     chunk_n: int = 96,
@@ -608,20 +870,66 @@ def gpu_proxy_batched(
     cell_area = cell_w * cell_h
 
     # ===== 1. Wirelength (exact HPWL) =====
-    # pin_xy [K, num_nets, max_pins, 2] = pos[K, macro_idx_p, :] + offsets_p
-    pin_xy = pos_K[:, macro_idx_p, :] + offsets_p[None, ...]
-    x = pin_xy[..., 0]
-    y = pin_xy[..., 1]
-    neg_inf = torch.finfo(x.dtype).min
-    pos_inf = torch.finfo(x.dtype).max
-    mask_K = mask_p[None, :, :]
-    x_max = torch.where(mask_K, x, x.new_full((), neg_inf)).amax(dim=2)
-    x_min = torch.where(mask_K, x, x.new_full((), pos_inf)).amin(dim=2)
-    y_max = torch.where(mask_K, y, x.new_full((), neg_inf)).amax(dim=2)
-    y_min = torch.where(mask_K, y, x.new_full((), pos_inf)).amin(dim=2)
-    hpwl_per_net = (x_max - x_min) + (y_max - y_min)               # [K, num_nets]
-    hpwl_K = hpwl_per_net.sum(dim=1)                                # [K]
-    wl_K = hpwl_K / ((canvas_w + canvas_h) * max(num_nets, 1))
+    if wl_pkg is not None:
+        wl_macro_idx = wl_pkg["macro_idx"].to(dev)
+        wl_offsets = wl_pkg["offsets"].to(dev)
+        wl_mask = wl_pkg["mask"].to(dev)
+        wl_weights_t = wl_pkg["weights"].to(dev, pos_K.dtype)
+        wl_port_pos = wl_pkg["port_positions"].to(dev, pos_K.dtype)
+        wl_n_total = int(wl_pkg["n_total"])
+        # Combined positions: pos_K extended with port positions (broadcast over K).
+        if wl_port_pos.shape[0] > 0:
+            ports_K = wl_port_pos.unsqueeze(0).expand(K, -1, -1)
+            combined_pos = torch.cat([pos_K, ports_K], dim=1)
+        else:
+            combined_pos = pos_K
+        pin_xy = combined_pos[:, wl_macro_idx, :] + wl_offsets[None, ...]
+        mask_used = wl_mask[None, :, :]
+        x = pin_xy[..., 0]
+        y = pin_xy[..., 1]
+        neg_inf = torch.finfo(x.dtype).min
+        pos_inf = torch.finfo(x.dtype).max
+        x_max = torch.where(mask_used, x, x.new_full((), neg_inf)).amax(dim=2)
+        x_min = torch.where(mask_used, x, x.new_full((), pos_inf)).amin(dim=2)
+        y_max = torch.where(mask_used, y, x.new_full((), neg_inf)).amax(dim=2)
+        y_min = torch.where(mask_used, y, x.new_full((), pos_inf)).amin(dim=2)
+        hpwl_per_net = ((x_max - x_min) + (y_max - y_min)) * wl_weights_t[None, :]
+        hpwl_K = hpwl_per_net.sum(dim=1)
+        norm_cnt = max(float(wl_pkg["net_cnt_total"]), 1.0)
+        wl_K = hpwl_K / ((canvas_w + canvas_h) * norm_cnt)
+        # Re-derive bounds for the (legacy) congestion fallback below.
+        # We need x_max/x_min/y_max/y_min over the macro-only nets if it
+        # is going to use them; recompute using macro_idx_p as before.
+        pin_xy_legacy = pos_K[:, macro_idx_p, :] + offsets_p[None, ...]
+        xl = pin_xy_legacy[..., 0]
+        yl = pin_xy_legacy[..., 1]
+        mlk = mask_p[None, :, :]
+        x_max = torch.where(mlk, xl, xl.new_full((), neg_inf)).amax(dim=2)
+        x_min = torch.where(mlk, xl, xl.new_full((), pos_inf)).amin(dim=2)
+        y_max = torch.where(mlk, yl, yl.new_full((), neg_inf)).amax(dim=2)
+        y_min = torch.where(mlk, yl, yl.new_full((), pos_inf)).amin(dim=2)
+    else:
+        # pin_xy [K, num_nets, max_pins, 2] = pos[K, macro_idx_p, :] + offsets_p
+        pin_xy = pos_K[:, macro_idx_p, :] + offsets_p[None, ...]
+        x = pin_xy[..., 0]
+        y = pin_xy[..., 1]
+        neg_inf = torch.finfo(x.dtype).min
+        pos_inf = torch.finfo(x.dtype).max
+        mask_K = mask_p[None, :, :]
+        x_max = torch.where(mask_K, x, x.new_full((), neg_inf)).amax(dim=2)
+        x_min = torch.where(mask_K, x, x.new_full((), pos_inf)).amin(dim=2)
+        y_max = torch.where(mask_K, y, x.new_full((), neg_inf)).amax(dim=2)
+        y_min = torch.where(mask_K, y, x.new_full((), pos_inf)).amin(dim=2)
+        hpwl_per_net = (x_max - x_min) + (y_max - y_min)
+        if net_weights is not None:
+            w_net = net_weights.to(pos_K.device, pos_K.dtype)
+            if w_net.shape[0] == hpwl_per_net.shape[1]:
+                hpwl_per_net = hpwl_per_net * w_net[None, :]
+        hpwl_K = hpwl_per_net.sum(dim=1)
+        norm_cnt = (wl_norm_net_cnt if wl_norm_net_cnt is not None
+                     else max(num_nets, 1))
+        norm_cnt = max(float(norm_cnt), 1.0)
+        wl_K = hpwl_K / ((canvas_w + canvas_h) * norm_cnt)
 
     # ===== 2. Density (exact rectangular overlap per cell) =====
     half_w = sizes_t[:, 0] / 2.0
