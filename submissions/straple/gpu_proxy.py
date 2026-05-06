@@ -199,10 +199,12 @@ def build_routing_edges_full(plc, name_to_global, n_total: int):
     p2_a_m, p2_a_off = [], []
     p2_b_m, p2_b_off = [], []
     p2_w = []
+    p2_net_id = []          # net id for dedup (same id => same multi-pin net)
     p3_a_m, p3_a_off = [], []
     p3_b_m, p3_b_off = [], []
     p3_c_m, p3_c_off = [], []
     p3_w = []
+    next_multi_id = 0
 
     for driver, sinks in plc.nets.items():
         d_idx = plc.mod_name_to_indices.get(driver, -1)
@@ -232,6 +234,7 @@ def build_routing_edges_full(plc, name_to_global, n_total: int):
             p2_a_m.append(d_macro); p2_a_off.append(list(d_offset))
             p2_b_m.append(sm); p2_b_off.append(list(soff))
             p2_w.append(w)
+            p2_net_id.append(-1)         # 2-pin nets need no dedup
         elif n_pins == 3:
             (m1, o1), (m2, o2) = valid
             p3_a_m.append(d_macro); p3_a_off.append(list(d_offset))
@@ -239,18 +242,42 @@ def build_routing_edges_full(plc, name_to_global, n_total: int):
             p3_c_m.append(m2); p3_c_off.append(list(o2))
             p3_w.append(w)
         else:
+            net_id = next_multi_id
+            next_multi_id += 1
             for sm, soff in valid:
                 p2_a_m.append(d_macro); p2_a_off.append(list(d_offset))
                 p2_b_m.append(sm); p2_b_off.append(list(soff))
                 p2_w.append(w)
+                p2_net_id.append(net_id)
 
     def _zero2(): return torch.zeros((0, 2), dtype=torch.float32)
+    # ---- Group multi-pin edges by net_id (for per-K cell dedup) ----
+    multi_groups = {}
+    for ei, nid in enumerate(p2_net_id):
+        if nid < 0:
+            continue
+        multi_groups.setdefault(nid, []).append(ei)
+    multi_groups = {k: v for k, v in multi_groups.items() if len(v) > 1}
+    G = len(multi_groups)
+    if G > 0:
+        max_ng = max(len(v) for v in multi_groups.values())
+        group_edges = torch.full((G, max_ng), -1, dtype=torch.long)
+        for gi, idxs in enumerate(multi_groups.values()):
+            for j, eid in enumerate(idxs):
+                group_edges[gi, j] = eid
+        group_pad = (group_edges >= 0)
+    else:
+        group_edges = torch.zeros((0, 0), dtype=torch.long)
+        group_pad = torch.zeros((0, 0), dtype=torch.bool)
     edges_2pin = {
         "pin_a_macro": torch.tensor(p2_a_m, dtype=torch.long),
         "pin_a_offset": torch.tensor(p2_a_off, dtype=torch.float32) if p2_a_off else _zero2(),
         "pin_b_macro": torch.tensor(p2_b_m, dtype=torch.long),
         "pin_b_offset": torch.tensor(p2_b_off, dtype=torch.float32) if p2_b_off else _zero2(),
         "weight": torch.tensor(p2_w, dtype=torch.float32),
+        "net_id": torch.tensor(p2_net_id, dtype=torch.long),
+        "multi_group_edges": group_edges,        # [G, max_ng] edge ids (-1 pad)
+        "multi_group_pad": group_pad,            # [G, max_ng] valid mask
     }
     edges_3pin = {
         "pin_a_macro": torch.tensor(p3_a_m, dtype=torch.long),
@@ -484,6 +511,44 @@ def gpu_congestion_google(
     weights = e2["weight"].to(dev)
     E = pin_a_m.shape[0]
 
+    # ----- Per-K dedup of multi-pin (>3) split edges --------------------
+    # Google routes a >3-pin net via __split_net which builds a *set* of
+    # (source, sink_gcell) pairs, deduplicating duplicate sink cells.
+    # Build a per-K multiplier `effective_w_K [K, E]` that zeroes duplicates.
+    edge_w_K = weights[None, :].expand(K, E).contiguous().clone()
+    group_edges_t = e2.get("multi_group_edges", None)
+    if group_edges_t is not None and group_edges_t.numel() > 0:
+        group_edges_t = group_edges_t.to(dev)
+        group_pad_t = e2["multi_group_pad"].to(dev)
+        G_, max_ng = group_edges_t.shape
+        # All-edge sink cells per K (we only need cell index; recompute fast):
+        b_xy_all = combined_pos[:, pin_b_m, :] + pin_b_off[None, :, :]
+        b_col_all = (b_xy_all[..., 0] / cell_w).floor().clamp(0, grid_cols - 1).long()
+        b_row_all = (b_xy_all[..., 1] / cell_h).floor().clamp(0, grid_rows - 1).long()
+        sink_cell_all = b_row_all * grid_cols + b_col_all     # [K, E]
+        # Pad-safe gather: -1 indices clamped to 0 (we'll mask later).
+        idx_safe = group_edges_t.clamp_min(0)                  # [G, max_ng]
+        gathered = sink_cell_all[:, idx_safe.flatten()].view(K, G_, max_ng)
+        # has_earlier_dup[k, g, j] = exists i<j with same sink_cell within group
+        eq = gathered.unsqueeze(-1) == gathered.unsqueeze(-2)  # [K, G, ng, ng]
+        # tril without diagonal: True for i<j
+        ng = max_ng
+        tril = torch.tril(
+            torch.ones(ng, ng, device=dev, dtype=torch.bool), diagonal=-1)
+        # Pad mask: ignore non-valid edges as "earlier" comparators
+        pad_mask_2d = group_pad_t.unsqueeze(-1) & group_pad_t.unsqueeze(-2)  # [G, ng, ng]
+        full_mask = tril.unsqueeze(0) & pad_mask_2d                          # [G, ng, ng]
+        has_earlier = (eq & full_mask.unsqueeze(0)).any(dim=-1)              # [K, G, ng]
+        alive = group_pad_t.unsqueeze(0) & ~has_earlier                     # [K, G, ng]
+        kill = (group_pad_t.unsqueeze(0) & ~alive).view(K, -1)              # [K, G*ng]
+        idx_flat = group_edges_t.view(-1)                                    # [G*ng]
+        valid_flat = group_pad_t.view(-1)
+        for k in range(K):
+            kill_k = kill[k]
+            ids_k = idx_flat[kill_k & valid_flat]
+            if ids_k.numel() > 0:
+                edge_w_K[k, ids_k] = 0.0
+
     cols_arange = torch.arange(grid_cols, device=dev)
     rows_arange = torch.arange(grid_rows, device=dev)
 
@@ -536,7 +601,7 @@ def gpu_congestion_google(
         b_m = pin_b_m[s:e]
         a_off = pin_a_off[s:e]
         b_off = pin_b_off[s:e]
-        w_chunk = weights[s:e]
+        w_chunk = edge_w_K[:, s:e]   # [K, e_n] — already dedup-applied
         a_xy = combined_pos[:, a_m, :] + a_off[None, :, :]
         b_xy = combined_pos[:, b_m, :] + b_off[None, :, :]
         a_col = (a_xy[..., 0] / cell_w).floor().clamp(0, grid_cols - 1).long()
@@ -616,7 +681,7 @@ def gpu_congestion_google(
         ], dim=-1)                                  # [K, N3, 3]
         rows_stack = torch.stack([a_row, b_row, c_row], dim=-1)
         cols_stack = torch.stack([a_col, b_col, c_col], dim=-1)
-        order = key.argsort(dim=-1)                 # [K, N3, 3]
+        order = key.argsort(dim=-1, stable=True)                 # [K, N3, 3]
         sorted_rows = torch.gather(rows_stack, -1, order)
         sorted_cols = torch.gather(cols_stack, -1, order)
         x1, x2, x3 = sorted_cols.unbind(-1)
@@ -671,7 +736,7 @@ def gpu_congestion_google(
             b_row * (grid_cols + 1) + b_col,
             c_row * (grid_cols + 1) + c_col,
         ], dim=-1)
-        order_yx = key_yx.argsort(dim=-1)
+        order_yx = key_yx.argsort(dim=-1, stable=True)
         sr = torch.gather(rows_stack, -1, order_yx)
         sc = torch.gather(cols_stack, -1, order_yx)
         ty1, ty2, ty3 = sr.unbind(-1)
