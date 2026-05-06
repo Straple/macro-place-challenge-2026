@@ -387,6 +387,39 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
     snapshots_pos = []
     snapshots_step = []
 
+    # Per-seed plateau detection: window of `patience` steps, fire if relative
+    # spread (max-min) over window for that seed is below `eps · |median|`.
+    plateau_ops_enable = os.environ.get("STRAPLE_BATCH_PLATEAU_OPS", "0") == "1"
+    plateau_patience = int(os.environ.get("STRAPLE_BATCH_PLATEAU_PATIENCE", "30"))
+    plateau_interval = int(os.environ.get("STRAPLE_BATCH_PLATEAU_INTERVAL", "20"))
+    plateau_eps = float(os.environ.get("STRAPLE_BATCH_PLATEAU_EPS", "0.005"))
+
+    # Per-seed crossover: when seed k hits plateau, mate it with one random
+    # seed from the top `elite_pct` (by current fitness) and replace pos[k]
+    # with the result of cluster-aware crossover + light mutation.
+    elite_pct = float(os.environ.get("STRAPLE_BATCH_GA_ELITE_PCT", "0.25"))
+    mutation_rate = float(os.environ.get("STRAPLE_BATCH_GA_MUTATION_RATE", "0.01"))
+    mutation_sigma = float(os.environ.get("STRAPLE_BATCH_GA_MUTATION_SIGMA", "0.005"))
+
+    loss_history = None
+    if plateau_ops_enable:
+        loss_history = torch.full((plateau_patience, K), float("nan"),
+                                   dtype=torch.float32, device=dev)
+        if verbose:
+            print(f"[gradient_batch] per-seed plateau crossover ON: "
+                  f"patience={plateau_patience} interval={plateau_interval} "
+                  f"eps={plateau_eps} elite_pct={elite_pct} "
+                  f"mut_rate={mutation_rate} mut_sigma={mutation_sigma}",
+                  flush=True)
+    plateau_evt_count = 0
+    seeds_recombined_total = 0
+    cluster_id_for_ga = cluster_id_t
+    n_hard_t_int = int(n_hard)
+
+    step_log = os.environ.get("STRAPLE_BATCH_STEP_LOG", "0") == "1"
+    fitness_history = []          # list of np arrays [K] per step
+    overlap_area_history = []     # list of np arrays [K] per step
+
     for step in range(num_steps):
         if time_budget > 0 and (time.time() - t_loop) >= time_budget:
             if verbose:
@@ -656,6 +689,152 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
                   f"ovrlp={mean_ovlap_per_K:.3f} γ={gamma:.3f} λ_d={density_weight:.2f} "
                   f"λ_o={cur_overlap_w_phase:.1f}", flush=True)
 
+        # ----- Evolution operations: plateau escape + GA -----
+        # Run after optimizer step + clamp. Track per-K loss for fitness/plateau.
+        # Active in P2 + early P3 (up to 85% of time) — give children time to
+        # settle after the last GA event before the final eval.
+        evo_active_phase = ((not multi_phase)
+                            or cur_phase == 2
+                            or (cur_phase == 3 and progress < 0.85))
+        with torch.no_grad():
+            wl_K_d = wl_K.detach()
+            dpen_K_d = dpen_K.detach()
+            overlap_K_d = overlap_K.detach()
+            if per_k_diversity:
+                fitness_K = (wl_K_d
+                             + density_weight * lambda_mul_K_t * dpen_K_d
+                             + cur_overlap_w_phase * overlap_K_d
+                             + cong_weight * cong_mul_K_t * cong_K.detach())
+            else:
+                fitness_K = (wl_K_d
+                             + density_weight * dpen_K_d
+                             + cur_overlap_w_phase * overlap_K_d
+                             + cong_weight * cong_K.detach())
+            # Always collect per-step history for plot (cheap CPU copy).
+            fitness_cpu = fitness_K.cpu().numpy().astype(np.float32)
+            fitness_history.append(fitness_cpu)
+            # Pair-wise overlap area per K (raw geometry — independent of weight).
+            pos_hard_now = pos[:, :n_hard, :].detach()
+            dx_now = pos_hard_now[:, :, 0:1] - pos_hard_now[:, :, 0].unsqueeze(1)
+            dy_now = pos_hard_now[:, :, 1:2] - pos_hard_now[:, :, 1].unsqueeze(1)
+            ox = torch.relu(sizes_x_pair[None, :, :] - torch.abs(dx_now))
+            oy = torch.relu(sizes_y_pair[None, :, :] - torch.abs(dy_now))
+            ov_area_now = ((ox * oy * eye_mask[None, :, :])
+                           .sum(dim=(1, 2)) * 0.5)
+            overlap_area_history.append(ov_area_now.cpu().numpy().astype(np.float32))
+
+            if step_log:
+                f_np = fitness_cpu
+                f_min = float(f_np.min())
+                f_p25 = float(np.percentile(f_np, 25))
+                f_med = float(np.median(f_np))
+                f_p75 = float(np.percentile(f_np, 75))
+                f_max = float(f_np.max())
+                ov_np = ov_area_now.cpu().numpy()
+                ov_min = float(ov_np.min())
+                ov_med = float(np.median(ov_np))
+                phase_str = f"P{cur_phase}" if multi_phase else "lin"
+                print(f"[gradient_batch] step={step+1} {phase_str} "
+                      f"fit[min/p25/p50/p75/max]="
+                      f"{f_min:.0f}/{f_p25:.0f}/{f_med:.0f}/{f_p75:.0f}/{f_max:.0f} "
+                      f"ovlp_area[min/med]={ov_min:.2f}/{ov_med:.2f}", flush=True)
+
+        # ----- Per-seed plateau crossover -----
+        # For each seed k: detect plateau on its loss trajectory over
+        # `plateau_patience` steps. If stuck → mate it with one random elite
+        # (top `elite_pct` by current fitness), cluster-aware crossover +
+        # light mutation, write back into pos.data[k].
+        if plateau_ops_enable:
+            with torch.no_grad():
+                slot = step % plateau_patience
+                loss_history[slot] = fitness_K
+                if (evo_active_phase and step >= plateau_patience
+                        and (step + 1) % plateau_interval == 0):
+                    spread = (loss_history.max(0).values
+                              - loss_history.min(0).values)        # [K]
+                    median_K = loss_history.median(0).values.abs().clamp_min(1e-6)
+                    rel = spread / median_K     # [K] relative spread
+                    plateau_mask = rel < plateau_eps                  # [K]
+                    plateau_idx = torch.nonzero(plateau_mask, as_tuple=False).flatten()
+                    n_plat = int(plateau_idx.numel())
+                    if verbose:
+                        print(f"[gradient_batch] plateau check @step={step+1}: "
+                              f"plateau={n_plat}/{K} "
+                              f"rel_spread[min/med/max]="
+                              f"{float(rel.min()):.4f}/{float(rel.median()):.4f}/"
+                              f"{float(rel.max()):.4f}", flush=True)
+                    if n_plat > 0:
+                        n_elite = max(1, int(round(K * elite_pct)))
+                        sorted_idx = torch.argsort(fitness_K)
+                        elite_idx = sorted_idx[:n_elite]   # [n_elite]
+                        # Random elite partner per plateau seed (with replacement).
+                        partner_pick = torch.randint(0, n_elite, (n_plat,),
+                                                     device=dev)
+                        partner_idx = elite_idx[partner_pick]   # [n_plat]
+
+                        pos_self = pos.data[plateau_idx]          # [n_plat, n, 2]
+                        pos_partner = pos.data[partner_idx]       # [n_plat, n, 2]
+                        # Cluster-aware crossover: per cluster, Bernoulli(0.5)
+                        # picks self vs partner. All macros of that cluster
+                        # follow the choice → keeps cluster geometry intact.
+                        cluster_pick = (torch.rand(n_plat, num_clusters,
+                                                    device=dev) < 0.5)
+                        per_macro_pick = cluster_pick[:, cluster_id_for_ga]
+                        pos_new = torch.where(per_macro_pick.unsqueeze(-1),
+                                               pos_self, pos_partner)
+
+                        # Light mutation: gaussian noise + rare teleport.
+                        if mutation_sigma > 0:
+                            noise = (torch.randn_like(pos_new)
+                                     * (mutation_sigma * canvas_min))
+                            noise = noise * movable.view(1, -1, 1).float()
+                            pos_new = pos_new + noise
+                        if mutation_rate > 0:
+                            tp_mask = ((torch.rand(n_plat, n_active, device=dev)
+                                        < mutation_rate)
+                                       & movable.unsqueeze(0))
+                            rand_pos = torch.stack([
+                                torch.rand(n_plat, n_active, device=dev) * canvas_w,
+                                torch.rand(n_plat, n_active, device=dev) * canvas_h,
+                            ], dim=-1)
+                            pos_new = torch.where(tp_mask.unsqueeze(-1),
+                                                   rand_pos, pos_new)
+
+                        # Clamp + restore fixed
+                        pos_new[..., 0] = torch.clamp(
+                            pos_new[..., 0],
+                            half_w_t.unsqueeze(0).expand(n_plat, -1),
+                            (canvas_w - half_w_t).unsqueeze(0).expand(n_plat, -1))
+                        pos_new[..., 1] = torch.clamp(
+                            pos_new[..., 1],
+                            half_h_t.unsqueeze(0).expand(n_plat, -1),
+                            (canvas_h - half_h_t).unsqueeze(0).expand(n_plat, -1))
+                        if fixed_mask.any():
+                            pos_new[:, fixed_mask, :] = (
+                                fixed_pos[fixed_mask][None, :, :]
+                                .expand(n_plat, -1, -1))
+
+                        pos.data[plateau_idx] = pos_new
+                        # Reset Adam state for plateau seeds (old momentum is
+                        # what got them stuck).
+                        opt_state = optimizer.state.get(pos, {})
+                        if "exp_avg" in opt_state:
+                            opt_state["exp_avg"][plateau_idx] = 0
+                        if "exp_avg_sq" in opt_state:
+                            opt_state["exp_avg_sq"][plateau_idx] = 0
+                        # Invalidate history rows for these seeds.
+                        loss_history[:, plateau_idx] = float("nan")
+
+                        plateau_evt_count += 1
+                        seeds_recombined_total += n_plat
+                        if verbose:
+                            elite_fit = fitness_K[elite_idx]
+                            print(f"[gradient_batch] plateau crossover "
+                                  f"@step={step+1}: {n_plat}/{K} seeds "
+                                  f"recombined with random elite "
+                                  f"(top-{n_elite}, fit_min={float(elite_fit.min()):.0f})",
+                                  flush=True)
+
         # Snapshot every snapshot_every steps (CPU copy, no autograd link)
         if (step + 1) % snapshot_every == 0 or step == 0:
             snapshots_pos.append(pos.detach().cpu().numpy().astype(np.float32))
@@ -674,10 +853,18 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
     if verbose:
         print(f"[gradient_batch] {num_steps} steps in {time.time()-t_loop:.1f}s",
               flush=True)
+        if plateau_ops_enable:
+            print(f"[gradient_batch] evolution: plateau_events="
+                  f"{plateau_evt_count} seeds_recombined_total="
+                  f"{seeds_recombined_total}", flush=True)
     # Add final snapshot if not already added
     if not snapshots_step or snapshots_step[-1] != step:
         snapshots_pos.append(pos.detach().cpu().numpy().astype(np.float32))
         snapshots_step.append(step)
+    fitness_history_np = (np.stack(fitness_history, axis=0)
+                          if fitness_history else None)
+    overlap_area_history_np = (np.stack(overlap_area_history, axis=0)
+                               if overlap_area_history else None)
     return pos.detach().cpu().numpy(), {
         "wl_K": wl_K.detach().cpu().numpy(),
         "dpen_K": dpen_K.detach().cpu().numpy(),
@@ -685,4 +872,8 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
         "overlap_area_K": ovlap_area_K.detach().cpu().numpy(),
         "snapshots_pos": np.stack(snapshots_pos, axis=0) if snapshots_pos else None,
         "snapshots_step": snapshots_step,
+        "plateau_events": plateau_evt_count,
+        "seeds_recombined_total": seeds_recombined_total,
+        "fitness_history": fitness_history_np,
+        "overlap_area_history": overlap_area_history_np,
     }

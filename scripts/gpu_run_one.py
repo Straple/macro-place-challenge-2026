@@ -25,6 +25,29 @@ sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "submissions" / "straple"))
 
 
+# Worker для proxy_cost trajectory: load bench один раз per process,
+# затем считаем proxy для batch снимков (snapshot_idx, seed_idx, pos_full).
+_PROXY_WORKER_BENCH = None
+_PROXY_WORKER_PLC = None
+
+
+def _proxy_worker_init(bench_dir_str):
+    global _PROXY_WORKER_BENCH, _PROXY_WORKER_PLC
+    sys.path.insert(0, str(REPO_ROOT))
+    from macro_place.loader import load_benchmark_from_dir as _ldb
+    _PROXY_WORKER_BENCH, _PROXY_WORKER_PLC = _ldb(bench_dir_str)
+
+
+def _proxy_worker_compute(args):
+    snap_idx, k, pos_full_np = args
+    import torch as _torch
+    from macro_place.objective import compute_proxy_cost as _cpc
+    full = _torch.tensor(pos_full_np, dtype=_torch.float32)
+    cost = _cpc(full, _PROXY_WORKER_BENCH, _PROXY_WORKER_PLC)
+    return (snap_idx, k, float(cost["proxy_cost"]),
+            int(cost["overlap_count"]))
+
+
 # Worker для multiprocessing — legalize одного seed и compute proxy.
 # Импорты внутри чтобы fork не дублировал большие tensor'ы.
 def _legalize_and_eval(k, pos_hard, pos_soft, bench_dir_str):
@@ -135,6 +158,17 @@ def main():
         print(f"[gpu_run_one] GPU peak memory: {peak_mb:.0f} MB", flush=True)
     print(f"[gpu_run_one] gradient batch: {grad_time:.1f}s "
           f"({grad_time / args.K * 1000:.1f}ms per seed)", flush=True)
+    plat_evts = stats.get("plateau_events", 0)
+    seeds_recomb = stats.get("seeds_recombined_total", 0)
+    if plat_evts:
+        print(f"[gpu_run_one] evolution: plateau_events={plat_evts} "
+              f"seeds_recombined={seeds_recomb}", flush=True)
+
+    fit_hist = stats.get("fitness_history", None)
+    ov_hist = stats.get("overlap_area_history", None)
+    snapshots_pos_all = stats.get("snapshots_pos", None)
+    snapshots_step_all = stats.get("snapshots_step", [])
+    proxy_traj = None  # populated later after legalize-all-K (full_template/bench_dir_str)
 
     # Phase 2: filter top-N candidates by overlap_area, eval proxy on top-N
     overlap_area_K = stats.get("overlap_area_K", None)
@@ -315,6 +349,140 @@ def main():
     print(f"[gpu_run_one] saved legalized pos_K to {grid_path} "
           f"({grid_path.stat().st_size / 1e6:.1f} MB)", flush=True)
 
+    # ===== Per-step proxy_cost trajectory across ALL K seeds =====
+    if (snapshots_pos_all is not None and len(snapshots_step_all) > 0):
+        n_snap = len(snapshots_step_all)
+        proxy_max_snap = int(os.environ.get("STRAPLE_PROXY_TRAJ_SNAPS", "30"))
+        sub_n = min(n_snap, proxy_max_snap)
+        sub_indices = np.linspace(0, n_snap - 1, sub_n).astype(int)
+        n_seeds_pos = snapshots_pos_all.shape[2]
+        full_template_np = full_template.cpu().numpy().astype(np.float32)
+        tasks = []
+        for snap_i, idx in enumerate(sub_indices):
+            for k in range(args.K):
+                full_np = full_template_np.copy()
+                full_np[:n_seeds_pos] = snapshots_pos_all[idx, k]
+                tasks.append((snap_i, k, full_np))
+        print(f"[gpu_run_one] proxy traj: {sub_n} snapshots × {args.K} seeds "
+              f"= {len(tasks)} compute_proxy_cost calls in pool...",
+              flush=True)
+        t_proxy = time.time()
+        n_workers_p = min(mp.cpu_count(), 16)
+        proxy_arr = np.full((sub_n, args.K), np.nan, dtype=np.float32)
+        ovlp_arr = np.zeros((sub_n, args.K), dtype=np.int32)
+        with mp.get_context("fork").Pool(
+                n_workers_p,
+                initializer=_proxy_worker_init,
+                initargs=(bench_dir_str,)) as pool:
+            for snap_i, k, proxy, ovlp in pool.imap_unordered(
+                    _proxy_worker_compute, tasks, chunksize=8):
+                proxy_arr[snap_i, k] = proxy
+                ovlp_arr[snap_i, k] = ovlp
+        proxy_traj = {
+            "steps": np.array([int(snapshots_step_all[i])
+                               for i in sub_indices]),
+            "proxy_K": proxy_arr,
+            "overlap_K": ovlp_arr,
+        }
+        print(f"[gpu_run_one] proxy traj done in {time.time()-t_proxy:.1f}s "
+              f"({n_workers_p} workers)", flush=True)
+
+    # ===== Evolution plot: fitness + overlap_area + proxy_cost panels =====
+    if fit_hist is not None and len(fit_hist) > 0:
+        plot_path = REPO_ROOT / "vis" / f"{args.bench}_evolution.png"
+        plot_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            steps = np.arange(1, fit_hist.shape[0] + 1)
+            f_min = fit_hist.min(axis=1)
+            f_p25 = np.percentile(fit_hist, 25, axis=1)
+            f_med = np.median(fit_hist, axis=1)
+            f_p75 = np.percentile(fit_hist, 75, axis=1)
+            f_max = fit_hist.max(axis=1)
+            n_panels = 2 + (1 if proxy_traj is not None else 0)
+            fig, axes = plt.subplots(n_panels, 1,
+                                     figsize=(12, 4 * n_panels), sharex=True)
+            if n_panels == 1:
+                axes = [axes]
+            ax = axes[0]
+            ax.fill_between(steps, f_min, f_max, alpha=0.15,
+                            color="C0", label="min..max")
+            ax.fill_between(steps, f_p25, f_p75, alpha=0.30,
+                            color="C0", label="p25..p75")
+            ax.plot(steps, f_med, color="C0", lw=1.5, label="median")
+            ax.plot(steps, f_min, color="C2", lw=1.0, label="min (best)")
+            ax.set_yscale("log")
+            ax.set_ylabel("fitness (loss)")
+            ax.set_title(f"{args.bench}: per-step fitness across K={args.K} seeds")
+            ax.legend(loc="upper right", fontsize=8)
+            ax.grid(True, alpha=0.3)
+            if ov_hist is not None and len(ov_hist) > 0:
+                ax2 = axes[1]
+                o_min = ov_hist.min(axis=1)
+                o_med = np.median(ov_hist, axis=1)
+                o_max = ov_hist.max(axis=1)
+                ax2.fill_between(steps, o_min, o_max, alpha=0.20,
+                                 color="C3", label="min..max")
+                ax2.plot(steps, o_med, color="C3", lw=1.2, label="median")
+                ax2.plot(steps, o_min, color="C2", lw=1.0, label="min")
+                ax2.set_yscale("symlog")
+                ax2.set_ylabel("overlap area")
+                ax2.legend(loc="upper right", fontsize=8)
+                ax2.grid(True, alpha=0.3)
+            if proxy_traj is not None:
+                ax3 = axes[-1]
+                ps = proxy_traj["steps"]
+                P = proxy_traj["proxy_K"]
+                ovK = proxy_traj["overlap_K"]
+                p_min = np.nanmin(P, axis=1)
+                p_p25 = np.nanpercentile(P, 25, axis=1)
+                p_med = np.nanmedian(P, axis=1)
+                p_p75 = np.nanpercentile(P, 75, axis=1)
+                p_max = np.nanmax(P, axis=1)
+                p_min_valid = np.full(P.shape[0], np.nan, dtype=np.float32)
+                for i in range(P.shape[0]):
+                    valid_in_row = (ovK[i] == 0)
+                    if valid_in_row.any():
+                        p_min_valid[i] = float(P[i][valid_in_row].min())
+                ax3.fill_between(ps, p_min, p_max, alpha=0.15,
+                                 color="C4", label="all K min..max")
+                ax3.fill_between(ps, p_p25, p_p75, alpha=0.30,
+                                 color="C4", label="p25..p75")
+                ax3.plot(ps, p_med, color="C4", lw=1.5, label="median")
+                ax3.plot(ps, p_min, color="#cc6677", lw=1.0,
+                         label="min (any seed, may be invalid)")
+                if np.isfinite(p_min_valid).any():
+                    ax3.plot(ps, p_min_valid, color="#117733", lw=1.5,
+                             marker="o", ms=3,
+                             label="min VALID (overlap=0)")
+                ax3.set_ylabel("proxy_cost (raw, no legalize)")
+                ax3.set_xlabel("step")
+                ax3.legend(loc="upper right", fontsize=8)
+                ax3.grid(True, alpha=0.3)
+                ax3.set_title("proxy_cost across all K seeds (raw, no legalize)")
+            else:
+                axes[-1].set_xlabel("step")
+            fig.tight_layout()
+            fig.savefig(plot_path, dpi=110)
+            plt.close(fig)
+            print(f"[gpu_run_one] evolution plot -> {plot_path}", flush=True)
+        except Exception as e:
+            print(f"[gpu_run_one] plot skipped: {e}", flush=True)
+        hist_path = REPO_ROOT / "results" / f"gpu_history_{args.bench}.npz"
+        hist_path.parent.mkdir(parents=True, exist_ok=True)
+        npz_payload = {"fitness": fit_hist.astype(np.float32)}
+        if ov_hist is not None:
+            npz_payload["overlap_area"] = ov_hist.astype(np.float32)
+        if proxy_traj is not None:
+            npz_payload["proxy_traj_steps"] = proxy_traj["steps"]
+            npz_payload["proxy_traj_K"] = proxy_traj["proxy_K"]
+            npz_payload["proxy_traj_overlap"] = proxy_traj["overlap_K"]
+        np.savez_compressed(hist_path, **npz_payload)
+        print(f"[gpu_run_one] history -> {hist_path} "
+              f"({hist_path.stat().st_size / 1e6:.1f} MB)", flush=True)
+
     # Save distribution stats JSON for offline config comparison
     if stats_dict is not None:
         import json
@@ -356,35 +524,36 @@ def main():
     )
 
     if snapshots_pos is not None and len(snapshots_step) > 0:
-        traj = snapshots_pos[:, best_idx, :, :]   # [num_snap, n_total, 2]
-        # Compute proxy for each snapshot — это медленно (sequential
-        # compute_proxy_cost) для 250 frames, но даёт точную метрику. Можем
-        # ускорить если нужно.
+        # Subsample frames for HTML viz (proxy compute is slow, ~2s per call).
+        viz_max_frames = int(os.environ.get("STRAPLE_HTML_VIZ_FRAMES", "30"))
+        n_snap_total = len(snapshots_step)
+        sub_idx = (np.linspace(0, n_snap_total - 1,
+                               min(n_snap_total, viz_max_frames))
+                   .astype(int))
+        traj = snapshots_pos[sub_idx, best_idx, :, :]   # [num_frames, n_total, 2]
+        sub_steps = [int(snapshots_step[i]) for i in sub_idx]
         from macro_place.objective import compute_proxy_cost
         full_template = benchmark.macro_positions.clone()
         proxies = []
         labels = []
         t_proxy = time.time()
-        for i, step_n in enumerate(snapshots_step):
+        for i, step_n in enumerate(sub_steps):
             full = full_template.clone()
             full[:traj[i].shape[0]] = torch.tensor(traj[i], dtype=torch.float32)
             c = compute_proxy_cost(full, benchmark, plc)
             proxies.append(float(c["proxy_cost"]))
             labels.append(f"step={step_n}")
-            if (i + 1) % 50 == 0:
-                print(f"[gpu_run_one] proxy snapshots {i+1}/{len(snapshots_step)}",
-                      flush=True)
-        # Final legalized
         full_f = torch.tensor(best_pos_full, dtype=torch.float32)
         cf = compute_proxy_cost(full_f, benchmark, plc)
         proxies.append(float(cf["proxy_cost"]))
         labels.append(f"FINAL legalized k={best_idx} proxy={best_proxy:.4f}")
-        print(f"[gpu_run_one] proxy compute: {time.time()-t_proxy:.1f}s",
+        print(f"[gpu_run_one] proxy compute (HTML, "
+              f"{len(sub_steps)} frames): {time.time()-t_proxy:.1f}s",
               flush=True)
 
         t_render = time.time()
         render_simple_html(
-            str(vis_path), benchmark, traj, snapshots_step,
+            str(vis_path), benchmark, traj, sub_steps,
             cluster_id, proxies, labels,
             final_pos=best_pos_full,
             final_proxy=best_proxy,
