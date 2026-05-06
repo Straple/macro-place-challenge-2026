@@ -379,10 +379,16 @@ class StraplePlacer:
         probe_safety_gb = float(os.environ.get(
             "STRAPLE_BATCH_VRAM_SAFETY_GB", "1.5"))
         # Final fill fraction: how close to total VRAM the real run is
-        # allowed to push.  0.92 leaves ~8 % for transient jitter (cuFFT
-        # plan reallocation, allocator fragmentation).
+        # allowed to push.  0.80 leaves ~20 % margin to cover the gap
+        # between a short probe and the long real run (phase transitions,
+        # lambda ramp, FFT plan re-allocation, allocator fragmentation).
         fill_frac = float(os.environ.get(
-            "STRAPLE_BATCH_VRAM_FILL_FRAC", "0.92"))
+            "STRAPLE_BATCH_VRAM_FILL_FRAC", "0.80"))
+        # Probe runs a small fixed number of gradient steps; 4 is enough
+        # to allocate the Adam optimizer state buffers and one full
+        # forward+backward+step+clamp pass, which dominates peak memory.
+        probe_steps = int(os.environ.get(
+            "STRAPLE_BATCH_PROBE_STEPS", "4"))
         K_align = int(os.environ.get("STRAPLE_BATCH_K_ALIGN", "32"))
 
         def _round_K(K_raw, fits_pred):
@@ -547,7 +553,7 @@ class StraplePlacer:
                 t_attempt = _time.time()
                 try:
                     pp, ps = gradient_batch(
-                        benchmark, plc, K=K_try, num_steps=2,
+                        benchmark, plc, K=K_try, num_steps=probe_steps,
                         time_budget=0.0,
                         proxy_pkgs=None,
                         verbose=False,
@@ -773,7 +779,7 @@ class StraplePlacer:
         offsets_p = padded_probe[1].to(dev)
         mask_p = padded_probe[2].to(dev)
         t_proxy = _time.time()
-        proxy_K_eval, _comp = gpu_proxy_batched(
+        proxy_K_eval, comp_eval = gpu_proxy_batched(
             pos_full_K, sizes_t, macro_idx_p, offsets_p, mask_p,
             canvas_w, canvas_h, grid_rows, grid_cols,
             macro_idx_p.shape[0],
@@ -806,6 +812,47 @@ class StraplePlacer:
         best_k = int(cand_idx_after[best_slot])
         self._log(f"[{bench_label}] BEST proxy={best_proxy:.4f} "
                   f"(legalized seed k={best_k})")
+
+        # ---- Optional save of final placement for offline debugging ----
+        save_path = os.environ.get("STRAPLE_BATCH_SAVE_FINAL_PATH", "")
+        if save_path:
+            try:
+                import numpy as _np
+                final_np = pos_full_K[best_slot].cpu().numpy()
+                _np.savez(save_path, pos=final_np,
+                           bench=str(benchmark.name),
+                           best_proxy_gpu=float(proxy_K_eval[best_slot].item()))
+                self._log(f"[{bench_label}] saved final → {save_path}")
+            except Exception as e:
+                self._log(f"[{bench_label}] save failed: {e}")
+
+        # ---- CPU verification of GPU proxy (env-gated debug) ----
+        if os.environ.get("STRAPLE_BATCH_VERIFY_CPU", "0") == "1":
+            try:
+                from macro_place.objective import compute_proxy_cost
+                full_check = pos_full_K[best_slot].cpu()
+                cpu_cost = compute_proxy_cost(full_check, benchmark, plc)
+                gpu_p = float(proxy_K_eval[best_slot].item())
+                # Pull GPU per-component for the same slot.
+                wl_g = float(comp_eval["wl"][best_slot].item()) \
+                    if "wl" in comp_eval else float("nan")
+                den_g = float(comp_eval["density"][best_slot].item()) \
+                    if "density" in comp_eval else float("nan")
+                cong_g = float(comp_eval["congestion"][best_slot].item()) \
+                    if "congestion" in comp_eval else float("nan")
+                self._log(
+                    f"[{bench_label}] VERIFY:\n"
+                    f"  wl   GPU={wl_g:.6f}  CPU={cpu_cost['wirelength_cost']:.6f}  "
+                    f"diff={wl_g - cpu_cost['wirelength_cost']:+.6f}\n"
+                    f"  den  GPU={den_g:.6f}  CPU={cpu_cost['density_cost']:.6f}  "
+                    f"diff={den_g - cpu_cost['density_cost']:+.6f}\n"
+                    f"  cong GPU={cong_g:.6f}  CPU={cpu_cost['congestion_cost']:.6f}  "
+                    f"diff={cong_g - cpu_cost['congestion_cost']:+.6f}\n"
+                    f"  PROXY GPU={gpu_p:.6f}  CPU={cpu_cost['proxy_cost']:.6f}  "
+                    f"diff={gpu_p - cpu_cost['proxy_cost']:+.6f} "
+                    f"({100*(gpu_p - cpu_cost['proxy_cost'])/cpu_cost['proxy_cost']:+.2f}%)")
+            except Exception as e:
+                self._log(f"[{bench_label}] verify failed: {e}")
 
         # ---- Optional evolution plot (env-gated) ----
         if os.environ.get("STRAPLE_BATCH_PLOT", "0") == "1":

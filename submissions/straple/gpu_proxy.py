@@ -882,6 +882,10 @@ def gpu_congestion_google(
     return cong_K, {
         "V_total": V_total,
         "H_total": H_total,
+        "V_net_smoothed": V_smoothed,
+        "H_net_smoothed": H_smoothed,
+        "V_macro": V_macro,
+        "H_macro": H_macro,
     }
 
 
