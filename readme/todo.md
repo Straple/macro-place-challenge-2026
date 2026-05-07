@@ -846,3 +846,50 @@ Variance ~±0.02 между runs (cohesion=5 даёт 0.9453 ↔ 0.9667).
 - Не запускать без `--no-vis` если нужны long runs (HTML render медленный)
 - Не пытаться anchor_loss + cohesion одновременно (конфликтуют)
 
+---
+
+## 13. Идеи на пост-submission: graph-guided gradient
+
+После того как ясно вошли ли в Tier 1 top-7 — ML улучшения placement guidance.
+
+### A. GNN-residual on top of gradient (наивысший ROI, 1-2 дня)
+GNN на netlist hypergraph (macros = nodes, nets = hyperedges).
+- Inputs per node: current pos, size, cluster id; per-edge: net membership.
+- Output: Δpos per macro.
+
+```
+pos_next = pos + lr · grad_loss + α · GNN(pos, netlist)
+```
+α — learned gating параметр.
+
+Training: на исторических placements собрать пары `(pos_t, displacement_to_best_seed)`.
+"Best seed" = best K placement в соседних gradient runs.  Supervised learning.
+
+**Эффект:** plateau escape без random teleports, basin selection из
+глобальной netlist structure.
+
+### B. Learned hyperparameter scheduler (RL / contextual bandits)
+Сейчас γ, λ_d, overlap_w расписаны вручную (linear per-phase).
+Маленький MLP на state {wl, dpen, ovrlp, step, n_total} → predicts
+оптимальные multipliers per step.  PPO или contextual bandit (UCB).
+
+**Эффект:** адаптация под bench (ibm01 vs ibm18 хотят разный schedule).
+Простая модель, низкий риск.
+
+### C. Generative placement (diffusion / flow matching) — амбициозно
+Conditional diffusion model на netlist graph: reverse process от random
+pos к "хорошим" pos.  Target distribution = наши best gradient
+placements.
+
+**Эффект:** может найти fundamentally better basins, недоступные
+gradient'у.  Длительная разработка (3+ недели).
+
+### Подводные камни
+- **Overfit на training distribution** — на hidden NG45 designs может ухудшить.
+  Generalization IBM ICCAD04 → NG45 (разные технологии, размеры) —
+  отдельный challenge.
+- **Brittleness** — ML brittle на out-of-distribution; pure gradient robust.
+- **Dev time** — serious GNN pipeline = 1-2 недели, diffusion = 3+.
+- **Inference cost** — GNN forward в gradient loop добавит 1-2 ms/step,
+  на K=480 budget 3000s это <0.1% времени.
+

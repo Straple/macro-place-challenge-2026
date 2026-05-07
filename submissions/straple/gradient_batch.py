@@ -229,20 +229,55 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
     else:
         sigma_per_macro = np.full(n_active, canvas_min * spawn_radius_frac)
 
-    pos_init = np.zeros((K, n_active, 2), dtype=np.float32)
-    for k in range(K):
-        anchor_pos_k = anchors_K[k][cluster_id_np]  # [n, 2]
-        noise_k = np.random.default_rng(seed + k * 1009).normal(
-            0.0, 1.0, size=(n_active, 2)) * sigma_per_macro[:, None]
-        pos_init[k] = anchor_pos_k + noise_k
+    init_method = os.environ.get("STRAPLE_BATCH_INIT", "louvain").lower()
     half_w_np = (sizes_t[:, 0] / 2.0).cpu().numpy()
     half_h_np = (sizes_t[:, 1] / 2.0).cpu().numpy()
+    fixed_idx_np = ~movable_np
+    fixed_pos_np = initial_pos_np
+
+    if init_method == "louvain":
+        pos_init = np.zeros((K, n_active, 2), dtype=np.float32)
+        for k in range(K):
+            anchor_pos_k = anchors_K[k][cluster_id_np]  # [n, 2]
+            noise_k = np.random.default_rng(seed + k * 1009).normal(
+                0.0, 1.0, size=(n_active, 2)) * sigma_per_macro[:, None]
+            pos_init[k] = anchor_pos_k + noise_k
+    else:
+        from init_strategies import (constructive_init, spectral_init,
+                                      hybrid_init, louvain_refined_init)
+        t_init = time.time()
+        if init_method == "spectral":
+            pos_init = spectral_init(benchmark, plc=plc, K=K, seed=seed)
+        elif init_method == "constructive":
+            pos_init = constructive_init(benchmark, plc=plc, K=K, seed=seed)
+        elif init_method == "hybrid":
+            pos_init = hybrid_init(benchmark, plc=plc, K=K, seed=seed)
+        elif init_method == "louvain_refined":
+            pos_init = louvain_refined_init(
+                benchmark, plc=plc, K=K, seed=seed,
+                cluster_target=cluster_target,
+                spawn_radius_frac=spawn_radius_frac,
+                spawn_adaptive=spawn_adaptive,
+                anchor_jitter_frac=anchor_jitter_frac,
+            )
+        else:
+            raise ValueError(
+                f"unknown STRAPLE_BATCH_INIT={init_method!r}, "
+                f"expected one of: louvain, constructive, spectral, "
+                f"hybrid, louvain_refined")
+        if pos_init.shape != (K, n_active, 2):
+            raise RuntimeError(
+                f"init_strategy {init_method} returned shape {pos_init.shape}, "
+                f"expected ({K}, {n_active}, 2)")
+        pos_init = pos_init.astype(np.float32, copy=False)
+        if verbose:
+            print(f"[gradient_batch] init={init_method} built {pos_init.shape} "
+                  f"in {time.time()-t_init:.2f}s", flush=True)
+
     pos_init[..., 0] = np.clip(pos_init[..., 0],
                                half_w_np[None, :], canvas_w - half_w_np[None, :])
     pos_init[..., 1] = np.clip(pos_init[..., 1],
                                half_h_np[None, :], canvas_h - half_h_np[None, :])
-    fixed_idx_np = ~movable_np
-    fixed_pos_np = initial_pos_np
     pos_init[:, fixed_idx_np] = fixed_pos_np[None, fixed_idx_np]
 
     pos = torch.tensor(pos_init, dtype=torch.float32,
@@ -317,11 +352,15 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
         print(f"[gradient_batch] {num_nets} nets, max_pins={macro_idx_p.shape[1]} "
               f"({time.time()-t0:.2f}s)", flush=True)
 
-    # Sizes pairs for hard overlap
-    sizes_hard = sizes_t[:n_hard]
-    sizes_x_pair = (sizes_hard[:, 0:1] + sizes_hard[:, 0].unsqueeze(0)) * 0.5  # [nh, nh]
-    sizes_y_pair = (sizes_hard[:, 1:2] + sizes_hard[:, 1].unsqueeze(0)) * 0.5
-    eye_mask = (1.0 - torch.eye(n_hard, dtype=torch.float32, device=dev))      # [nh, nh]
+    overlap_include_soft = os.environ.get("STRAPLE_BATCH_OVERLAP_SOFT", "0") == "1"
+    n_pair = n_total if overlap_include_soft else n_hard
+    sizes_pair_set = sizes_t[:n_pair]
+    sizes_x_pair = (sizes_pair_set[:, 0:1] + sizes_pair_set[:, 0].unsqueeze(0)) * 0.5  # [n_pair, n_pair]
+    sizes_y_pair = (sizes_pair_set[:, 1:2] + sizes_pair_set[:, 1].unsqueeze(0)) * 0.5
+    eye_mask = (1.0 - torch.eye(n_pair, dtype=torch.float32, device=dev))      # [n_pair, n_pair]
+    if verbose and overlap_include_soft:
+        print(f"[gradient_batch] overlap pair-table extended to soft: "
+              f"n_pair={n_pair} (was n_hard={n_hard})", flush=True)
 
     # Density grid
     grid_rows = int(benchmark.grid_rows)
@@ -605,8 +644,8 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
         #                halo / dead zones around hard rects). Match MTK style.
         #   'rect_lin':  pure ovlap_area
         #   'gauss_overlap': gauss + 5×area (legacy, creates circular dead zones)
-        pos_hard = pos[:, :n_hard, :]   # [K, nh, 2]
-        diff_x = pos_hard[:, :, 0:1] - pos_hard[:, :, 0].unsqueeze(1)   # [K, nh, nh]
+        pos_hard = pos[:, :n_pair, :]   # [K, n_pair, 2]
+        diff_x = pos_hard[:, :, 0:1] - pos_hard[:, :, 0].unsqueeze(1)   # [K, n_pair, n_pair]
         diff_y = pos_hard[:, :, 1:2] - pos_hard[:, :, 1].unsqueeze(1)
         ovlap_x = torch.relu(sizes_x_pair[None, :, :] - torch.abs(diff_x))
         ovlap_y = torch.relu(sizes_y_pair[None, :, :] - torch.abs(diff_y))
@@ -680,7 +719,53 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
                     + anchor_loss_total
                     + cohesion_loss_total
                     + cong_weight * cong_total)
+        # Optional per-macro velocity scaling. Two flavours:
+        #   STRAPLE_BATCH_VELOCITY_SCALE   — boost ∝ |∂total_loss/∂pos|
+        #   STRAPLE_BATCH_VELOCITY_WL_SCALE — boost ∝ |∂WL/∂pos|  (this macro's
+        #         contribution specifically to WL, ignoring overlap/density)
+        # In both cases boost ∈ [VELOCITY_LO, VELOCITY_HI] relative to the
+        # per-K median, blended with 1.0 by the scale factor.
+        vel_scale = float(os.environ.get("STRAPLE_BATCH_VELOCITY_SCALE", "0"))
+        vel_wl_scale = float(os.environ.get("STRAPLE_BATCH_VELOCITY_WL_SCALE", "0"))
+        vel_lo = float(os.environ.get("STRAPLE_BATCH_VELOCITY_LO", "0.5"))
+        vel_hi = float(os.environ.get("STRAPLE_BATCH_VELOCITY_HI", "2.0"))
+        # Apply only inside selected phases: "all" (default), "phase1",
+        # "phase12". When multi_phase is off, "all" is always used.
+        vel_phase = os.environ.get("STRAPLE_BATCH_VELOCITY_PHASE", "all").lower()
+        if not multi_phase or vel_phase == "all":
+            in_vel_phase = True
+        elif vel_phase == "phase1":
+            in_vel_phase = cur_phase == 1
+        elif vel_phase == "phase12":
+            in_vel_phase = cur_phase in (1, 2)
+        elif vel_phase == "phase23":
+            in_vel_phase = cur_phase in (2, 3)
+        elif vel_phase == "phase3":
+            in_vel_phase = cur_phase == 3
+        else:
+            in_vel_phase = True
+
+        wl_boost = None
+        if vel_wl_scale > 0 and in_vel_phase:
+            wl_grad, = torch.autograd.grad(wl_total, pos,
+                                            retain_graph=True,
+                                            create_graph=False)
+            wl_norm = wl_grad.detach().norm(dim=-1, keepdim=True)
+            wl_norm_med = wl_norm.median(dim=1, keepdim=True).values
+            wl_ratio = (wl_norm / wl_norm_med.clamp_min(1e-9)).clamp(vel_lo, vel_hi)
+            wl_boost = (1.0 - vel_wl_scale) + vel_wl_scale * wl_ratio
+
         loss.backward()
+
+        if wl_boost is not None and pos.grad is not None:
+            pos.grad.mul_(wl_boost)
+        if vel_scale > 0 and in_vel_phase and pos.grad is not None:
+            g = pos.grad.detach()
+            g_norm = g.norm(dim=-1, keepdim=True)
+            g_norm_med = g_norm.median(dim=1, keepdim=True).values
+            ratio = (g_norm / g_norm_med.clamp_min(1e-9)).clamp(vel_lo, vel_hi)
+            boost = (1.0 - vel_scale) + vel_scale * ratio
+            pos.grad.mul_(boost)
         # Optional gradient clipping for stability
         grad_clip = float(os.environ.get("STRAPLE_BATCH_GRAD_CLIP", "0"))
         if grad_clip > 0:
@@ -774,7 +859,7 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
             fitness_cpu = fitness_K.cpu().numpy().astype(np.float32)
             fitness_history.append(fitness_cpu)
             # Pair-wise overlap area per K (raw geometry — independent of weight).
-            pos_hard_now = pos[:, :n_hard, :].detach()
+            pos_hard_now = pos[:, :n_pair, :].detach()
             dx_now = pos_hard_now[:, :, 0:1] - pos_hard_now[:, :, 0].unsqueeze(1)
             dy_now = pos_hard_now[:, :, 1:2] - pos_hard_now[:, :, 1].unsqueeze(1)
             ox = torch.relu(sizes_x_pair[None, :, :] - torch.abs(dx_now))
@@ -902,7 +987,7 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
 
     # Final overlap_K computation (clean, after step loop)
     with torch.no_grad():
-        pos_hard = pos[:, :n_hard, :]
+        pos_hard = pos[:, :n_pair, :]
         diff_x = pos_hard[:, :, 0:1] - pos_hard[:, :, 0].unsqueeze(1)
         diff_y = pos_hard[:, :, 1:2] - pos_hard[:, :, 1].unsqueeze(1)
         ovlap_x = torch.relu(sizes_x_pair[None, :, :] - torch.abs(diff_x))

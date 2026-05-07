@@ -478,6 +478,7 @@ class StraplePlacer:
         os.environ.setdefault("STRAPLE_BATCH_COHESION_END", "0.001")
         os.environ.setdefault("STRAPLE_BATCH_DIVERSITY", "1")
         os.environ.setdefault("STRAPLE_BATCH_OVERLAP_FORM", "rect_quad")
+        os.environ.setdefault("STRAPLE_BATCH_OVERLAP_SOFT", "1")
         # Plateau-detect + per-seed crossover OFF by default for submission —
         # plain gradient with multi-start diversity has been more reliable.
         # Re-enable with STRAPLE_BATCH_PLATEAU_OPS=1.
@@ -817,6 +818,27 @@ class StraplePlacer:
         best_k = int(cand_idx_after[best_slot])
         self._log(f"[{bench_label}] BEST proxy={best_proxy:.4f} "
                   f"(legalized seed k={best_k})")
+
+        valid_np = ~invalid_mask.cpu().numpy()
+        n_valid = int(valid_np.sum())
+        if n_valid > 0:
+            def _qstats(name: str, arr: np.ndarray) -> str:
+                v = arr[valid_np]
+                qs = np.quantile(v, [0.0, 0.25, 0.5, 0.75, 1.0])
+                return (f"{name:>5}: min={qs[0]:.4f} p25={qs[1]:.4f} "
+                        f"p50={qs[2]:.4f} p75={qs[3]:.4f} max={qs[4]:.4f} "
+                        f"mean={float(v.mean()):.4f} std={float(v.std()):.4f}")
+            wl_np = comp_eval["wl"].cpu().numpy() if "wl" in comp_eval else None
+            den_np = comp_eval["density"].cpu().numpy() if "density" in comp_eval else None
+            cong_np = comp_eval["congestion"].cpu().numpy() if "congestion" in comp_eval else None
+            self._log(f"[{bench_label}] DIST over {n_valid}/{Nc} valid legalized seeds:")
+            self._log(f"[{bench_label}]   {_qstats('proxy', proxy_np)}")
+            if wl_np is not None:
+                self._log(f"[{bench_label}]   {_qstats('wl', wl_np)}")
+            if den_np is not None:
+                self._log(f"[{bench_label}]   {_qstats('dens', den_np)}")
+            if cong_np is not None:
+                self._log(f"[{bench_label}]   {_qstats('cong', cong_np)}")
 
         # ---- Optional save of final placement for offline debugging ----
         save_path = os.environ.get("STRAPLE_BATCH_SAVE_FINAL_PATH", "")

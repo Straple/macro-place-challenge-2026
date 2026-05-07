@@ -1,221 +1,165 @@
-# Промпт для следующей сессии — автономный цикл улучшений
+# Идеи улучшения текущего pipeline
 
-> **Контекст**: Partcl/HRT Macro Placement Challenge 2026, команда **Straple**, дедлайн **21 мая 2026**.
-> Я (пользователь) сплю. Этот цикл должен работать **бесконечно сам**, без моего участия.
-> Перед началом прочитай: [INDEX.md](INDEX.md), [todo.md](todo.md), [results.md](results.md), [PROBLEM.md](PROBLEM.md).
+> Анализ от 2026-05-07 после прочтения всех проектных .md.
+> Контекст: submitted ALNS AVG17=1.4445 (~16 место), pure-gradient GPU best ibm01=0.9453 (vs MTK 0.91, gap +3.9%).
+> Цель — пробить топ-7 (AVG17 ≤ 1.3479) для квалификации на Гран-при.
 
-## Текущая точка
+---
 
-| | Значение |
-|---|---|
-| Best AVG (наш) | **1.5181** |
-| RePlAce baseline (порог отсечки) | 1.4578 — нужно пробить -4.0% |
-| Топ-10 leaderboard | 1.4076 |
-| Топ-7 (Гран-при $20K) | 1.3479 |
-| Лимит | 1 час на бенчмарк, 16 cores + 100GB + RTX 6000 Ada GPU (на eval-машине) |
-| Наш runtime | 17.66с на --all (запас ~1700×) |
-| Цель сессии | **бесконечно итерировать улучшения**, всё фиксировать, ничего не терять |
+## 1. Что мы учитываем — и насколько правильно
 
-Архитектура — pure C++ placer:
-- `submissions/straple/placer.py` — тонкая Python обёртка
-- `submissions/straple/cpp/placer_core.cpp` — legalize + SA + LNS destroy/repair
-- `submissions/straple/cpp/proxy_cost.cpp` — exact replica `plc.compute_proxy_cost` (WL/density/congestion)
-- Сборка: `submissions/straple/cpp/build.sh`
-- Тесты: `uv run pytest test/test_smoke.py -v` → 9/9 PASS
+### Учитываем корректно
 
-## Главное правило
+- **Smooth HPWL через LSE по пинам** с cooling γ — стандарт DREAMPlace, эта часть в порядке.
+- **ePlace FFT density** (Poisson на grid 128) — правильная electrostatic-аналогия, лучше bell-curve.
+- **Overlap penalty `rect_quad` только между hard pairs** — корректно (soft могут пересекаться).
+- **Cluster cohesion с dynamic centroid** + β decay 5→0.001 — даёт structural prior без жёсткого anchor-loss (с которым он конфликтовал).
+- **Multi-start K=384 + per-K diversity** + parallel C++ legalize всех 384 — хорошая инфраструктура.
 
-**Цикл бесконечный**. Никогда не останавливайся, пока не упрёшься в **critical**:
-- build падает не из-за моих изменений (системная поломка)
-- evaluator (`macro_place/`) сам по себе падает
-- диск/память кончились
+### Учитываем слабо или неправильно
 
-**НЕ останавливайся** на:
-- noise-регрессии (ухудшение в пределах шума — это нормальная информация)
-- провал smoke tests или overlap → **разбираться и чинить**, а не пропускать. Идея не может «не работать» — она либо даёт хороший скор, либо плохой; **build/correctness баги — мои, нужно фиксить пока не пройдёт**
-- N подряд провальных идей — продолжай
-- достижение целевого AVG — продолжай (всегда есть куда улучшать до Cezar 1.2224)
+**Congestion surrogate vs TILOS reality.** Самое уязвимое место. У нас «smooth net-bbox demand → top-10% mean». TILOS считает совсем иначе:
+- 2-pin nets: **L-shape routing** (одно колено), а не bbox
+- 3-pin: Steiner-like
+- N>3: bbox decomposition
+- **Macro blockage** — hard макросы съедают routing tracks в своей области
+- **Smoothing kernel** (5×5 Gaussian-like) перед top-k
+- **Top-5%**, а не top-10%
+- Раздельные H/V capacities через `hroutes_per_micron` / `vroutes_per_micron`
 
-## Цикл (один проход)
+В readme прямо написано: «эксперимент с congestion-aware loss не сходился». Скорее всего, потому что наш surrogate далёк от TILOS-метрики, и оптимизатор тянет в локальный минимум surrogate'а, который ортогонален истине. Confidence: 8/10. **Это объясняет основной gap до MTK.**
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│  1) ИДЕЯ-АГЕНТ                                               │
-│     ───  proposes one concrete improvement                  │
-│     ───  включая источник (paper / leaderboard / своё)      │
-│     ───  prompt: "Предложи одну improvement-идею..."         │
-│     ───  output: structured описание (см. шаблон ниже)       │
-│                                                              │
-│  2) КОДЕР-АГЕНТ                                              │
-│     ───  implements the idea                                 │
-│     ───  prompt: "Вот идея X. Реализуй в C++/Python..."     │
-│     ───  pass: список изменённых файлов + summary            │
-│                                                              │
-│  3) BUILD + SMOKE-TEST GATE (ты, главный агент)              │
-│     ───  bash submissions/straple/cpp/build.sh               │
-│     ───  uv run pytest test/test_smoke.py -v                 │
-│     ───  если падает: ЧИНИТЬ (новый coder-agent с context     │
-│              предыдущей попытки + failure log) до 9/9 PASS    │
-│              + 0 build errors. Не пропускать!                 │
-│                                                              │
-│  4) РЕВЬЮИР-АГЕНТ                                            │
-│     ───  reviews diff, ищет: hardcode под benchmark,         │
-│              корректность алгоритма, baked-in магические числа,│
-│              утечки памяти, off-by-one, race conditions       │
-│     ───  prompt: "Проверь diff submissions/straple/..."     │
-│     ───  если NACK с обоснованием: новый coder-итерация       │
-│     ───  если ACK: дальше                                    │
-│                                                              │
-│  5) FAST-CHECK на 4 представительных бенчах (параллельно)     │
-│     ───  $HOME/.local/bin/uv run python                      │
-│              scripts/fast_check.py                            │
-│     ───  4 бенча (ibm01/ibm10/ibm14/ibm17) в 4 fork-worker'ах│
-│              по 1 ядру каждый. Wall ~100с (vs --all = 360с)  │
-│     ───  записать AVG4, per-bench numbers, time              │
-│     ───  ТРИ раза для noise floor; медиана = отчётный AVG4   │
-│     ───  --all НЕ запускать ВООБЩЕ — слишком медленно        │
-│                                                              │
-│  6) ЛОГ в results.md                                         │
-│     ───  append-only, новая секция в существующий файл       │
-│     ───  по шаблону "#N · YYYY-MM-DD · variant_name"         │
-│     ───  включая что менялось, что сработало, что не         │
-│     ───  AVG4 как основной показатель (НЕ AVG17)             │
-│                                                              │
-│  7) COMMIT                                                   │
-│     ───  все попытки коммитим, даже регрессии                │
-│     ───  историю коммитов НЕ переписывать (rebase запрещён)  │
-│     ───  message: "<идея краткое>: AVG4 X.XXXX (Δ ±X.X%)"    │
-│     ───  локальный коммит, push не делать                    │
-│                                                              │
-│  8) ВЕРНУТЬСЯ К 1                                            │
-└─────────────────────────────────────────────────────────────┘
-```
+**Density: ePlace FFT vs top-10%.** ePlace минимизирует total electrostatic potential. TILOS считает **top-10% densest cells**. Это разные функционалы — наш меньше штрафует «равномерно плохое» распределение, чем TILOS. Hybrid (ePlace для spreading + soft-top-k для refinement) может дать выигрыш.
 
-## Конкретика по агентам (Agent tool)
+**Net weights.** Нужно проверить, попадает ли `benchmark.net_weights` в `build_wl_pkg_full` и в congestion surrogate. Если все nets с весом 1.0 — теряем сигнал, что критические net'ы важнее.
 
-| Агент | subagent_type | prompt skeleton |
+**Pin offsets.** В TILOS `pin_pos = macro_center + pin_offset`. Если в нашем smooth WL мы считаем `macro_center` без offset (что грубее), HPWL-bbox systematically отличается. Особенно для крупных макросов с пинами по краям — это десятки μm разницы.
+
+**Overlap penalty не учитывает congestion.** Overlap rect_quad одинаковый везде. Реально overlap в congested зоне «дороже», т.к. блокирует ещё и routing. Можно weighted: `overlap_w(cell) = base + α × congestion(cell)`.
+
+**Soft в density bell.** Все макросы (hard+soft) одинаково контрибьютят в density penalty. Но soft — абстракция кластеров стандартных ячеек, которые в реальности «разливаются». Возможно их надо weighted с меньшим charge или разнести в отдельный density grid.
+
+---
+
+## 2. Что не учитываем вообще
+
+| Что | Почему важно | Trade-off |
 |---|---|---|
-| Идея | `general-purpose` | "Предложи **одну** конкретную идею для улучшения macro-placer (текущий AVG 1.5181, цель 1.4578). Источник: paper/leaderboard/своя гипотеза. Выход: hypothesis, expected_gain (±%), difficulty (1-5), implementation_steps (high level), files_to_modify. Не дублируй уже-отвергнутые идеи (см. [results.md](readme/results.md))." |
-| Кодер | `general-purpose` | "Реализуй идею: <описание>. Контекст: pure C++ placer, см. submissions/straple/. Изменения только в submissions/straple/. После — bash submissions/straple/cpp/build.sh. Не модифицируй macro_place/." |
-| Ревьюир | `general-purpose` | "Сделай code review diff: <git diff submissions/straple/>. Ищи: hardcoding под имя бенчмарка (DQ-риск), некорректность алгоритма, off-by-one, утечки памяти, гонки, плохой стиль. Verdict: ACK или NACK с конкретными issues." |
+| **Klein-4 orientations** (N/FN/FS/S) | Sidecar `orientations.pt` опционален; +1-3% на ORFS pin-access. На Tier 1 влияет через pin offset → HPWL/congestion. | Дешёвый эксперимент: после legalize попробовать 4 ориентации каждого hard, оставить лучшую. |
+| **Boundary affinity** | Макросы с большим количеством IO-пинов лучше у краёв canvas. | Loss term `Σ pin_io_count_i × distance_to_nearest_boundary(macro_i)`. |
+| **Net criticality** | High-weight net'ы должны быть короче. | Просто умножить slot в smooth WL на `net_weight`. |
+| **Adaptive overflow-based schedule** (DREAMPlace 4.0) | У нас линейный λ growth. У DRP — `coef = 10^((overflow - stop_overflow) × β)`. Это и есть «smoothly steer out of local traps» из MTK-комментария. | Заменить `LAMBDA_GROWTH` на overflow-driven update. |
+| **PDN ≥12 μm clearance** | На Tier 2 evaluator раздвигает за нас, но это меняет proxy. Лучше сразу резервировать. | Пост-обработка: после legalize iteratively push apart до 12 μm. |
+| **Symmetry constraints** | Парные SRAM banks часто лучше зеркально. | Detection через name regex и size matching. |
+| **Macro blockage в congestion** | Hard macro = 0 routing capacity внутри. Наш surrogate этого не видит. | `routing_capacity[cell] -= sum(macro_area_in_cell)`. |
+| **Pin-aware HPWL** | См. п.1. | Поправка `pin_pos = center + pin_offset` в LSE. |
 
-Запускать **последовательно** (не параллельно — иначе смешаются изменения файлов). После каждого — анализировать результат и решать дальше.
+---
 
-## Constraints
+## 3. Научные статьи и что из них взять
 
-- **CPU**: использовать **только 4 ядра**. В `OMP_NUM_THREADS=4` env, в C++ коде — `omp_set_num_threads(4)` или std::thread с пулом 4. Это потому что Mac пользователю нужен ночью.
-- **Память**: не выходить за 8GB на процесс.
-- **Все попытки коммитим** в текущую ветку (`main` или текущую). Историю не переписывать (`git rebase`, `git reset --hard` на чужие коммиты — запрещено). Можно `git revert` для откатов, но обычно просто следующая идея.
-- **Noise**: ухудшение в пределах ±0.5% — это OK, всё равно коммитим как информация.
-- **Build/correctness баги**: чинить циклом coder→build→test пока 9/9 PASS. Если 5 итераций не помогли — спросить idea-агента "что не так с этой идеей", и попробовать другой подход к этой же идее. Никогда не «забивать».
-- **Язык**: всё на **русском** (комментарии в `results.md`, commit messages, общение с агентами). Code identifiers — английские (как сейчас).
+### Прямые апгрейды gradient pipeline (высокий ROI)
 
-## Шаблон записи в results.md
+**AutoDMP (Agnesina et al., NVIDIA, ISPD 2023)** — https://github.com/NVlabs/AutoDMP
+Bayesian multi-objective optimization над hyperparams DREAMPlace. Pareto front (WL, density, congestion) из ~30 точек. На leaderboard это #7 «Archgen» = 1.3479. Применимо к нам напрямую: запустить MOBO над нашими `STRAPLE_BATCH_*` env vars (target_util, gamma_frac, lambda_max, cong_w, cohesion_start). Confidence: 9/10, expected gain: 2-5% AVG17.
 
-После каждого валидного бенчмарка добавить новую секцию по шаблону внизу [results.md](results.md):
+**Spindler & Johannes (DAC 2007) "Fast and Accurate Routing Demand Estimation"** — RUDY metric.
+RUDY = `Σ_nets (bbox_perimeter / bbox_area) × indicator(cell ∈ bbox)`. Коррелирует с реальной congestion лучше bbox demand, дифференцируема через smooth indicator. Это **прямая замена** нашему `cong_w` term'у. Confidence: 8/10.
 
-```markdown
-### #N · YYYY-MM-DD HH:MM · `submissions/straple/placer.py` (variant_name)
+**Lin et al. "DREAMPlace 4.0" (TCAD 2021)** — adaptive subgradient ascent для density_weight. Псевдокод доступен. Скорее всего, MTK ровно это и использует (его коммент про «smoothly steer out of local traps» — буквальная цитата DREAMPlace overflow algorithm). Confidence: 9/10.
 
-**Идея**: <краткое описание>
-**Источник**: <paper / leaderboard team / собственная гипотеза>
-**Изменения**: <список файлов + 1-2 предложения сути>
+**Chu & Wong "FLUTE" (TCAD 2008)** — fast lookup-table Steiner trees. Для нетов с >2 пинами FLUTE даёт **истинную Steiner length**, а HPWL — overestimate на 10-20%. Использовать FLUTE как target в loss даст более точное направление gradient'а. Однако FLUTE недифференцируема — можно использовать как **importance weight per net**: `w_net *= flute_length / hpwl_estimate`. Confidence: 6/10.
 
-**Сводка** (медиана из 3 fast_check запусков на ibm01/10/14/17):
-- AVG4 proxy: X.XXXX (Δ от прошлого best AVG4=1.4839: ±X.XX%)
-- Best: X.XXXX на ibmXX
-- Worst: X.XXXX на ibmXX
-- Wall time: X.Xs (parallel, 4 workers)
-- Overlaps: 0
-- vs RePlAce (на тех же 4 бенчах, AVG=1.4197): ±X.X%
+### Better init / structural constraints
 
-**Что сработало**: ...
-**Что не сработало**: ...
-**Per-benchmark детали**: <таблица из 4 бенчей>
+**Hu & Marek-Sadowska "FastPlace" (ISPD 2005)** — quadratic placement: solve `Lx = b` где L — Laplacian netlist. Даёт WL-optimal placement без overlap-aware фазы за O(N) через CG. Один K seed из spectral init = бесплатная WL-baseline.
 
-**Команда**: `uv run python scripts/fast_check.py`
-**Commit**: <SHA>
-```
+**Karypis et al. "hMETIS" (DAC 1999)** — multi-level hypergraph partitioning. Лучше Louvain для placement, потому что Louvain на clique expansion теряет hypergraph структуру. На больших benches (n>2000) разница заметна.
 
-> **Зачем 4 бенча, а не 17?** Один прогон --all = ~6 минут wall-time, fast_check на 4 параллельных = ~100с. За одно «время на --all» успеваем сделать 3.6× итераций. ibm01/10/14/17 покрывают small/medium/large/largest и ibm10 — единственный mid-bench где Straple обходит RePlAce, любая регрессия там сразу видна.
+**Boyd et al. "Optimal Transport for placement"** — Hungarian / Sinkhorn для matching clusters to anchor positions (вместо random grid). Минимизирует inter-cluster WL bottom-up. Confidence: 7/10.
 
-## Источники идей (что искать)
+### Better congestion (наш самый слабый компонент)
 
-### A. Performance / параллелизм (с учётом OMP_NUM_THREADS=4)
-- OpenMP в inner SA loop (multi-walker SA)
-- OpenMP в congestion smoothing (per-row independence)
-- SIMD overlap check (AVX2/NEON)
-- **Incremental proxy_cost** — после destroy k macros пересчитывать только затронутые grid cells. Может дать ещё 10× для inner LNS.
-- CUDA для density/congestion — только если C++ исчерпан
+**Pan et al. "GeniusRoute" (ICCAD 2019)** — neural net предсказывает routing congestion из placement features. **Идея**: train small CNN/GNN на `(placement, true_TILOS_congestion)` парах из наших K=384 runs, использовать как differentiable surrogate в loss. По сути learned drop-in replacement нашего `cong_w` term'а. Дорого по dev time, но потенциально mid-game changer. Confidence: 6/10.
 
-### B. Алгоритмы (по ROI)
-- Multi-start с N=3-5 сидов, лучший по proxy
-- Proxy-aware SA — каждые 50 SA-ходов делать proxy_cost call
-- ALNS / Thompson Sampling для destroy operators
-- Свой analytical placer (gradient на smooth surrogate) — прототип в `submissions/straple/analytical_seed.py`
-- Min-cut bisection через recursive partitioning
-- Force-directed initial seed
+**Cheng et al. "RePlAce" (TCAD 2018)** — bivariate density penalty + Nesterov. Их Nesterov формулировка с правильной step size — отдельная статья, не «просто Nesterov». В readme мы пробовали Nesterov с lr=0.3 → catastrophic. Стоит попробовать с **их** rule: `lr_k = 1 / L_k` где L — backtracking Lipschitz estimate.
 
-### C. Congestion (66% cost)
-- Congestion-aware destroy (top-5% routing-busy cells)
-- Routing-aware repair
-- Net clustering для размещения связанных макросов рядом
+### ML approaches (long-term, after submission)
 
-### D. Density (40% cost)
-- Bell-curve density penalty в SA вместо overlap-check
-- Spread move в SA (двигать N соседей вместе)
+**DG-RePlAce / Wireplanner** — GNN добавляет residual displacement к gradient: `pos_next = pos + lr·grad + α·GNN(pos, netlist)`. Train на парах `(pos_t, displacement_to_best_seed)`. Plateau escape без random teleports. В readme есть секция 13 с этой идеей.
 
-### E. ML / data-driven (Tier 1 публичный — все 17 IBM открыты)
-- Per-bench feature analysis (без hardcode под имя)
-- GNN/RL обучение, leave-one-out CV
+**Mirhoseini et al. (Google Nature 2021)** + Cheng et al. re-evaluation (CACM 2023). RL не воспроизводится, но идея «agent предлагает destroy operator» в LNS — рабочая (как TAISPlAce с Thompson Sampling).
 
-### F. LNS budget
-- **Time-budget LNS**: 300с на бенчмарк (вместо 30 фикс. итераций). Адаптивно: маленькие 60с, средние 180с, большие 300с. На --all это ~85 минут — внутри 1-часового лимита на каждый.
-- ⚠ Если такой тяжёлый LNS использовать в fast_check — wall на ibm17 будет ~300с (≈5 мин). Тогда сократить fast_check до 60с/bench, или скоринг на --all отдельным редким батчем.
+---
 
-## Запрещено
+## 4. Идеи, которых нет в плане
 
-- Hardcode под имя бенчмарка (`if benchmark.name == "ibmXX"`) — DQ
-- Модифицировать `macro_place/` — это evaluator
-- `git push` — только локальные коммиты
-- `git rebase`, `git reset --hard` на чужие коммиты — историю не трогаем
-- Скипать build/test failures — только чинить
-- Параллельно запускать coder и reviewer (CPU contention) — только последовательно
+### Quick wins (день каждая)
 
-## Команды (cheat sheet)
+1. **Top-k smooth density вместо ePlace-only**: `density_loss = soft_topk(cell_density, k=top_10pct)`. Прямо матчит TILOS. Hybrid с ePlace: `λ_eplace × eplace + λ_topk × topk`.
 
-```bash
-# Build C++
-bash submissions/straple/cpp/build.sh
+2. **L-shape routing surrogate** для 2-pin nets. Для каждого 2-pin net: вместо bbox считаем sum demand вдоль L-shape (right-then-up или up-then-right, soft choose через sigmoid). Больших N-pin нетов мало, mostly это и нужно.
 
-# Smoke tests (9/9 must pass)
-$HOME/.local/bin/uv run pytest test/test_smoke.py -v
+3. **Macro-as-blockage в congestion**: `cell_capacity[c] -= overlap_area(macro, c) × routes_per_micron`. Differentiable через smooth overlap.
 
-# Fast-check: 4 представительных бенча параллельно (ibm01/10/14/17)
-# Wall ~100с, в 3.6× быстрее --all. Это основной отчётный гон.
-$HOME/.local/bin/uv run python scripts/fast_check.py
+4. **Net-weight propagation**: проверить и пробросить `benchmark.net_weights` во все loss terms. Если сейчас все 1.0 — это бесплатный сигнал.
 
-# Кастомный fast_check: другие бенчи или другой placer
-$HOME/.local/bin/uv run python scripts/fast_check.py submissions/will_seed/placer.py
-$HOME/.local/bin/uv run python scripts/fast_check.py --benches ibm01 ibm17
+5. **Pin offsets в smooth WL**: `pin_pos = pos[macro_id] + pin_offset` вместо `pos[macro_id]`. Просто переписать `_build_net_pin_tensors_full`.
 
-# Single benchmark (для debug)
-$HOME/.local/bin/uv run evaluate submissions/straple/placer.py -b ibm01
+### Mid (2-4 дня)
 
-# !!! НЕ ИСПОЛЬЗОВАТЬ в цикле — слишком медленно (~6 мин wall):
-# $HOME/.local/bin/uv run evaluate submissions/straple/placer.py --all
+6. **AutoDMP-style MOBO** над нашими env vars. Готовый Ax/BoTorch + 30-50 trials = expected -2-4% AVG17.
 
-# Git: посмотреть последний коммит
-git log -1 --stat
+7. **Overflow-based λ schedule** (DREAMPlace 4.0). Простая замена growth: `coef = 10^((overflow - 0.07) × 2.2)`, `λ *= max(min(coef, 2.0), 0.5)`.
 
-# Git: откатить последний коммит файлов (не самой истории)
-git revert HEAD --no-edit
-```
+8. **Hybrid spectral+constructive init** (это есть в `improve.md` старой версии как промпт для агента — не реализовано). 1/4 K = spectral, 1/4 K = constructive Boltzmann, 1/2 K = current Louvain. Diverse basins без потери качества.
 
-## Известные проблемы
+9. **Joint hard+soft с weighted density**: soft в density grid с весом 0.3-0.5 (потому что они спокойно overlap). Может вернуть density penalty в правильную область.
 
-- **bounds-violations в существующем placer**: на ibm10/ibm14/ibm17 (вероятно и других больших) макросы вылетают за canvas. Это pre-existing баг — `evaluate.py` его маскирует (печатает "VALID" только по overlaps==0, игнорирует out-of-bounds). На leaderboard оценщики могут это поймать → DQ-риск. Чинить отдельной задачей. fast_check печатает WARN но не fail-exit (чтобы не блокировать цикл).
+10. **Orientation flip optimizer**: после legalize — для каждого hard попробовать 4 Klein-4 ориентации, выбрать с минимальным local HPWL (только смежные net'ы пересчитывать). O(n_hard × 4 × avg_net_recompute), очень дёшево.
 
-## Цикл начинается СЕЙЧАС
+### Структурно более амбициозное
 
-Первый шаг: спавни **idea-агента** с brief'ом из этого файла. Дальше по схеме. Лог в [results.md](results.md), коммиты в текущую ветку. Удачи.
+11. **Replace ePlace + cong_w + cohesion одним trained surrogate**: small NN `(macro_positions, sizes, netlist_features) → proxy_cost`. Train на `(K=384 placements, true_TILOS_proxy)` парах. Уже сейчас имеем тысячи таких пар из runs. Дифференцируемый, точно матчит TILOS.
+
+12. **Real DREAMPlace integration через subprocess** (план C). 1.5-2 дня работы, потенциал — топ-10 проверен (UT Austin AS = plain DREAMPlace = 1.4076). С нашим LNS polish сверху может дать топ-7.
+
+---
+
+## 5. Гипотезы про gap MTK 0.91 vs наш 0.95 на ibm01
+
+В убывающей confidence:
+
+1. **Adaptive overflow-based schedule** (то самое «smoothly steer out» MTK-комментария). Confidence: 8/10. Дешёвый эксперимент.
+2. **Pin-aware HPWL + net weights** правильно проброшены. Confidence: 7/10.
+3. **Better congestion model** (RUDY или L-shape). Confidence: 6/10.
+4. **Boundary affinity** для IO-rich макросов. Confidence: 5/10.
+5. **Orientation flips после legalize**. Confidence: 5/10.
+
+Если набрать 2-3 из этого, gap до MTK закрывается. Confidence overall: 7/10.
+
+---
+
+## 6. Что не делать (антипаттерны)
+
+- **Не пытаться писать свой DREAMPlace с нуля** — месяцы работы. Бери готовый.
+- **Не оптимизировать pure-gradient на ibm01 до бесконечности** — variance ±0.02 уже больше шага улучшений. Перейти к ablation на ibm14/17 для генерализации.
+- **Не игнорировать verify в чистом env** — все top-3 кейса DQ (Mike Gao, BakaBobo, vmallela) случились из-за silent fail на eval-машине.
+- **Не делать ансамбль gradient + ALNS как «basin escape»** — в readme явно отмечено что hybrid даёт basin trap (попадание в basin gradient'а из которого ALNS не может выйти).
+
+---
+
+## 7. Рекомендация в порядке приоритета
+
+| # | Идея | Effort | Expected gain |
+|---|---|---|---|
+| 1 | Pin offsets + net weights проверка/фикс в smooth WL | 0.5 дня | 1-3% |
+| 2 | DREAMPlace 4.0 overflow schedule для λ_d / γ | 1 день | 2-4% |
+| 3 | Top-k smooth density поверх ePlace | 1 день | 1-2% |
+| 4 | RUDY congestion вместо bbox demand | 2 дня | 2-4% |
+| 5 | AutoDMP-style MOBO sweep | 2-3 дня | 2-5% |
+| 6 | Orientation flip optimizer post-legalize | 1 день | 1-2% |
+| 7 | Hybrid spectral+constructive+Louvain init | 2 дня | 1-3% |
+| 8 | Real DREAMPlace integration | 3-5 дней | 5-10% |
+
+Сумма потенциалов перекрывает gap до топ-7 (≤1.3479) с большим запасом, но они не аддитивны (часть перекрывается). Realistic: 5-8% выигрыша если сделать пп.1-5.
