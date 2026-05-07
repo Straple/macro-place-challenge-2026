@@ -26,8 +26,8 @@
 #   clean      — rm -rf .remote_runs/ на сервере
 #
 # Env vars (с дефолтами):
-#   REMOTE_USER=root
-#   REMOTE_HOST=89.169.164.17
+#   REMOTE_USER=evyukhnevich
+#   REMOTE_HOST=111.88.159.190
 #   REMOTE_DIR=macro-place
 #   SSH_OPTS=""
 #   STRAPLE_*    — все пробрасываются на сервер для подкоманд eval/gpu/sweep
@@ -35,8 +35,8 @@
 
 set -euo pipefail
 
-REMOTE_USER="${REMOTE_USER:-root}"
-REMOTE_HOST="${REMOTE_HOST:-89.169.164.17}"
+REMOTE_USER="${REMOTE_USER:-evyukhnevich}"
+REMOTE_HOST="${REMOTE_HOST:-111.88.159.190}"
 REMOTE_DIR="${REMOTE_DIR:-macro-place}"
 SSH_KEEPALIVE_OPTS="-o ServerAliveInterval=10 -o ServerAliveCountMax=6 -o TCPKeepAlive=yes -o StrictHostKeyChecking=accept-new"
 SSH_OPTS="${SSH_KEEPALIVE_OPTS} ${SSH_OPTS:-}"

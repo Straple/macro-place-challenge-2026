@@ -358,6 +358,82 @@ def main():
                     dtype=torch.float32)
             best_pos_full = full_b.cpu().numpy()
 
+    best_orientations = [0] * n_hard
+
+    orient_flip_enable = os.environ.get("STRAPLE_BATCH_ORIENT_FLIP", "0") == "1"
+    if orient_flip_enable and valid_mask.any() and best_pos_full is not None:
+        orient_topn = int(os.environ.get("STRAPLE_BATCH_ORIENT_TOPN", "16"))
+        orient_rounds = int(os.environ.get("STRAPLE_BATCH_ORIENT_ROUNDS", "2"))
+
+        sys.path.insert(0, str(REPO_ROOT / "submissions" / "straple"))
+        from orient_flip import (orient_flip_optimize,
+                                 apply_orientations_to_plc,
+                                 reset_orientations_to_n)
+
+        valid_idx = np.where(valid_mask)[0]
+        sorted_idx = valid_idx[np.argsort(all_proxies[valid_idx])]
+        cands = [int(k) for k in sorted_idx[:orient_topn]]
+        print(f"[gpu_run_one] orient_flip on top-{len(cands)} valid seeds "
+              f"(rounds={orient_rounds})...", flush=True)
+        t_orient = time.time()
+        improved = 0
+        best_oriented_proxy = best_proxy
+        best_oriented_k = -1
+        best_oriented_orient = None
+        best_oriented_hard = None
+        best_oriented_soft = None
+        for k in cands:
+            hard_pos_k = pos_K_legalized[k, :n_hard].astype(np.float64)
+            if pos_K.shape[1] > n_hard:
+                soft_pos_k = pos_K[k, n_hard:n_hard + n_soft].astype(np.float64)
+            else:
+                soft_pos_k = None
+            orientations, _ = orient_flip_optimize(
+                benchmark, hard_pos_k, soft_pos=soft_pos_k,
+                rounds=orient_rounds, verbose=False,
+            )
+            n_changed = sum(1 for o in orientations if o != 0)
+            if n_changed == 0:
+                continue
+            apply_orientations_to_plc(plc, benchmark, orientations)
+            full_k = full_template.clone()
+            full_k[:n_hard] = torch.tensor(hard_pos_k, dtype=torch.float32)
+            if soft_pos_k is not None:
+                full_k[n_hard:n_hard + n_soft] = torch.tensor(
+                    soft_pos_k, dtype=torch.float32)
+            c_k = compute_proxy_cost(full_k, benchmark, plc)
+            reset_orientations_to_n(plc, benchmark)
+            new_proxy = float(c_k["proxy_cost"])
+            new_overlap = int(c_k["overlap_count"])
+            if new_overlap == 0 and new_proxy < all_proxies[k] - 1e-6:
+                improved += 1
+                if new_proxy < best_oriented_proxy - 1e-6:
+                    best_oriented_proxy = new_proxy
+                    best_oriented_k = k
+                    best_oriented_orient = list(orientations)
+                    best_oriented_hard = hard_pos_k.copy()
+                    best_oriented_soft = (soft_pos_k.copy()
+                                           if soft_pos_k is not None else None)
+        print(f"[gpu_run_one] orient_flip: {improved}/{len(cands)} improved, "
+              f"{time.time()-t_orient:.1f}s", flush=True)
+        if best_oriented_k >= 0:
+            print(f"[gpu_run_one] orient_flip beat best: "
+                  f"{best_oriented_proxy:.4f} < {best_proxy:.4f} "
+                  f"(k={best_oriented_k})", flush=True)
+            best_proxy = best_oriented_proxy
+            best_idx = best_oriented_k
+            best_orientations = best_oriented_orient
+            full_b = full_template.clone()
+            full_b[:n_hard] = torch.tensor(best_oriented_hard,
+                                            dtype=torch.float32)
+            if best_oriented_soft is not None:
+                full_b[n_hard:n_hard + n_soft] = torch.tensor(
+                    best_oriented_soft, dtype=torch.float32)
+            best_pos_full = full_b.cpu().numpy()
+            apply_orientations_to_plc(plc, benchmark, best_orientations)
+        else:
+            reset_orientations_to_n(plc, benchmark)
+
     grid_path = REPO_ROOT / "results" / f"gpu_pos_K_{args.bench}.npz"
     np.savez_compressed(
         grid_path,
@@ -365,6 +441,7 @@ def main():
         proxies=all_proxies,
         overlaps=all_overlaps,
         best_idx=np.array([best_idx], dtype=np.int32),
+        best_orientations=np.array(best_orientations, dtype=np.int8),
     )
     print(f"[gpu_run_one] saved legalized pos_K to {grid_path} "
           f"({grid_path.stat().st_size / 1e6:.1f} MB)", flush=True)
@@ -537,6 +614,7 @@ def main():
                 "stats": stats_dict,
                 "config": cfg,
                 "best_idx": int(best_idx),
+                "best_orientations": [int(o) for o in best_orientations],
             }, f, indent=2)
         print(f"[gpu_run_one] stats saved to {stats_path}", flush=True)
 
@@ -576,12 +654,22 @@ def main():
         proxies = []
         labels = []
         t_proxy = time.time()
+        # Intermediate snapshots are from gradient_batch which uses orientation N.
+        # Make sure plc is in N state for these proxy calls. The final frame uses
+        # the chosen best_orientations and is re-applied below.
+        if any(o != 0 for o in best_orientations):
+            sys.path.insert(0, str(REPO_ROOT / "submissions" / "straple"))
+            from orient_flip import (apply_orientations_to_plc,
+                                     reset_orientations_to_n)
+            reset_orientations_to_n(plc, benchmark)
         for i, step_n in enumerate(sub_steps):
             full = full_template.clone()
             full[:traj[i].shape[0]] = torch.tensor(traj[i], dtype=torch.float32)
             c = compute_proxy_cost(full, benchmark, plc)
             proxies.append(float(c["proxy_cost"]))
             labels.append(f"step={step_n}")
+        if any(o != 0 for o in best_orientations):
+            apply_orientations_to_plc(plc, benchmark, best_orientations)
         full_f = torch.tensor(best_pos_full, dtype=torch.float32)
         cf = compute_proxy_cost(full_f, benchmark, plc)
         proxies.append(float(cf["proxy_cost"]))

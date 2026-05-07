@@ -416,6 +416,46 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
     density_weight = lambda_start
     cur_overlap_w = overlap_weight
 
+    topk_density_weight = float(os.environ.get(
+        "STRAPLE_BATCH_TOPK_W", "0"))
+    topk_density_pct = float(os.environ.get(
+        "STRAPLE_BATCH_TOPK_PCT", "0.10"))
+    if topk_density_weight > 0 and verbose:
+        print(f"[gradient_batch] top-k density penalty ON: "
+              f"w={topk_density_weight} pct={topk_density_pct}", flush=True)
+
+    rudy_enable = os.environ.get("STRAPLE_BATCH_RUDY", "0") == "1"
+    canvas_area_scaler = float(os.environ.get(
+        "STRAPLE_BATCH_RUDY_SCALE", "20"))
+    if rudy_enable and verbose:
+        print(f"[gradient_batch] RUDY congestion ON "
+              f"(scaler={canvas_area_scaler})", flush=True)
+    blockage_weight = float(os.environ.get(
+        "STRAPLE_BATCH_BLOCKAGE_W", "0"))
+    if blockage_weight > 0 and verbose:
+        print(f"[gradient_batch] hard-macro blockage ON "
+              f"(w={blockage_weight})", flush=True)
+
+    overflow_lambda_enable = os.environ.get(
+        "STRAPLE_BATCH_OVERFLOW_LAMBDA", "0") == "1"
+    overflow_target = float(os.environ.get(
+        "STRAPLE_BATCH_OVERFLOW_TARGET", "0.07"))
+    overflow_exponent = float(os.environ.get(
+        "STRAPLE_BATCH_OVERFLOW_EXP", "2.2"))
+    overflow_warmup_frac = float(os.environ.get(
+        "STRAPLE_BATCH_OVERFLOW_WARMUP", "0.10"))
+    overflow_coef_lo = float(os.environ.get(
+        "STRAPLE_BATCH_OVERFLOW_COEF_LO", "0.5"))
+    overflow_coef_hi = float(os.environ.get(
+        "STRAPLE_BATCH_OVERFLOW_COEF_HI", "2.0"))
+    total_macro_area_scalar = float(macro_areas.sum().item())
+    if overflow_lambda_enable and verbose:
+        print(f"[gradient_batch] DRP-style overflow lambda update ON: "
+              f"target={overflow_target} exp={overflow_exponent} "
+              f"warmup={overflow_warmup_frac} "
+              f"coef_clip=[{overflow_coef_lo},{overflow_coef_hi}]",
+              flush=True)
+
     if verbose:
         print(f"[gradient_batch] starting {num_steps} iters...", flush=True)
     t_loop = time.time()
@@ -526,9 +566,12 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
                 overlap_mul = phase3_overlap_mul
                 cur_phase = 3
             gamma = gamma_base * gamma_mul
-            # Snap density_weight toward phase target via exp approach
-            density_weight = phase_lambda_target + (density_weight - phase_lambda_target) * 0.95
-            density_weight = max(0.001, min(density_weight, lambda_max))
+            # Snap density_weight toward phase target unless overflow-driven
+            # update is active (in that case density_weight grows from
+            # lambda_start adaptively based on per-step overflow).
+            if not overflow_lambda_enable:
+                density_weight = phase_lambda_target + (density_weight - phase_lambda_target) * 0.95
+                density_weight = max(0.001, min(density_weight, lambda_max))
             cur_overlap_w_phase = cur_overlap_w * overlap_mul
         else:
             gamma_factor = gamma_start_factor + (gamma_end_factor - gamma_start_factor) * progress
@@ -567,26 +610,63 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
         # Congestion-aware loss: net bbox dimensions (max_x - min_x, max_y - min_y)
         # already computed above. Smooth indicator if cell is inside bbox -> sum
         # over all nets -> top-k cells. Larger bbox = more cells covered = more demand.
+        # If STRAPLE_BATCH_RUDY=1, weight each net's contribution by RUDY
+        # (perimeter / area) — Spindler & Johannes' wire-density estimate that
+        # correlates better with TILOS routing congestion than uniform bbox demand.
+        # Normalized by canvas area so cong_weight scale stays comparable.
         if cong_weight > 0:
-            # bbox per net per K: x_lo, x_hi [K, num_nets]
             x_hi = max_x   # [K, num_nets]
             x_lo = min_x
             y_hi = max_y
             y_lo = min_y
-            # Sigmoid indicator: cell c contributes to net n if x_lo <= cx <= x_hi (similar for y)
-            # in_x [K, num_nets, ncols] = sigmoid((x_hi - cx)/σ) * sigmoid((cx - x_lo)/σ)
             cx_e = grid_x[None, None, :]   # [1, 1, ncols]
             cy_e = grid_y[None, None, :]   # [1, 1, nrows]
             in_x = (torch.sigmoid((x_hi[..., None] - cx_e) / cong_smooth_sigma)
-                    * torch.sigmoid((cx_e - x_lo[..., None]) / cong_smooth_sigma))  # [K, num_nets, ncols]
+                    * torch.sigmoid((cx_e - x_lo[..., None]) / cong_smooth_sigma))
             in_y = (torch.sigmoid((y_hi[..., None] - cy_e) / cong_smooth_sigma)
-                    * torch.sigmoid((cy_e - y_lo[..., None]) / cong_smooth_sigma))  # [K, num_nets, nrows]
-            # cell_demand [K, nrows, ncols] = sum over nets in_y[K,n,r] * in_x[K,n,c]
-            cell_demand = torch.einsum("knr,knc->krc", in_y, in_x)
+                    * torch.sigmoid((cy_e - y_lo[..., None]) / cong_smooth_sigma))
+            if rudy_enable:
+                wx = (x_hi - x_lo).clamp_min(1e-6)
+                wy = (y_hi - y_lo).clamp_min(1e-6)
+                rudy_w_scaled = canvas_area_scaler * (wx + wy) / (wx * wy)
+                cell_demand = torch.einsum("kn,knr,knc->krc",
+                                            rudy_w_scaled, in_y, in_x)
+            else:
+                cell_demand = torch.einsum("knr,knc->krc", in_y, in_x)
+            if blockage_weight > 0:
+                # Hard macro blockage: each cell gets phantom congestion equal
+                # to fraction of its area occupied by hard macros (chunked over
+                # macros to bound memory).
+                blockage_grid = torch.zeros_like(cell_demand)
+                chunk_h = 32
+                cell_x_lo = grid_x - cell_w * 0.5
+                cell_x_hi = grid_x + cell_w * 0.5
+                cell_y_lo = grid_y - cell_h * 0.5
+                cell_y_hi = grid_y + cell_h * 0.5
+                for i0 in range(0, n_hard, chunk_h):
+                    i1 = min(i0 + chunk_h, n_hard)
+                    hpos_c = pos[:, i0:i1, :]
+                    hw_c = half_w[i0:i1]
+                    hh_c = half_h[i0:i1]
+                    mac_xl = hpos_c[:, :, 0:1] - hw_c[None, :, None]
+                    mac_xh = hpos_c[:, :, 0:1] + hw_c[None, :, None]
+                    mac_yl = hpos_c[:, :, 1:2] - hh_c[None, :, None]
+                    mac_yh = hpos_c[:, :, 1:2] + hh_c[None, :, None]
+                    ov_x_b = torch.relu(
+                        torch.minimum(mac_xh, cell_x_hi[None, None, :])
+                        - torch.maximum(mac_xl, cell_x_lo[None, None, :]))
+                    ov_y_b = torch.relu(
+                        torch.minimum(mac_yh, cell_y_hi[None, None, :])
+                        - torch.maximum(mac_yl, cell_y_lo[None, None, :]))
+                    blockage_grid = blockage_grid + (
+                        ov_y_b[:, :, :, None]
+                        * ov_x_b[:, :, None, :]).sum(dim=1)
+                cell_demand = cell_demand + (blockage_weight
+                                              * blockage_grid / cell_capacity)
             flat = cell_demand.reshape(K, -1)
             top_k = max(1, int(flat.shape[-1] * cong_top_pct))
             top_vals, _ = torch.topk(flat, top_k, dim=-1)
-            cong_K = top_vals.mean(dim=-1)   # [K]
+            cong_K = top_vals.mean(dim=-1)
             cong_total = cong_K.sum()
         else:
             cong_total = pos.new_zeros(())
@@ -604,6 +684,21 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
         cell_density = (macro_areas[None, :, None, None]
                         * norm_y[:, :, :, None]
                         * norm_x[:, :, None, :]).sum(dim=1)
+        # DRP-style normalized overflow proxy (per-K). Used for adaptive λ schedule.
+        # overflow = (sum over cells of max(0, density_frac - target_util)) * cell_area
+        # divided by total macro area. Cheap, no autograd path.
+        if overflow_lambda_enable:
+            with torch.no_grad():
+                excess_norm = (cell_density / cell_capacity
+                               - target_util_K_t).clamp_min(0.0)
+                overflow_K_proxy = (excess_norm.sum(dim=(1, 2)) * cell_capacity
+                                     / max(total_macro_area_scalar, 1e-9))
+
+        # Top-k smooth density penalty (TILOS-style: mean of top-N% densest cells).
+        # Postponed until after eplace branch — cell_density_ep is preferred
+        # when use_eplace_density=True to reuse its grad chain.
+        density_topk_K = pos.new_zeros(K)
+        density_topk_total = pos.new_zeros(())
         if use_eplace_density:
             # Hi-res ePlace density via chunked accumulation over n.
             # cell_density_ep [K, ep_n, ep_n] = Σ_i area_i * gauss_y(i) * gauss_x(i)
@@ -637,6 +732,25 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
             excess = (cell_density / cell_capacity - target_util_K_t).clamp_min(0.0)
             dpen_K = (excess * excess).sum(dim=(1, 2))   # [K]
             dpen_total = dpen_K.sum()
+
+        # Top-k smooth density penalty using ePlace high-res grid (preferred,
+        # already has grad chain) or low-res bell density. Indices selected
+        # without grad; gradient flows through gather only at selected cells.
+        if topk_density_weight > 0:
+            if use_eplace_density:
+                topk_src = cell_density_ep
+                topk_cap = ep_cell_capacity
+            else:
+                topk_src = cell_density
+                topk_cap = cell_capacity
+            flat_density = topk_src.reshape(K, -1)
+            top_k_n = max(1, int(flat_density.shape[-1] * topk_density_pct))
+            with torch.no_grad():
+                _, top_idx = torch.topk(flat_density.detach(),
+                                         top_k_n, dim=-1)
+            gathered = flat_density.gather(1, top_idx)
+            density_topk_K = gathered.mean(dim=-1) / topk_cap
+            density_topk_total = density_topk_K.sum()
 
         # Overlap (only between hard pairs, batched over K)
         # Form is configurable via STRAPLE_BATCH_OVERLAP_FORM env (default 'rect_quad'):
@@ -712,13 +826,15 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
                     + cur_overlap_w_phase * overlap_total
                     + anchor_loss_total
                     + cohesion_loss_total
-                    + cong_per_K.sum())
+                    + cong_per_K.sum()
+                    + topk_density_weight * density_topk_total)
         else:
             loss = (wl_total + density_weight * dpen_total
                     + cur_overlap_w_phase * overlap_total
                     + anchor_loss_total
                     + cohesion_loss_total
-                    + cong_weight * cong_total)
+                    + cong_weight * cong_total
+                    + topk_density_weight * density_topk_total)
         # Optional per-macro velocity scaling. Two flavours:
         #   STRAPLE_BATCH_VELOCITY_SCALE   — boost ∝ |∂total_loss/∂pos|
         #   STRAPLE_BATCH_VELOCITY_WL_SCALE — boost ∝ |∂WL/∂pos|  (this macro's
@@ -791,7 +907,17 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
 
             mean_dpen_per_K = float(dpen_K.mean().item())
             mean_ovlap_per_K = float(overlap_K.mean().item())
-        if not multi_phase:
+        mean_overflow_per_K = 0.0
+        if overflow_lambda_enable:
+            mean_overflow_per_K = float(overflow_K_proxy.mean().item())
+            if progress > overflow_warmup_frac:
+                coef = 10.0 ** ((mean_overflow_per_K - overflow_target)
+                                * overflow_exponent)
+                coef = max(overflow_coef_lo, min(coef, overflow_coef_hi))
+                density_weight = max(lambda_start * 0.5,
+                                      min(density_weight * coef, lambda_max))
+            cur_overlap_w = min(cur_overlap_w * overlap_w_growth, overlap_w_max)
+        elif not multi_phase:
             # Legacy path: smooth growth of lambda + overlap
             if mean_dpen_per_K > stop_overflow:
                 density_weight = min(density_weight * lambda_growth, lambda_max)
@@ -801,10 +927,12 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
 
         if verbose and (step + 1) % 100 == 0:
             phase_str = f"P{cur_phase}" if multi_phase else "linear"
+            extra = (f" ovf={mean_overflow_per_K:.3f}"
+                      if overflow_lambda_enable else "")
             print(f"[gradient_batch] step={step+1}/{num_steps} {phase_str} "
                   f"wl={float(wl_K.mean()):.3f} dpen={mean_dpen_per_K:.3f} "
                   f"ovrlp={mean_ovlap_per_K:.3f} γ={gamma:.3f} λ_d={density_weight:.2f} "
-                  f"λ_o={cur_overlap_w_phase:.1f}", flush=True)
+                  f"λ_o={cur_overlap_w_phase:.1f}{extra}", flush=True)
 
         # ----- Evolution operations: plateau escape + GA -----
         # Run after optimizer step + clamp. Track per-K loss for fitness/plateau.
