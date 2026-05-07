@@ -430,6 +430,23 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
     if rudy_enable and verbose:
         print(f"[gradient_batch] RUDY congestion ON "
               f"(scaler={canvas_area_scaler})", flush=True)
+
+    saddle_enable = os.environ.get("STRAPLE_BATCH_SADDLE", "0") == "1"
+    saddle_iters = int(os.environ.get("STRAPLE_BATCH_SADDLE_ITERS", "10"))
+    saddle_step_factor = float(os.environ.get(
+        "STRAPLE_BATCH_SADDLE_STEP", "0.05"))
+    saddle_threshold = float(os.environ.get(
+        "STRAPLE_BATCH_SADDLE_THRESHOLD", "-1e-6"))
+    saddle_eps_factor = float(os.environ.get(
+        "STRAPLE_BATCH_SADDLE_EPS", "1e-3"))
+    saddle_chunk = int(os.environ.get("STRAPLE_BATCH_SADDLE_CHUNK", "0"))
+    saddle_progress_min = float(os.environ.get(
+        "STRAPLE_BATCH_SADDLE_PROGRESS_MIN", "0.0"))
+    if saddle_enable and verbose:
+        print(f"[gradient_batch] Hessian saddle escape ON: "
+              f"iters={saddle_iters} step={saddle_step_factor} "
+              f"threshold={saddle_threshold} eps={saddle_eps_factor} "
+              f"chunk={saddle_chunk or 'full K'}", flush=True)
     blockage_weight = float(os.environ.get(
         "STRAPLE_BATCH_BLOCKAGE_W", "0"))
     if blockage_weight > 0 and verbose:
@@ -470,6 +487,8 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
     # Per-seed plateau detection: window of `patience` steps, fire if relative
     # spread (max-min) over window for that seed is below `eps · |median|`.
     plateau_ops_enable = os.environ.get("STRAPLE_BATCH_PLATEAU_OPS", "0") == "1"
+    if os.environ.get("STRAPLE_BATCH_SADDLE", "0") == "1":
+        plateau_ops_enable = True
     plateau_patience = int(os.environ.get("STRAPLE_BATCH_PLATEAU_PATIENCE", "30"))
     plateau_interval = int(os.environ.get("STRAPLE_BATCH_PLATEAU_INTERVAL", "20"))
     plateau_eps = float(os.environ.get("STRAPLE_BATCH_PLATEAU_EPS", "0.005"))
@@ -1036,7 +1055,135 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
                               f"rel_spread[min/med/max]="
                               f"{float(rel.min()):.4f}/{float(rel.median()):.4f}/"
                               f"{float(rel.max()):.4f}", flush=True)
-                    if n_plat > 0:
+                    if (n_plat > 0 and saddle_enable
+                            and progress >= saddle_progress_min):
+                        # Tier 0: Hessian saddle escape via FD Hessian-vector
+                        # product + power iteration on -H. Direction of largest
+                        # negative curvature (smallest eigenvalue of H).
+                        fd_eps = saddle_eps_factor * canvas_min
+                        step_amount = saddle_step_factor * canvas_min
+
+                        def _saddle_loss(pos_in):
+                            # Lightweight forward: WL + density + overlap.
+                            # cong/anchor/cohesion/topk/blockage dropped — they
+                            # are second-order on placement landscape and add
+                            # noise to Hessian estimate.
+                            pin_xy_l = (pos_in[:, macro_idx_p, :]
+                                         + offsets_p[None, ...])
+                            x_l = pin_xy_l[..., 0]
+                            y_l = pin_xy_l[..., 1]
+                            neg_inf_l = torch.finfo(pos_in.dtype).min
+                            x_max_l = torch.where(mask_p[None, :, :], x_l,
+                                                   x_l.new_full((), neg_inf_l))
+                            x_min_l = torch.where(mask_p[None, :, :], -x_l,
+                                                   x_l.new_full((), neg_inf_l))
+                            y_max_l = torch.where(mask_p[None, :, :], y_l,
+                                                   y_l.new_full((), neg_inf_l))
+                            y_min_l = torch.where(mask_p[None, :, :], -y_l,
+                                                   y_l.new_full((), neg_inf_l))
+                            gd = (gamma * gamma_K_t).view(K, 1, 1)
+                            gm = (gamma * gamma_K_t).view(K, 1)
+                            max_x_l = gm * torch.logsumexp(x_max_l / gd, dim=2)
+                            min_x_l = -gm * torch.logsumexp(x_min_l / gd, dim=2)
+                            max_y_l = gm * torch.logsumexp(y_max_l / gd, dim=2)
+                            min_y_l = -gm * torch.logsumexp(y_min_l / gd, dim=2)
+                            wl_K_l = ((max_x_l - min_x_l)
+                                       + (max_y_l - min_y_l)).sum(dim=1)
+                            dx_l = pos_in[..., 0:1] - grid_x[None, None, :]
+                            dy_l = pos_in[..., 1:2] - grid_y[None, None, :]
+                            bx_l = torch.exp(-(dx_l * dx_l)
+                                              / (2 * sigma_dx * sigma_dx))
+                            by_l = torch.exp(-(dy_l * dy_l)
+                                              / (2 * sigma_dy * sigma_dy))
+                            nx_l = bx_l / bx_l.sum(dim=2, keepdim=True).clamp_min(1e-12)
+                            ny_l = by_l / by_l.sum(dim=2, keepdim=True).clamp_min(1e-12)
+                            cd_l = (macro_areas[None, :, None, None]
+                                     * ny_l[:, :, :, None]
+                                     * nx_l[:, :, None, :]).sum(dim=1)
+                            ex_l = (cd_l / cell_capacity
+                                     - target_util_K_t).clamp_min(0.0)
+                            dpen_K_l = (ex_l * ex_l).sum(dim=(1, 2))
+                            ph_l = pos_in[:, :n_pair, :]
+                            diff_x_l = (ph_l[:, :, 0:1]
+                                         - ph_l[:, :, 0].unsqueeze(1))
+                            diff_y_l = (ph_l[:, :, 1:2]
+                                         - ph_l[:, :, 1].unsqueeze(1))
+                            ovx_l = torch.relu(sizes_x_pair[None, :, :]
+                                                - torch.abs(diff_x_l))
+                            ovy_l = torch.relu(sizes_y_pair[None, :, :]
+                                                - torch.abs(diff_y_l))
+                            ova_l = ovx_l * ovy_l * eye_mask[None, :, :]
+                            ov_K_l = (ova_l * ova_l).sum(dim=(1, 2)) * 0.5
+                            return (wl_K_l + density_weight * dpen_K_l
+                                     + cur_overlap_w_phase * ov_K_l)
+
+                        def _hvp_fd(pos_data, v_in):
+                            pos_p = (pos_data + fd_eps * v_in).detach().requires_grad_(True)
+                            loss_p = _saddle_loss(pos_p)
+                            grad_p = torch.autograd.grad(loss_p.sum(), pos_p)[0]
+                            pos_m = (pos_data - fd_eps * v_in).detach().requires_grad_(True)
+                            loss_m = _saddle_loss(pos_m)
+                            grad_m = torch.autograd.grad(loss_m.sum(), pos_m)[0]
+                            return (grad_p - grad_m) / (2 * fd_eps)
+
+                        with torch.enable_grad():
+                            # Shifted power iteration: largest eig of (σI - H)
+                            # corresponds to smallest eig of H. σ chosen above
+                            # the spectrum from a probe HVP. Naive `-H v`
+                            # converges to LARGEST |eig| direction, not smallest.
+                            v = torch.randn_like(pos.data)
+                            v = v / v.flatten(1).norm(dim=1).clamp_min(1e-9).view(K, 1, 1)
+                            Hv_probe = _hvp_fd(pos.data, v)
+                            probe_norm = Hv_probe.flatten(1).norm(dim=1).clamp_min(1.0)
+                            sigma_K = (2.0 * probe_norm).view(K, 1, 1)
+                            for _ in range(saddle_iters):
+                                Hv = _hvp_fd(pos.data, v)
+                                v_new = sigma_K * v - Hv  # (σI - H) v
+                                vn = v_new.flatten(1).norm(dim=1).clamp_min(1e-9)
+                                v = (v_new / vn.view(K, 1, 1)).detach()
+                            Hv_final = _hvp_fd(pos.data, v)
+                            eig_K = (v * Hv_final).flatten(1).sum(dim=1)
+
+                        # Apply step to ALL seeds with sufficiently negative
+                        # eig — drop plateau gate. Plateau ≠ saddle (a flat
+                        # plateau may sit at local minimum with positive eig);
+                        # negative eig is the right indicator regardless.
+                        saddle_mask_K = eig_K < saddle_threshold
+                        saddle_idx = torch.nonzero(saddle_mask_K, as_tuple=False).flatten()
+                        n_saddle = int(saddle_idx.numel())
+                        if n_saddle > 0:
+                            pos.data[saddle_idx] = (pos.data[saddle_idx]
+                                                     + step_amount * v[saddle_idx])
+                            pos.data[saddle_idx, :, 0] = torch.clamp(
+                                pos.data[saddle_idx, :, 0],
+                                half_w_t.unsqueeze(0).expand(n_saddle, -1),
+                                (canvas_w - half_w_t).unsqueeze(0).expand(n_saddle, -1))
+                            pos.data[saddle_idx, :, 1] = torch.clamp(
+                                pos.data[saddle_idx, :, 1],
+                                half_h_t.unsqueeze(0).expand(n_saddle, -1),
+                                (canvas_h - half_h_t).unsqueeze(0).expand(n_saddle, -1))
+                            if fixed_mask.any():
+                                fixed_block = (fixed_pos[fixed_mask][None, :, :]
+                                                .expand(n_saddle, -1, -1))
+                                tmp = pos.data[saddle_idx]
+                                tmp[:, fixed_mask, :] = fixed_block
+                                pos.data[saddle_idx] = tmp
+                            opt_state = optimizer.state.get(pos, {})
+                            if "exp_avg" in opt_state:
+                                opt_state["exp_avg"][saddle_idx] = 0
+                            if "exp_avg_sq" in opt_state:
+                                opt_state["exp_avg_sq"][saddle_idx] = 0
+                            loss_history[:, saddle_idx] = float("nan")
+                            plateau_evt_count += 1
+                            seeds_recombined_total += n_saddle
+                        if verbose:
+                            eig_min_v = float(eig_K.min())
+                            eig_med_v = float(eig_K.median())
+                            print(f"[gradient_batch] saddle escape "
+                                  f"@step={step+1}: plateau={n_plat}/{K} "
+                                  f"eig[min/med]={eig_min_v:.3e}/{eig_med_v:.3e} "
+                                  f"escaped={n_saddle}", flush=True)
+                    elif n_plat > 0:
                         n_elite = max(1, int(round(K * elite_pct)))
                         sorted_idx = torch.argsort(fitness_K)
                         elite_idx = sorted_idx[:n_elite]   # [n_elite]

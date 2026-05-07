@@ -662,17 +662,32 @@ def main():
             from orient_flip import (apply_orientations_to_plc,
                                      reset_orientations_to_n)
             reset_orientations_to_n(plc, benchmark)
+        wl_costs = []
+        density_costs = []
+        cong_costs = []
+        overlap_counts = []
+        overlap_areas = []
         for i, step_n in enumerate(sub_steps):
             full = full_template.clone()
             full[:traj[i].shape[0]] = torch.tensor(traj[i], dtype=torch.float32)
             c = compute_proxy_cost(full, benchmark, plc)
             proxies.append(float(c["proxy_cost"]))
+            wl_costs.append(float(c["wirelength_cost"]))
+            density_costs.append(float(c["density_cost"]))
+            cong_costs.append(float(c["congestion_cost"]))
+            overlap_counts.append(int(c["overlap_count"]))
+            overlap_areas.append(float(c["total_overlap_area"]))
             labels.append(f"step={step_n}")
         if any(o != 0 for o in best_orientations):
             apply_orientations_to_plc(plc, benchmark, best_orientations)
         full_f = torch.tensor(best_pos_full, dtype=torch.float32)
         cf = compute_proxy_cost(full_f, benchmark, plc)
         proxies.append(float(cf["proxy_cost"]))
+        wl_costs.append(float(cf["wirelength_cost"]))
+        density_costs.append(float(cf["density_cost"]))
+        cong_costs.append(float(cf["congestion_cost"]))
+        overlap_counts.append(int(cf["overlap_count"]))
+        overlap_areas.append(float(cf["total_overlap_area"]))
         labels.append(f"FINAL legalized k={best_idx} proxy={best_proxy:.4f}")
         print(f"[gpu_run_one] proxy compute (HTML, "
               f"{len(sub_steps)} frames): {time.time()-t_proxy:.1f}s",
@@ -685,6 +700,11 @@ def main():
             final_pos=best_pos_full,
             final_proxy=best_proxy,
             final_label=labels[-1],
+            wl_costs=wl_costs,
+            density_costs=density_costs,
+            cong_costs=cong_costs,
+            overlap_counts=overlap_counts,
+            overlap_areas=overlap_areas,
         )
         print(f"[gpu_run_one] HTML render: {time.time()-t_render:.1f}s",
               flush=True)

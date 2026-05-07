@@ -3,6 +3,63 @@
 > Анализ от 2026-05-07 после прочтения всех проектных .md.
 > Контекст: submitted ALNS AVG17=1.4445 (~16 место), pure-gradient GPU best ibm01=0.9453 (vs MTK 0.91, gap +3.9%).
 > Цель — пробить топ-7 (AVG17 ≤ 1.3479) для квалификации на Гран-при.
+>
+> **Update 2026-05-07 (после Tier 1+2+3):** ibm01 best 0.9128 (паритет с MTK 0.91), median 1.06 (-16% vs original).
+> Verified leader: **vmallela v7 = AVG17 1.0109** (wins all 17 benches), использует **Hessian negative-eigenvalue saddle escape**.
+> Это сдвигает Tier 0 — без saddle escape выше топ-3 не пройти.
+
+---
+
+## 0. Tier 0 (TOP PRIORITY) — Hessian saddle escape
+
+**Источник:** vmallela v7 leaderboard verification (AVG17=1.0109, beats all 17 benches verified). Сами слова: «Hessian negative-eigenvalue saddle escape (`vmallela_v7` branch). Previous Incremental CD+LNS verified 1.4152.»
+
+**Идея.** В non-convex high-dim landscape (наши 2280 dims = 1140 макросов × 2) **седловые точки доминируют над локальными минимумами** (~2^n соотношение). Стандартный gradient descent видит `∇L ≈ 0` и останавливается, но в седле есть направления отрицательной кривизны — туда можно ещё спуститься. Random teleport / shake (наш `STRAPLE_BATCH_PLATEAU_OPS`) угадывает направление наугад → часто заходит в худший basin или возвращается. **Hessian eigenvector = математически точный escape direction.**
+
+**Алгоритм (v7-style):**
+1. Detector: для каждого K seed track loss за last 30 шагов. Если `(max-min)/|median| < ε` И `‖∇L‖` маленький → подозрение на седло.
+2. Compute smallest eigenvalue λ_min Hessian'а через **Lanczos / power iteration on `-H`** (~15-20 HVPs).
+3. Если λ_min < `-threshold` → это седло; v_min = соответствующий eigenvector.
+4. Step `pos += step_size · v_min`, обнулить Adam moments для перетеленных pos.
+5. Continue gradient descent.
+
+**Compute primitives:**
+- HVP (Hessian-vector product) через PyTorch double-backward:
+  ```python
+  grads = torch.autograd.grad(loss, pos, create_graph=True)[0]
+  Hv = torch.autograd.grad((grads * v).sum(), pos)[0]
+  ```
+  Стоимость: ~3× обычного backward. Memory: ~2× (double-backward graph).
+- Lanczos / power iteration: ~15-20 HVPs на seed для smallest eig+vector.
+
+**Cost estimate (наш T4 K=384 budget=600s):**
+- Trigger каждые ~50-100 steps в P2/P3 only.
+- Только для seeds в плато (детектор) — типично 10-30% K в данный момент.
+- ~15 HVPs × 3× backward × 0.2 × K_in_plateau / total_steps ≈ 5-15% overhead.
+- Memory: chunked over K (по 64 seed за раз) чтобы вместить double-backward graph + ePlace + cong.
+
+**Главные риски:**
+1. **Memory OOM** на T4 16GB при K=384 + double-backward + ePlace 128 + cong. Решение — chunked compute.
+2. **Lanczos numerical instability** на indefinite Hessian. Решение — restart / shift trick / fall back to random direction.
+3. **Step size tuning** — too big разрушает layout, too small ничего не даёт. Tune через `STRAPLE_BATCH_SADDLE_STEP`.
+4. **Compute time** — 5-15% overhead = меньше gradient steps в budget. Если saddle escape даёт +0.5% на step → break-even при 3% overhead.
+
+**Confidence:** 9/10 что это работает (verified в leader's submission). 6/10 что мы аккуратно реализуем за 3-5 days — много sharp corners.
+
+**Плюс — какие седла мы реально встречаем:**
+- На ibm01 в P3 (settling) λ_d=2000, overlap уже почти 0, но WL не уменьшается → плато из-за «структурного баланса» between cluster (cohesion) и spreading (density). Это ровно седло — пара кластеров «зеркальны», push в любом направлении ломает баланс с одной стороны и улучшает с другой. Hessian eigenvector укажет именно нужный axis.
+
+**Stage план реализации:**
+| Stage | Что | Effort |
+|---|---|---|
+| 1 | Plateau detector (per-seed loss window) | 0.5 day |
+| 2 | HVP primitive + sanity test | 1 day |
+| 3 | Lanczos smallest-eig (single seed first, then batched) | 1.5 day |
+| 4 | Saddle step integration (only when eig < -threshold) | 0.5 day |
+| 5 | Memory tuning (chunked over K) + A/B test | 1 day |
+| 6 | Confirmed WIN + submission run | 0.5 day |
+
+Итого 5 days. Если работает — ожидаем -10 до -30% на ibm01 (сходимость к ~0.76 как у vmallela).
 
 ---
 
