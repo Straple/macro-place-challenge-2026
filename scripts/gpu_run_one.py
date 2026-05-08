@@ -456,7 +456,7 @@ def main():
     if cd_polish_enable and best_pos_full is not None:
         sys.path.insert(0, str(REPO_ROOT / "submissions" / "straple"))
         if cd_gpu_enable:
-            from cd_polish import cd_polish_gpu
+            from cd_polish import cd_polish_gpu, cd_polish_gpu_with_restart
             from gpu_proxy import (build_routing_edges_full,
                                     build_smooth_matrices,
                                     build_routing_consts,
@@ -480,8 +480,16 @@ def main():
                 "STRAPLE_BATCH_CD_GPU_APPROX", "0") == "1"
             cd_approx_threshold = float(os.environ.get(
                 "STRAPLE_BATCH_CD_GPU_APPROX_THRESHOLD", "1e-5"))
+            cd_approx_refresh = os.environ.get(
+                "STRAPLE_BATCH_CD_GPU_APPROX_REFRESH_PER_ACCEPT", "0") == "1"
             cd_top_n_seeds = int(os.environ.get(
                 "STRAPLE_BATCH_CD_GPU_TOP_N_SEEDS", "1"))
+            cd_restart_cycles = int(os.environ.get(
+                "STRAPLE_BATCH_CD_GPU_RESTART_CYCLES", "0"))
+            cd_jitter_frac = float(os.environ.get(
+                "STRAPLE_BATCH_CD_GPU_JITTER_FRAC", "0.2"))
+            cd_jitter_step = float(os.environ.get(
+                "STRAPLE_BATCH_CD_GPU_JITTER_STEP", "0.5"))
             sf_str = os.environ.get(
                 "STRAPLE_BATCH_CD_SF",
                 "0.5,0.25,0.125,0.0625,0.03125,0.015625")
@@ -550,6 +558,7 @@ def main():
                         proxy_chunk_n=cd_proxy_chunk_n,
                         approx_verify=cd_approx_verify,
                         approx_threshold=cd_approx_threshold,
+                        approx_refresh_per_accept=cd_approx_refresh,
                         verbose=True)
                     if polished_seed_proxy < best_polished_proxy - 1e-6:
                         best_polished_proxy = polished_seed_proxy
@@ -559,9 +568,12 @@ def main():
                 polished_pos = best_polished_pos
                 polished_proxy = best_polished_proxy
             else:
-                polished_pos, polished_proxy = cd_polish_gpu(
+                polished_pos, polished_proxy = cd_polish_gpu_with_restart(
                     benchmark, plc, best_pos_full,
                     proxy_pkgs=proxy_pkgs_cd,
+                    restart_cycles=cd_restart_cycles,
+                    jitter_frac=cd_jitter_frac,
+                    jitter_step=cd_jitter_step,
                     rounds=cd_rounds, step_factors=cd_sf,
                     n_directions=cd_dirs, topk_verify=cd_topk,
                     macro_chunk=cd_macro_chunk,
@@ -569,6 +581,7 @@ def main():
                     proxy_chunk_n=cd_proxy_chunk_n,
                     approx_verify=cd_approx_verify,
                     approx_threshold=cd_approx_threshold,
+                    approx_refresh_per_accept=cd_approx_refresh,
                     verbose=True)
             cd_dt = time.time() - t_cd
         else:

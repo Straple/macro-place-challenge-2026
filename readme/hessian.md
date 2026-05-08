@@ -404,6 +404,24 @@ scp evyukhnevich@103.76.52.240:macro-place/.remote_runs/stats_ROUND_NAME.json /t
   3. **Multi-seed top-N=20+** в Round 4 paradigm (no per-accept refresh).
   4. **Implement pair-swap CD** (path D, orthogonal).
 
+#### Round 9 — top-20 CD (без per-accept refresh) — KILLED — 2026-05-08
+- **Hypothesis:** при single-batch top-20 chances больше что один seed имеет lucky pre-CD как Round 4. Effort cheap (default config + N=20).
+- **Run config:** `STRAPLE_BATCH_CD_GPU_TOP_N_SEEDS=20`. ROUNDS=8 DIRS=8.
+- **Result:** killed mid-run по запросу пользователя ("плетешься на 0.9, нужно прорывное"). Round 9 не закончил, but pattern был очевиден из Rounds 5/6.
+
+#### Round 10 — CD with random-restart jitter (8 cycles) — NOISE — 2026-05-08
+- **Hypothesis:** После CD converges (-0.010 floor), jitter 25% макросов ±0.7 cell и заново CD. 8 cycles → возможно один найдёт другой basin с deeper floor.
+- **Code (`submissions/straple/cd_polish.py`):** новая wrapper `cd_polish_gpu_with_restart`. Initial CD → for cycle in restart_cycles: jitter random N% макросов на ±jitter_step×cell в каждой оси (clamped to canvas), call cd_polish_gpu, accept если improved over best.
+- **Run config:** `STRAPLE_BATCH_CD_GPU_RESTART_CYCLES=8 STRAPLE_BATCH_CD_GPU_JITTER_FRAC=0.25 STRAPLE_BATCH_CD_GPU_JITTER_STEP=0.7`.
+- **Result:** Initial CD: 0.9170 → 0.9060. **All 8 restart cycles REJECTED:** jitter создавал 60-68 overlaps, CD за 8 rounds не успевал их разрешить, final cycles_proxy 0.918-0.944 (worse than 0.9060). Wall 18 min, total CD time 209.9s.
+- **Verdict:** NOISE (0.9060 vs trial9 0.9065 = -0.0005). Restart cycles бесполезны при текущем jitter.
+- **Why failed:** jitter ±0.7 cell слишком большой → массовые overlaps. CD `_has_new_overlap_with` отклоняет moves которые могут увеличить overlap, но `accept_threshold_overlap` set to starting overlap → CD не может уменьшить high overlap. Восстановление overlap-free состояния требует gradient-style spreading force, которого нет в CD.
+- **Path forward (Round 11+):**
+  1. **Smaller jitter (±0.1-0.2 cell, 5-10% macros)** — менее destructive, маленький escape attempt.
+  2. **Overlap-aware jitter** — jitter в overlap-free регионы (bin packing).
+  3. **Hierarchical/cluster CD** — двигать целые clusters макросов как rigid groups (cluster preserves intra-cluster overlap, может найти лучший слот для всего блока). **GENUINELY NEW ALGORITHM**.
+  4. **DREAMPlace full integration** — нужен Bookshelf format converter (не существует в repo). 4-6h работы. Действительно прорыв но дорого.
+
 ---
 
 ## 8. Iteration prompt (для coder/reviewer/orchestrator triad)

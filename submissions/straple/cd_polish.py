@@ -219,6 +219,72 @@ def cd_polish(benchmark, plc, pos_full: np.ndarray,
     return pos, final_proxy
 
 
+def cd_polish_gpu_with_restart(benchmark, plc, pos_full: np.ndarray,
+                                proxy_pkgs: dict,
+                                restart_cycles: int = 0,
+                                jitter_frac: float = 0.2,
+                                jitter_step: float = 0.5,
+                                jitter_seed: int = 42,
+                                verbose: bool = False,
+                                **cd_kwargs) -> tuple[np.ndarray, float]:
+    """CD polish with random-restart cycles to escape basin floor.
+
+    Pipeline: initial CD → if restart_cycles>0, jitter + re-CD repeatedly,
+    keep best. Each restart jitter_frac of hard macros uniformly within
+    ±jitter_step×cell_size.
+    """
+    pos_best, proxy_best = cd_polish_gpu(benchmark, plc, pos_full,
+                                          proxy_pkgs=proxy_pkgs,
+                                          verbose=verbose, **cd_kwargs)
+    if restart_cycles <= 0:
+        return pos_best, proxy_best
+
+    rng = np.random.default_rng(jitter_seed)
+    n_hard = int(benchmark.num_hard_macros)
+    canvas_w = float(benchmark.canvas_width)
+    canvas_h = float(benchmark.canvas_height)
+    cell_w = canvas_w / int(benchmark.grid_cols)
+    cell_h = canvas_h / int(benchmark.grid_rows)
+    sizes = benchmark.macro_sizes.cpu().numpy().astype(np.float64)
+    fixed = benchmark.macro_fixed.cpu().numpy().astype(bool)
+    half_w = sizes[:, 0] * 0.5
+    half_h = sizes[:, 1] * 0.5
+
+    n_jitter = max(1, int(jitter_frac * n_hard))
+
+    for cycle in range(restart_cycles):
+        pos_try = pos_best.copy()
+        movable = [i for i in range(n_hard) if not fixed[i]]
+        jitter_idx = rng.choice(movable, size=min(n_jitter, len(movable)),
+                                replace=False)
+        for j in jitter_idx:
+            dx = rng.uniform(-cell_w * jitter_step, cell_w * jitter_step)
+            dy = rng.uniform(-cell_h * jitter_step, cell_h * jitter_step)
+            pos_try[j, 0] = float(np.clip(pos_try[j, 0] + dx,
+                                          half_w[j], canvas_w - half_w[j]))
+            pos_try[j, 1] = float(np.clip(pos_try[j, 1] + dy,
+                                          half_h[j], canvas_h - half_h[j]))
+        if verbose:
+            print(f"[cd_restart] cycle {cycle+1}/{restart_cycles} "
+                  f"jittered {len(jitter_idx)} macros (±{jitter_step:.2f} cell) "
+                  f"from base proxy={proxy_best:.4f}",
+                  flush=True)
+        pos_cd, proxy_cd = cd_polish_gpu(benchmark, plc, pos_try,
+                                          proxy_pkgs=proxy_pkgs,
+                                          verbose=verbose, **cd_kwargs)
+        if proxy_cd < proxy_best - 1e-6:
+            if verbose:
+                print(f"[cd_restart] cycle {cycle+1} IMPROVED: "
+                      f"{proxy_cd:.4f} < {proxy_best:.4f}", flush=True)
+            pos_best = pos_cd
+            proxy_best = proxy_cd
+        else:
+            if verbose:
+                print(f"[cd_restart] cycle {cycle+1} no improvement: "
+                      f"{proxy_cd:.4f} >= {proxy_best:.4f}", flush=True)
+    return pos_best, proxy_best
+
+
 def cd_polish_gpu(benchmark, plc, pos_full: np.ndarray,
                   proxy_pkgs: dict,
                   rounds: int = 6,
@@ -230,7 +296,8 @@ def cd_polish_gpu(benchmark, plc, pos_full: np.ndarray,
                   time_budget: float = 0.0,
                   proxy_chunk_n: int = 32,
                   approx_verify: bool = False,
-                  approx_threshold: float = 1e-5) -> tuple[np.ndarray, float]:
+                  approx_threshold: float = 1e-5,
+                  approx_refresh_per_accept: bool = False) -> tuple[np.ndarray, float]:
     """GPU-batched CD polish.
 
     Two-stage filter for each hard macro i:
@@ -533,7 +600,7 @@ def cd_polish_gpu(benchmark, plc, pos_full: np.ndarray,
                 pos_t[i, 1] = float(pos[i, 1])
                 improvements += 1
                 accept_count += 1
-                if approx_verify:
+                if approx_verify and approx_refresh_per_accept:
                     chunk_baseline_gpu = _gpu_proxy_at(pos_t)
             verify_time += time.time() - t_v
             if time_exceeded:
