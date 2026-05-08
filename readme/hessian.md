@@ -381,6 +381,14 @@ scp evyukhnevich@103.76.52.240:macro-place/.remote_runs/stats_ROUND_NAME.json /t
   4. **Restart CD with random jitter:** после convergence добавить случайные jitters к 5-10% макросов и пере-CD. Multiple cycles.
   5. **Multi-batch reuse:** запустить gradient batch 2-3 раза с разным seed, polish best of all batches. Cost: 2-3× wall.
 
+#### Round 7 — extended sf (2.0, 1.0 in front) — NOISE — 2026-05-08
+- **Hypothesis:** sf=2.0, 1.0 дают большие jumps → может escape larger basins. Возможно ускорит wall в crowded layout где single-cell move недостаточен.
+- **Run config:** `STRAPLE_BATCH_CD_SF=2.0,1.0,0.5,0.25,0.125,0.0625,0.03125,0.015625,0.0078125,0.00390625 STRAPLE_BATCH_CD_ROUNDS=10` (DIRS=8, single-seed).
+- **Result:** pre-CD min=0.9183 (худший pre-CD из всех runs!). После 10 rounds: **0.9083** (-0.0100). Wall 14.9 min, CD 30.3s.
+- **Per-round accepts:** sf=2.0:1, sf=1.0:1, sf=0.5:12, sf=0.25:40, sf=0.125:31, sf=0.0625:33, sf=0.03125:14, sf=0.0156:9, sf=0.0078:2, sf=0.0039:0. **Большие sf бесполезны** — почти всё rejected by border (231 при sf=2.0) или overlap (1386 при sf=2.0). Default sf range optimal.
+- **Verdict:** NOISE (0.9083 vs trial9 0.9065 = +0.0018, в noise). CD signature consistent: -0.010 absolute.
+- **Confirmation #2:** pre-CD start dominates final result. Same pattern as Round 5/6.
+
 ---
 
 ## 8. Iteration prompt (для coder/reviewer/orchestrator triad)
