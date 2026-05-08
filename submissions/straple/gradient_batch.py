@@ -1127,22 +1127,44 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
                             return (grad_p - grad_m) / (2 * fd_eps)
 
                         with torch.enable_grad():
-                            # Shifted power iteration: largest eig of (σI - H)
-                            # corresponds to smallest eig of H. σ chosen above
-                            # the spectrum from a probe HVP. Naive `-H v`
-                            # converges to LARGEST |eig| direction, not smallest.
-                            v = torch.randn_like(pos.data)
+                            # Batched Lanczos for smallest eigenvalue of H per K.
+                            # Builds Krylov basis V_0..V_{k-1} via 3-term
+                            # recurrence: w = H V_i; α_i = V_i^T w; w -= α_i V_i + β_{i-1} V_{i-1};
+                            # β_i = ||w||; V_{i+1} = w / β_i.  Tridiag T = diag(α) +
+                            # off-diag(β); eigendecompose T (small k×k batched).
+                            # Smallest eig + corresponding combo of V columns =
+                            # estimate of smallest eig of H + its eigenvector.
+                            k_iters = max(2, saddle_iters)
+                            v_init = torch.randn_like(pos.data)
+                            v_init = v_init / v_init.flatten(1).norm(dim=1).clamp_min(1e-9).view(K, 1, 1)
+                            V_basis = [v_init]
+                            alphas = []
+                            betas = []
+                            for i in range(k_iters):
+                                w = _hvp_fd(pos.data, V_basis[i])
+                                alpha_i = (V_basis[i] * w).flatten(1).sum(dim=1)
+                                alphas.append(alpha_i)
+                                w = w - alpha_i.view(K, 1, 1) * V_basis[i]
+                                if i > 0:
+                                    w = w - betas[i - 1].view(K, 1, 1) * V_basis[i - 1]
+                                beta_i = w.flatten(1).norm(dim=1).clamp_min(1e-9)
+                                betas.append(beta_i)
+                                v_next = (w / beta_i.view(K, 1, 1)).detach()
+                                V_basis.append(v_next)
+                            V_stack = torch.stack(V_basis[:k_iters], dim=1)  # [K, k, n, 2]
+                            T = torch.zeros(K, k_iters, k_iters,
+                                            device=dev, dtype=pos.dtype)
+                            diag_idx = torch.arange(k_iters, device=dev)
+                            T[:, diag_idx, diag_idx] = torch.stack(alphas, dim=1)
+                            if k_iters > 1:
+                                beta_off = torch.stack(betas[:-1], dim=1)
+                                T[:, diag_idx[:-1], diag_idx[1:]] = beta_off
+                                T[:, diag_idx[1:], diag_idx[:-1]] = beta_off
+                            eigvals, eigvecs = torch.linalg.eigh(T)
+                            eig_K = eigvals[:, 0]
+                            u_min = eigvecs[:, :, 0]      # [K, k]
+                            v = (V_stack * u_min.view(K, k_iters, 1, 1)).sum(dim=1)
                             v = v / v.flatten(1).norm(dim=1).clamp_min(1e-9).view(K, 1, 1)
-                            Hv_probe = _hvp_fd(pos.data, v)
-                            probe_norm = Hv_probe.flatten(1).norm(dim=1).clamp_min(1.0)
-                            sigma_K = (2.0 * probe_norm).view(K, 1, 1)
-                            for _ in range(saddle_iters):
-                                Hv = _hvp_fd(pos.data, v)
-                                v_new = sigma_K * v - Hv  # (σI - H) v
-                                vn = v_new.flatten(1).norm(dim=1).clamp_min(1e-9)
-                                v = (v_new / vn.view(K, 1, 1)).detach()
-                            Hv_final = _hvp_fd(pos.data, v)
-                            eig_K = (v * Hv_final).flatten(1).sum(dim=1)
 
                         # Apply step to ALL seeds with sufficiently negative
                         # eig — drop plateau gate. Plateau ≠ saddle (a flat

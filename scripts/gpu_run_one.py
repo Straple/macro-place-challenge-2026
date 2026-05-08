@@ -177,7 +177,8 @@ def main():
         peak_mb = torch.cuda.max_memory_allocated() / 1e6
         print(f"[gpu_run_one] GPU peak memory: {peak_mb:.0f} MB", flush=True)
     print(f"[gpu_run_one] gradient batch: {grad_time:.1f}s "
-          f"({grad_time / args.K * 1000:.1f}ms per seed)", flush=True)
+          f"({grad_time / args.K * 1000:.1f}ms per seed) "
+          f"[wall_elapsed={time.time()-t0:.1f}s]", flush=True)
     plat_evts = stats.get("plateau_events", 0)
     seeds_recomb = stats.get("seeds_recombined_total", 0)
     if plat_evts:
@@ -247,7 +248,8 @@ def main():
             best_idx = int(k)
             best_pos_full = full_leg.clone().cpu().numpy()
             tag = "leg"
-    print(f"[gpu_run_one] eval+legalize: {time.time()-t_eval:.1f}s", flush=True)
+    print(f"[gpu_run_one] eval+legalize: {time.time()-t_eval:.1f}s "
+          f"[wall_elapsed={time.time()-t0:.1f}s]", flush=True)
     print(f"\n[gpu_run_one] BEST proxy={best_proxy:.4f} (k={best_idx})", flush=True)
 
     if best_pos_full is None:
@@ -294,7 +296,8 @@ def main():
         all_proxies[k] = proxy
         all_overlaps[k] = ovrlp
     print(f"[gpu_run_one] legalize all: {time.time()-t_all:.1f}s "
-          f"({n_workers} workers)", flush=True)
+          f"({n_workers} workers) [wall_elapsed={time.time()-t0:.1f}s]",
+          flush=True)
 
     # ===== Distribution stats: видеть качество gradient'а, не только min =====
     valid_mask_for_stats = all_overlaps == 0
@@ -433,6 +436,113 @@ def main():
             apply_orientations_to_plc(plc, benchmark, best_orientations)
         else:
             reset_orientations_to_n(plc, benchmark)
+
+    cd_polish_enable = os.environ.get("STRAPLE_BATCH_CD_POLISH", "0") == "1"
+    cd_gpu_enable = os.environ.get("STRAPLE_BATCH_CD_GPU_FILTER", "0") == "1"
+    wall_tl = float(os.environ.get("STRAPLE_BATCH_WALL_TL", "0"))
+    wall_reserve = float(os.environ.get("STRAPLE_BATCH_WALL_RESERVE", "30"))
+    if cd_polish_enable and best_pos_full is not None and wall_tl > 0:
+        elapsed_now = time.time() - t0
+        wall_remaining = wall_tl - elapsed_now - wall_reserve
+        if wall_remaining <= 0:
+            print(f"[gpu_run_one] WALL_TL {wall_tl:.0f}s exhausted "
+                  f"(elapsed {elapsed_now:.1f}s, reserve {wall_reserve:.0f}s) "
+                  f"-- skipping CD polish", flush=True)
+            cd_polish_enable = False
+        else:
+            print(f"[gpu_run_one] CD polish wall_remaining={wall_remaining:.0f}s "
+                  f"(WALL_TL={wall_tl:.0f}s elapsed={elapsed_now:.1f}s)",
+                  flush=True)
+    if cd_polish_enable and best_pos_full is not None:
+        sys.path.insert(0, str(REPO_ROOT / "submissions" / "straple"))
+        if cd_gpu_enable:
+            from cd_polish import cd_polish_gpu
+            from gpu_proxy import (build_routing_edges_full,
+                                    build_smooth_matrices,
+                                    build_routing_consts,
+                                    build_wl_pkg_full)
+            cd_rounds = int(os.environ.get("STRAPLE_BATCH_CD_ROUNDS", "6"))
+            cd_dirs = int(os.environ.get("STRAPLE_BATCH_CD_DIRS", "8"))
+            cd_topk = int(os.environ.get("STRAPLE_BATCH_CD_GPU_TOPK", "3"))
+            cd_macro_chunk = int(os.environ.get(
+                "STRAPLE_BATCH_CD_GPU_MACRO_CHUNK", "64"))
+            cd_time_budget = float(os.environ.get(
+                "STRAPLE_BATCH_CD_GPU_TIME_BUDGET", "0"))
+            if wall_tl > 0:
+                wall_remaining = wall_tl - (time.time() - t0) - wall_reserve
+                if cd_time_budget <= 0 or cd_time_budget > wall_remaining:
+                    cd_time_budget = max(1.0, wall_remaining)
+                    print(f"[gpu_run_one] cd_time_budget clamped to "
+                          f"{cd_time_budget:.0f}s by WALL_TL", flush=True)
+            cd_proxy_chunk_n = int(os.environ.get(
+                "STRAPLE_BATCH_CD_GPU_PROXY_CHUNK_N", "32"))
+            sf_str = os.environ.get(
+                "STRAPLE_BATCH_CD_SF",
+                "0.5,0.25,0.125,0.0625,0.03125,0.015625")
+            cd_sf = tuple(float(x) for x in sf_str.split(",") if x.strip())
+            print(f"[gpu_run_one] CD polish (GPU filter) on best seed: "
+                  f"rounds={cd_rounds} dirs={cd_dirs} topk={cd_topk} "
+                  f"chunk={cd_macro_chunk} proxy_chunk_n={cd_proxy_chunk_n} "
+                  f"sf={cd_sf}", flush=True)
+            name_to_global = {}
+            for bidx, idx in enumerate(plc.hard_macro_indices):
+                name_to_global[plc.modules_w_pins[idx].get_name()] = bidx
+            for sidx, idx in enumerate(plc.soft_macro_indices):
+                name_to_global[plc.modules_w_pins[idx].get_name()] = (
+                    n_hard + sidx)
+            n_total_full = benchmark.num_macros
+            edges_pkg = build_routing_edges_full(
+                plc, name_to_global, n_total_full)
+            routing_consts = build_routing_consts(
+                plc, float(benchmark.canvas_width),
+                float(benchmark.canvas_height),
+                int(benchmark.grid_rows), int(benchmark.grid_cols))
+            smooth_matrices = build_smooth_matrices(
+                int(benchmark.grid_rows), int(benchmark.grid_cols),
+                routing_consts["smooth_range"])
+            wl_pkg = build_wl_pkg_full(plc, name_to_global, n_total_full)
+            proxy_pkgs_cd = {
+                "edges_pkg": edges_pkg,
+                "smooth_matrices": smooth_matrices,
+                "routing_consts": routing_consts,
+                "wl_pkg": wl_pkg,
+            }
+            t_cd = time.time()
+            polished_pos, polished_proxy = cd_polish_gpu(
+                benchmark, plc, best_pos_full,
+                proxy_pkgs=proxy_pkgs_cd,
+                rounds=cd_rounds, step_factors=cd_sf,
+                n_directions=cd_dirs, topk_verify=cd_topk,
+                macro_chunk=cd_macro_chunk,
+                time_budget=cd_time_budget,
+                proxy_chunk_n=cd_proxy_chunk_n,
+                verbose=True)
+            cd_dt = time.time() - t_cd
+        else:
+            from cd_polish import cd_polish
+            cd_rounds = int(os.environ.get("STRAPLE_BATCH_CD_ROUNDS", "3"))
+            cd_dirs = int(os.environ.get("STRAPLE_BATCH_CD_DIRS", "8"))
+            sf_str = os.environ.get(
+                "STRAPLE_BATCH_CD_SF", "1.0,0.5,0.25,0.125")
+            cd_sf = tuple(float(x) for x in sf_str.split(",") if x.strip())
+            print(f"[gpu_run_one] CD polish on best seed: "
+                  f"rounds={cd_rounds} dirs={cd_dirs} sf={cd_sf}", flush=True)
+            t_cd = time.time()
+            polished_pos, polished_proxy = cd_polish(
+                benchmark, plc, best_pos_full,
+                rounds=cd_rounds, step_factors=cd_sf,
+                n_directions=cd_dirs, verbose=True)
+            cd_dt = time.time() - t_cd
+        if polished_proxy < best_proxy - 1e-6:
+            print(f"[gpu_run_one] CD polish IMPROVED: {polished_proxy:.4f} "
+                  f"< {best_proxy:.4f} ({cd_dt:.1f}s) "
+                  f"[wall_elapsed={time.time()-t0:.1f}s]", flush=True)
+            best_proxy = polished_proxy
+            best_pos_full = polished_pos.astype(np.float32)
+        else:
+            print(f"[gpu_run_one] CD polish: {polished_proxy:.4f} "
+                  f"(no improvement vs {best_proxy:.4f}, {cd_dt:.1f}s) "
+                  f"[wall_elapsed={time.time()-t0:.1f}s]", flush=True)
 
     grid_path = REPO_ROOT / "results" / f"gpu_pos_K_{args.bench}.npz"
     np.savez_compressed(
