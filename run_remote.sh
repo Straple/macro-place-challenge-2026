@@ -27,7 +27,7 @@
 #
 # Env vars (с дефолтами):
 #   REMOTE_USER=evyukhnevich
-#   REMOTE_HOST=103.76.52.240
+#   REMOTE_HOST=51.250.110.50
 #   REMOTE_DIR=macro-place
 #   SSH_OPTS=""
 #   STRAPLE_*    — все пробрасываются на сервер для подкоманд eval/gpu/sweep
@@ -36,7 +36,7 @@
 set -euo pipefail
 
 REMOTE_USER="${REMOTE_USER:-evyukhnevich}"
-REMOTE_HOST="${REMOTE_HOST:-103.76.52.240}"
+REMOTE_HOST="${REMOTE_HOST:-51.250.110.50}"
 REMOTE_DIR="${REMOTE_DIR:-macro-place}"
 SSH_KEEPALIVE_OPTS="-o ServerAliveInterval=10 -o ServerAliveCountMax=6 -o TCPKeepAlive=yes -o StrictHostKeyChecking=accept-new"
 SSH_OPTS="${SSH_KEEPALIVE_OPTS} ${SSH_OPTS:-}"

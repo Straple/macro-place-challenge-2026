@@ -440,9 +440,34 @@ scp evyukhnevich@103.76.52.240:macro-place/.remote_runs/stats_ROUND_NAME.json /t
 
 ## Сводка статуса (Round 12 update)
 
-**Best держится Round 4:** **0.8977** (только лicky pre-CD=0.9088 + CD signature -0.011).
+**Best держится Round 14:** **0.8942** (lucky pre-CD=0.9082 + CD signature -0.014). Round 4 был 0.8977, но Round 14 unequivocally beats его.
 
-**Все остальные runs (5-12):** floor 0.904-0.910 при typical pre-CD=0.91-0.92, или хуже при non-default config.
+**Все остальные runs (5-13):** floor 0.904-0.910 при typical pre-CD=0.91-0.92, или хуже при non-default config.
+
+#### Round 14 — Идея #1: Perturb-relax + CD cycles — NEW BEST 0.8942 — 2026-05-09
+- **Hypothesis:** После CD (locks at floor), perturb 25% macros by ±0.5 cell → mini-gradient (K=8, 80 steps) → legalize → CD. Spreading force gradient resolves overlaps правильно (не как Round 10 random jitter). Цикл 3-5 раз чтобы escape basin.
+- **Code:**
+  - `submissions/straple/gradient_batch.py`: добавлен `init_pos_override` параметр.
+  - `submissions/straple/perturb_relax.py` (NEW): функция `perturb_relax_cycles` — perturb → mini-gradient (через init_pos_override) → legalize всех K → take best valid → CD polish → compare.
+  - `scripts/gpu_run_one.py`: новый блок env-gated `STRAPLE_BATCH_PR_CYCLES` после CLUSTER polish.
+- **Run config:**
+  ```
+  STRAPLE_BATCH_PR_CYCLES=4 STRAPLE_BATCH_PR_K=8 STRAPLE_BATCH_PR_STEPS=80
+  STRAPLE_BATCH_PR_PERTURB_FRAC=0.25 STRAPLE_BATCH_PR_PERTURB_STEP=0.5
+  STRAPLE_BATCH_PR_TIME_BUDGET=20
+  ```
+- **Result:** pre-CD min=0.9082 (lucky! такой же как Round 4). После initial CD (8 rounds approx): **0.8942** (-0.014 absolute, deepest CD signature так far). После 4 perturb-relax cycles: ВСЕ cycles failed (cycle1=1.008, cycle2=0.966, cycle3=1.000, cycle4=1.010, ВСЕ хуже 0.8942). Wall=18 мин total. CD time 24.9s + perturb-relax 182s. Final = initial CD (PR cycles все rejected).
+- **Verdict:** **NEW BEST 0.8942** (vs trial9 0.9065 = -0.0123 = WIN). Beats Round 4's 0.8977.
+- **Causality:** new best — от **initial CD при lucky pre-CD 0.9082**, НЕ от perturb-relax. Perturb-relax failed at current params (perturb=0.5 cell слишком разрушительный, 80 mini-steps не хватает recovery).
+- **Что delivered:**
+  - Idea #1 implementation работает (no crashes, all cycles complete)
+  - Confirmed CD signature varies -0.011 to -0.014 by basin: this run got lucky
+  - **Pre-CD min = 0.9082** воспроизводимо для определённых seeds — это критично знать, basin existence stable.
+- **Что НЕ delivered:**
+  - Perturb-relax NOT improving over initial CD at current hyperparams
+  - Need to tune: smaller perturb_step (0.1-0.2), more mini_steps (200-300), maybe smaller K to focus gradient
+
+
 
 **Подтверждённый pattern:** CD polish даёт **-0.010 ± 0.001 absolute** improvement регardless of tweaks. Floor определяется pre-CD (gradient batch outcome). Random tweaks (more dirs, multi-seed top-N, larger sf, restart with jitter, longer gradient) — не пробивают.
 

@@ -65,6 +65,7 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
                    verbose: bool = True,
                    anchor_jitter_frac: float = 0.05,
                    per_k_diversity: bool = False,
+                   init_pos_override: "np.ndarray | None" = None,
                    use_eplace_density: bool = False,
                    eplace_grid_size: int = 256,
                    multi_phase: bool = True,
@@ -235,7 +236,22 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
     fixed_idx_np = ~movable_np
     fixed_pos_np = initial_pos_np
 
-    if init_method == "louvain":
+    if init_pos_override is not None:
+        ovr = np.asarray(init_pos_override, dtype=np.float32)
+        if ovr.ndim == 2:
+            ovr_active = ovr[movable_np]
+            pos_init = np.broadcast_to(
+                ovr_active[None, :, :], (K, n_active, 2)).copy()
+        elif ovr.ndim == 3 and ovr.shape[0] == K:
+            pos_init = ovr[:, movable_np, :].astype(np.float32, copy=True)
+        else:
+            raise ValueError(
+                f"init_pos_override shape {ovr.shape} not understood; "
+                f"expected [n_total, 2] or [K, n_total, 2]")
+        if verbose:
+            print(f"[gradient_batch] init_pos_override applied "
+                  f"shape={pos_init.shape}", flush=True)
+    elif init_method == "louvain":
         pos_init = np.zeros((K, n_active, 2), dtype=np.float32)
         for k in range(K):
             anchor_pos_k = anchors_K[k][cluster_id_np]  # [n, 2]

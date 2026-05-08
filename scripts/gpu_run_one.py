@@ -458,7 +458,8 @@ def main():
     if cd_polish_enable and best_pos_full is not None:
         sys.path.insert(0, str(REPO_ROOT / "submissions" / "straple"))
         if cd_gpu_enable:
-            from cd_polish import cd_polish_gpu, cd_polish_gpu_with_restart
+            from cd_polish import (cd_polish_gpu, cd_polish_gpu_with_restart,
+                                    cluster_polish_gpu)
             from gpu_proxy import (build_routing_edges_full,
                                     build_smooth_matrices,
                                     build_routing_consts,
@@ -611,6 +612,141 @@ def main():
             print(f"[gpu_run_one] CD polish: {polished_proxy:.4f} "
                   f"(no improvement vs {best_proxy:.4f}, {cd_dt:.1f}s) "
                   f"[wall_elapsed={time.time()-t0:.1f}s]", flush=True)
+
+        cluster_enable = (os.environ.get(
+            "STRAPLE_BATCH_CLUSTER_POLISH", "0") == "1"
+            and cd_gpu_enable and best_pos_full is not None)
+        if cluster_enable:
+            cluster_n = int(os.environ.get(
+                "STRAPLE_BATCH_CLUSTER_N", "30"))
+            cluster_rounds = int(os.environ.get(
+                "STRAPLE_BATCH_CLUSTER_ROUNDS", "4"))
+            cluster_grid = int(os.environ.get(
+                "STRAPLE_BATCH_CLUSTER_GRID", "5"))
+            sf_cluster_str = os.environ.get(
+                "STRAPLE_BATCH_CLUSTER_SF",
+                "0.5,0.25,0.125,0.0625")
+            cluster_sf = tuple(float(x) for x in sf_cluster_str.split(",")
+                                 if x.strip())
+            cluster_tb = float(os.environ.get(
+                "STRAPLE_BATCH_CLUSTER_TIME_BUDGET", "0"))
+            if wall_tl > 0:
+                wall_remaining = wall_tl - (time.time() - t0) - wall_reserve
+                if cluster_tb <= 0 or cluster_tb > wall_remaining:
+                    cluster_tb = max(1.0, wall_remaining)
+            print(f"[gpu_run_one] CLUSTER polish: n_clusters={cluster_n} "
+                  f"rounds={cluster_rounds} grid={cluster_grid} "
+                  f"sf={cluster_sf} budget={cluster_tb:.0f}s", flush=True)
+            t_cl = time.time()
+            cl_pos, cl_proxy = cluster_polish_gpu(
+                benchmark, plc, best_pos_full,
+                proxy_pkgs=proxy_pkgs_cd,
+                n_clusters=cluster_n,
+                n_rounds=cluster_rounds,
+                sf_list=cluster_sf,
+                n_grid=cluster_grid,
+                verbose=True,
+                time_budget=cluster_tb,
+                proxy_chunk_n=cd_proxy_chunk_n)
+            cl_dt = time.time() - t_cl
+            if cl_proxy < best_proxy - 1e-6:
+                print(f"[gpu_run_one] CLUSTER polish IMPROVED: "
+                      f"{cl_proxy:.4f} < {best_proxy:.4f} ({cl_dt:.1f}s) "
+                      f"[wall_elapsed={time.time()-t0:.1f}s]", flush=True)
+                best_proxy = cl_proxy
+                best_pos_full = cl_pos.astype(np.float32)
+            else:
+                print(f"[gpu_run_one] CLUSTER polish: {cl_proxy:.4f} "
+                      f"(no improvement vs {best_proxy:.4f}, {cl_dt:.1f}s)",
+                      flush=True)
+
+    pr_cycles = int(os.environ.get("STRAPLE_BATCH_PR_CYCLES", "0"))
+    if (pr_cycles > 0 and best_pos_full is not None and cd_polish_enable
+            and cd_gpu_enable):
+        from perturb_relax import perturb_relax_cycles
+        pr_K = int(os.environ.get("STRAPLE_BATCH_PR_K", "8"))
+        pr_steps = int(os.environ.get("STRAPLE_BATCH_PR_STEPS", "100"))
+        pr_time_budget = float(os.environ.get(
+            "STRAPLE_BATCH_PR_TIME_BUDGET", "20"))
+        pr_perturb_frac = float(os.environ.get(
+            "STRAPLE_BATCH_PR_PERTURB_FRAC", "0.25"))
+        pr_perturb_step = float(os.environ.get(
+            "STRAPLE_BATCH_PR_PERTURB_STEP", "0.5"))
+        pr_seed = int(os.environ.get("STRAPLE_BATCH_PR_SEED", "777"))
+        wall_deadline = (t0 + wall_tl - wall_reserve) if wall_tl > 0 else 0.0
+        from cd_polish import cd_polish_gpu as _cd_polish_gpu_fn
+        from macro_place.objective import compute_proxy_cost as _cpc_fn
+
+        def _grad_fn(bench, plc_arg, K, num_steps, time_budget,
+                      seed, init_pos_override, verbose, **kw):
+            return gradient_batch(
+                bench, plc_arg, K=K, num_steps=num_steps,
+                time_budget=time_budget, seed=seed,
+                device="cuda" if torch.cuda.is_available() else "cpu",
+                init_pos_override=init_pos_override,
+                anchor_strategy=os.environ.get(
+                    "STRAPLE_BATCH_ANCHOR_STRATEGY", "centroid"),
+                spawn_radius_frac=0.05, spawn_adaptive=True,
+                anchor_jitter_frac=0.05,
+                anchor_loss_beta_start=anchor_beta_start,
+                anchor_loss_beta_end=anchor_beta_end,
+                cohesion_beta_start=cohesion_beta_start,
+                cohesion_beta_end=cohesion_beta_end,
+                use_eplace_density=use_eplace,
+                eplace_grid_size=eplace_grid_size,
+                cong_weight=cong_weight,
+                per_k_diversity=per_k_diversity,
+                lr=grad_lr, verbose=verbose,
+            )
+
+        def _cd_fn(bench, plc_arg, pos_full_in, **kw):
+            return _cd_polish_gpu_fn(
+                bench, plc_arg, pos_full_in,
+                proxy_pkgs=proxy_pkgs_cd,
+                rounds=cd_rounds, step_factors=cd_sf,
+                n_directions=cd_dirs, topk_verify=cd_topk,
+                macro_chunk=cd_macro_chunk,
+                time_budget=cd_time_budget,
+                proxy_chunk_n=cd_proxy_chunk_n,
+                approx_verify=cd_approx_verify,
+                approx_threshold=cd_approx_threshold,
+                approx_refresh_per_accept=cd_approx_refresh,
+                verbose=False)
+
+        print(f"[gpu_run_one] PERTURB-RELAX: cycles={pr_cycles} K={pr_K} "
+              f"steps={pr_steps} time_budget={pr_time_budget:.0f}s "
+              f"perturb_frac={pr_perturb_frac:.2f} "
+              f"perturb_step={pr_perturb_step:.2f} "
+              f"[wall_elapsed={time.time()-t0:.1f}s "
+              f"wall_remaining={(wall_deadline-time.time()):.0f}s]",
+              flush=True)
+        t_pr = time.time()
+        pr_pos, pr_proxy = perturb_relax_cycles(
+            benchmark, plc, best_pos_full,
+            gradient_batch_fn=_grad_fn,
+            cd_polish_fn=_cd_fn,
+            legalize_fn=_legalize_only,
+            compute_proxy_fn=_cpc_fn,
+            n_cycles=pr_cycles,
+            mini_K=pr_K,
+            mini_steps=pr_steps,
+            mini_time_budget=pr_time_budget,
+            perturb_frac=pr_perturb_frac,
+            perturb_step=pr_perturb_step,
+            seed=pr_seed,
+            wall_deadline=wall_deadline,
+            verbose=True)
+        pr_dt = time.time() - t_pr
+        if pr_proxy < best_proxy - 1e-6:
+            print(f"[gpu_run_one] PERTURB-RELAX IMPROVED: "
+                  f"{pr_proxy:.4f} < {best_proxy:.4f} ({pr_dt:.1f}s) "
+                  f"[wall_elapsed={time.time()-t0:.1f}s]", flush=True)
+            best_proxy = pr_proxy
+            best_pos_full = pr_pos.astype(np.float32)
+        else:
+            print(f"[gpu_run_one] PERTURB-RELAX: {pr_proxy:.4f} "
+                  f"(no improvement vs {best_proxy:.4f}, {pr_dt:.1f}s)",
+                  flush=True)
 
     grid_path = REPO_ROOT / "results" / f"gpu_pos_K_{args.bench}.npz"
     np.savez_compressed(
