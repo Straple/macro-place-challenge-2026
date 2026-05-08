@@ -422,7 +422,38 @@ scp evyukhnevich@103.76.52.240:macro-place/.remote_runs/stats_ROUND_NAME.json /t
   3. **Hierarchical/cluster CD** — двигать целые clusters макросов как rigid groups (cluster preserves intra-cluster overlap, может найти лучший слот для всего блока). **GENUINELY NEW ALGORITHM**.
   4. **DREAMPlace full integration** — нужен Bookshelf format converter (не существует в repo). 4-6h работы. Действительно прорыв но дорого.
 
+#### Round 11 — Nesterov SGD optimizer — KILLED — 2026-05-08
+- **Hypothesis:** заменить Adam на Nesterov SGD (DREAMPlace's standard) → возможно different basin.
+- **Run config:** `STRAPLE_BATCH_OPT=nesterov` (с lr=0.3 default, потом lr=0.01).
+- **Result:** lr=0.3 — explosion (wl=182k, ovrlp=4722, density=902k). lr=0.01 — same explosion. Vanilla Nesterov SGD не совместим с нашим loss formulation (overflow penalty имеет gradients ×10000 scale, Adam normalizes per-parameter, SGD не).
+- **Verdict:** KILLED, не путь. Нужен custom optimizer (DREAMPlace's adaptive Nesterov с line search) — major work.
+
+#### Round 12 — longer gradient (time_budget=1200s) — LOSE — 2026-05-08
+- **Hypothesis:** дольше gradient → глубже basin → лучше pre-CD start.
+- **Run config:** `--time-budget 1200` (vs 600 default), всё остальное trial9+CD.
+- **Result:** pre-CD min=0.9448 (МНОГО хуже типичного 0.91!) p25=0.9756 (vs typical 0.97). После CD: **0.9227** (-0.0221 absolute, bigger drop потому что pre-CD выше). Wall 25 min.
+- **Verdict:** **LOSE** (0.9227 vs trial9 0.9065 = +0.0162, well above noise threshold).
+- **Why hurt:** schedule в `gradient_batch` calibrated for 600s. Phase transitions (P1→P2 at progress=0.1, P2→P3 at progress=0.4) растянуты по времени. λ_o (overflow weight) растёт до 645k вместо 12k при 600s — overflow доминирует loss, density penalty слабо.
+- **Insight:** просто увеличивать time_budget не помогает. Schedule **must be re-calibrated** для других времён (другие thresholds, decay rates).
+
 ---
+
+## Сводка статуса (Round 12 update)
+
+**Best держится Round 4:** **0.8977** (только лicky pre-CD=0.9088 + CD signature -0.011).
+
+**Все остальные runs (5-12):** floor 0.904-0.910 при typical pre-CD=0.91-0.92, или хуже при non-default config.
+
+**Подтверждённый pattern:** CD polish даёт **-0.010 ± 0.001 absolute** improvement регardless of tweaks. Floor определяется pre-CD (gradient batch outcome). Random tweaks (more dirs, multi-seed top-N, larger sf, restart with jitter, longer gradient) — не пробивают.
+
+**Реальные пути для breakthrough:**
+1. **DREAMPlace full integration** — стандартный референс placer достигает 1.41 AVG17 (мы на ~1.0). Но: нужен Bookshelf format converter (не в repo), и DREAMPlace build (~30-60 min). Effort 4-6 hours.
+2. **Cluster-aware CD** — двигать кластеры макросов как rigid units. Genuinely новое action vs CD's single-macro. Effort 2-3 hours.
+3. **Pair-swap** — swap permutation. Тоже ортогонально CD. Effort 1-2 hours.
+4. **Custom Nesterov optimizer + line search** (DREAMPlace internal techniques)— требует написания custom torch.optim subclass. Effort 2-4 hours.
+5. **Recalibrated longer gradient** — adjust schedule так чтобы λ_o не растёт без меры при 1200s. Effort 1-2 hours.
+
+
 
 ## 8. Iteration prompt (для coder/reviewer/orchestrator triad)
 
