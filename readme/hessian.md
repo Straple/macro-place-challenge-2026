@@ -312,6 +312,24 @@ scp evyukhnevich@103.76.52.240:macro-place/.remote_runs/stats_ROUND_NAME.json /t
   - Tighter integration: применить CD polish к top-N seeds (не только best) и взять best of N polished.
   - Path C ablation: Lanczos restart + line search на per-macro level (combined с CD finalization).
 
+#### Round 3 — extended WALL_TL=1700 (path A continuation) — 2026-05-08
+- **Hypothesis:** Round 2 dropped only 2 CD rounds (TL 617s exhausted). Extend WALL_TL 1500→1700 (28 мин, near user 30 min ceiling) даёт CD ~13.5 min budget vs ~10 min. Ожидание: 3-4 rounds (Round 0 demo показал 4 rounds = -1.4%, при -0.4% per round). Cíль: подтвердить тренд, ожидаемый best 0.890-0.895.
+- **Code:** no changes (только run config: WALL_TL=1700, ROUNDS=6).
+- **Run config:**
+  ```
+  STRAPLE_BATCH_CD_ROUNDS=6 STRAPLE_BATCH_WALL_TL=1700
+  ```
+  (rest from Round 2 trial9+CD config)
+- **Result:** Distribution: min=0.9112 p25=0.9777 median=1.0623 mean=1.0475 std=0.0741. CD: 0.9112 → 0.9104 (R1 sf=0.5, 19 acc, 257 calls × 1.81s = 465s) → **0.9088** (R2 sf=0.25, 27 acc, 194 calls × 1.81s = 351s). Total CD 825s (TL clamp 817s, 8s overrun из-за per-macro check let-in). Wall_elapsed 1678.9s = 28 мин.
+- **Verdict:** NOISE (0.9088 vs trial9 0.9065 = +0.0023; vs Round 2 0.9082 = +0.0006).
+- **Cross-run consistency:** Round 2 starting 0.9124, Round 3 starting 0.9112. After 2 rounds CD: 0.9082, 0.9088 (Δ=0.0006 = ниже single-run noise floor 0.005). Это значит **CD polish плавно сходится к локальному минимуму ~0.908 регardless стартового seed-best**. Tracking improvements: R2 23+19=42, R3 19+27=46 (similar count, similar magnitude).
+- **Insight:** "CD floor" ≈ 0.908 после 2 rounds @ ~10 min. Чтобы пробить 0.85 нужно либо a) много больше rounds (TL bottleneck — 1.82s/TILOS call), либо b) другой подход вне CD (path C/D или приближённый verify).
+- **TL extension не дала ожидаемых 3-4 rounds:** budget 817s, но 2 rounds = 825s (R1=465s + R2=351s + 9s overhead). Round 3 sf=0.125 не стартует из-за TL guard.
+- **Next:**
+  - **Round 4 (priority)**: cut overhead (skip top-32 eval-and-legalize, ~118s saved) + WALL_TL=1800 (30 min ceiling) → CD budget ~17 min → 3 rounds возможны. Цель: подтвердить, что R3 sf=0.125 даёт ещё -0.4% → ~0.904 = WIN porog (≤0.901).
+  - Альтернатива: **approximate verify** — заменить TILOS proxy на gpu_proxy_batched для всех TOPK candidates (не только rank). 50ms vs 1.82s → 36× speedup. Risk: GPU proxy может расходиться с точным.
+  - Backup: Path D pair-swap CD (orthogonal к single-macro CD).
+
 ---
 
 ## 8. Iteration prompt (для coder/reviewer/orchestrator triad)
