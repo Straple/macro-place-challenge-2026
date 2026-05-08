@@ -350,6 +350,22 @@ scp evyukhnevich@103.76.52.240:macro-place/.remote_runs/stats_ROUND_NAME.json /t
   4. **Combine with path D (pair-swap)**: pair swap operations в approx mode после single-macro CD.
   5. **Larger initial sf**: попробовать sf=1.0 и sf=2.0 в начале (большие jumps когда GPU proxy надёжен) — но риск нарушить overlap для много макросов.
 
+#### Round 5 — Multi-seed approx CD (top-5) — NOISE — 2026-05-08
+- **Hypothesis:** Round 4 dependence на удачу стартового seed (Round 4: 0.9088→0.8977; других runs: 0.9112→0.9088, 0.9124→0.9082). Применить approx CD к top-5 seeds, взять best polished. Each CD ~25s → ~125s extra → fits в budget.
+- **Code:** новый env `STRAPLE_BATCH_CD_GPU_TOP_N_SEEDS` в `gpu_run_one.py`. Если N>1: sort valid seeds by pre-CD proxy ascending, polish top N, return best polished. ROUNDS=8 расширен (8th round repeats sf=0.0156).
+- **Run config:** `STRAPLE_BATCH_CD_GPU_TOP_N_SEEDS=5 STRAPLE_BATCH_CD_ROUNDS=8` (rest = Round 4).
+- **Result:** distribution: pre-CD min=0.9161 (k=?), top-5 starting proxies=0.9161,…,0.9208 (рейндж 0.005). После polish best=0.9058 (improved 0.9161→0.9058 = -0.0103). Total CD 126.9s. Wall_elapsed 981s = 16.3 min.
+- **Verdict:** NOISE (0.9058 vs trial9 0.9065 = -0.0007, в пределах ±0.005 noise floor). И **worse than Round 4** (0.9058 vs 0.8977 = +0.0081) — но это **run-to-run variance в pre-CD min**, НЕ из-за multi-seed. Round 4 повезло на pre-CD 0.9088, Round 5 — 0.9161.
+- **Multi-seed delta per seed:** seed4 0.9204→0.9080 (-0.0124), seed5 0.9208→0.9070 (-0.0138). Все ~-0.011-0.014 absolute = consistent CD signature. Best polished = 0.9058 = seed1/2/3 (~rank top by pre-CD).
+- **Key insight: CD floor depends on pre-CD start.** При pre-CD ≈ 0.91, CD floor ≈ 0.90 ± 0.005. При pre-CD ≈ 0.92, floor ≈ 0.91. То есть multi-seed помогает только если в top-N есть seed с **значительно ниже** pre-CD (что редко в малой выборке 5-10).
+- **Что не сработало (гипотеза):** все 5 топ-seeds имели похожий starting (0.9161-0.9208 = 0.005 spread = noise). CD polish не пересекает basin границы — оставляет каждый seed в своём local basin. Best of 5 ≈ best within shared basin.
+- **Path forward (Round 6+):**
+  1. **More directions per round (24 instead of 8):** 5×5 grid minus center. Покроет больше local moves, выше accept rate, потенциал глубже floor. Cost +10-20s.
+  2. **Periodic TILOS sync:** после каждого CD round (или каждых N accepts) пересчитать base_gpu_proxy через TILOS — корректирует drift в approx mode.
+  3. **Larger initial sf:** sf=1.0, 2.0 в начале (большие escape moves; полагаемся на GPU proxy для overlap detection).
+  4. **Combine top-K seeds + cross-seed mix:** взять best макроса i из топ-K seeds — но это требует new logic.
+  5. **Improve gradient phase:** уменьшить pre-CD variance (stronger convergence, longer time_budget, higher K).
+
 ---
 
 ## 8. Iteration prompt (для coder/reviewer/orchestrator triad)

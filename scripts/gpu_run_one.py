@@ -480,15 +480,18 @@ def main():
                 "STRAPLE_BATCH_CD_GPU_APPROX", "0") == "1"
             cd_approx_threshold = float(os.environ.get(
                 "STRAPLE_BATCH_CD_GPU_APPROX_THRESHOLD", "1e-5"))
+            cd_top_n_seeds = int(os.environ.get(
+                "STRAPLE_BATCH_CD_GPU_TOP_N_SEEDS", "1"))
             sf_str = os.environ.get(
                 "STRAPLE_BATCH_CD_SF",
                 "0.5,0.25,0.125,0.0625,0.03125,0.015625")
             cd_sf = tuple(float(x) for x in sf_str.split(",") if x.strip())
-            print(f"[gpu_run_one] CD polish (GPU filter) on best seed: "
+            print(f"[gpu_run_one] CD polish (GPU filter): "
                   f"rounds={cd_rounds} dirs={cd_dirs} topk={cd_topk} "
                   f"chunk={cd_macro_chunk} proxy_chunk_n={cd_proxy_chunk_n} "
                   f"approx_verify={cd_approx_verify} "
                   f"approx_threshold={cd_approx_threshold:g} "
+                  f"top_n_seeds={cd_top_n_seeds} "
                   f"sf={cd_sf}", flush=True)
             name_to_global = {}
             for bidx, idx in enumerate(plc.hard_macro_indices):
@@ -514,17 +517,59 @@ def main():
                 "wl_pkg": wl_pkg,
             }
             t_cd = time.time()
-            polished_pos, polished_proxy = cd_polish_gpu(
-                benchmark, plc, best_pos_full,
-                proxy_pkgs=proxy_pkgs_cd,
-                rounds=cd_rounds, step_factors=cd_sf,
-                n_directions=cd_dirs, topk_verify=cd_topk,
-                macro_chunk=cd_macro_chunk,
-                time_budget=cd_time_budget,
-                proxy_chunk_n=cd_proxy_chunk_n,
-                approx_verify=cd_approx_verify,
-                approx_threshold=cd_approx_threshold,
-                verbose=True)
+            if cd_top_n_seeds > 1 and valid_mask.any():
+                seed_top_idx = valid_idx[np.argsort(all_proxies[valid_idx])][:cd_top_n_seeds]
+                print(f"[gpu_run_one] CD polish multi-seed top-{cd_top_n_seeds}: "
+                      f"k={list(seed_top_idx)} "
+                      f"proxies={[f'{all_proxies[k]:.4f}' for k in seed_top_idx]}",
+                      flush=True)
+                best_polished_proxy = best_proxy
+                best_polished_pos = best_pos_full
+                per_seed_budget = (cd_time_budget / cd_top_n_seeds
+                                   if cd_time_budget > 0 else 0.0)
+                for rank, k in enumerate(seed_top_idx):
+                    full_seed = full_template.clone()
+                    full_seed[:n_hard] = torch.tensor(
+                        pos_K_legalized[int(k), :n_hard], dtype=torch.float32)
+                    if pos_K.shape[1] > n_hard:
+                        full_seed[n_hard:n_hard + n_soft] = torch.tensor(
+                            pos_K[int(k), n_hard:n_hard + n_soft],
+                            dtype=torch.float32)
+                    seed_pos_full = full_seed.cpu().numpy()
+                    seed_orig_proxy = float(all_proxies[int(k)])
+                    print(f"[gpu_run_one] -- seed rank={rank+1}/{cd_top_n_seeds} "
+                          f"k={int(k)} start_proxy={seed_orig_proxy:.4f}",
+                          flush=True)
+                    polished_seed_pos, polished_seed_proxy = cd_polish_gpu(
+                        benchmark, plc, seed_pos_full,
+                        proxy_pkgs=proxy_pkgs_cd,
+                        rounds=cd_rounds, step_factors=cd_sf,
+                        n_directions=cd_dirs, topk_verify=cd_topk,
+                        macro_chunk=cd_macro_chunk,
+                        time_budget=per_seed_budget,
+                        proxy_chunk_n=cd_proxy_chunk_n,
+                        approx_verify=cd_approx_verify,
+                        approx_threshold=cd_approx_threshold,
+                        verbose=True)
+                    if polished_seed_proxy < best_polished_proxy - 1e-6:
+                        best_polished_proxy = polished_seed_proxy
+                        best_polished_pos = polished_seed_pos.astype(np.float32)
+                        print(f"[gpu_run_one] -- seed k={int(k)} NEW BEST: "
+                              f"{polished_seed_proxy:.4f}", flush=True)
+                polished_pos = best_polished_pos
+                polished_proxy = best_polished_proxy
+            else:
+                polished_pos, polished_proxy = cd_polish_gpu(
+                    benchmark, plc, best_pos_full,
+                    proxy_pkgs=proxy_pkgs_cd,
+                    rounds=cd_rounds, step_factors=cd_sf,
+                    n_directions=cd_dirs, topk_verify=cd_topk,
+                    macro_chunk=cd_macro_chunk,
+                    time_budget=cd_time_budget,
+                    proxy_chunk_n=cd_proxy_chunk_n,
+                    approx_verify=cd_approx_verify,
+                    approx_threshold=cd_approx_threshold,
+                    verbose=True)
             cd_dt = time.time() - t_cd
         else:
             from cd_polish import cd_polish
