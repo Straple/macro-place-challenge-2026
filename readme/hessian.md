@@ -366,6 +366,21 @@ scp evyukhnevich@103.76.52.240:macro-place/.remote_runs/stats_ROUND_NAME.json /t
   4. **Combine top-K seeds + cross-seed mix:** взять best макроса i из топ-K seeds — но это требует new logic.
   5. **Improve gradient phase:** уменьшить pre-CD variance (stronger convergence, longer time_budget, higher K).
 
+#### Round 6 — n_directions=24 (5×5 grid - center) — NOISE — 2026-05-08
+- **Hypothesis:** Расширить per-macro search space с 8 dirs (3×3-1) до 24 dirs (5×5-1) → больше valid candidates → выше accept rate → глубже CD floor.
+- **Code:** добавлен case `n_directions == 24` в `cd_polish_gpu`: offsets = (±sw, ±2sw) × (±sh, ±2sh) - center. Также 48 (7×7-1) для будущих раундов.
+- **Run config:** `STRAPLE_BATCH_CD_DIRS=24 STRAPLE_BATCH_CD_GPU_TOP_N_SEEDS=1` (single-seed для apples-to-apples vs Round 4).
+- **Result:** pre-CD min=0.9164 (similar к Round 5's 0.9161). После 8 rounds × 24 dirs = 180 accepts (Round 5 single-seed had ~158). CD: 0.9164 → **0.9060** (-0.0104). Per-round 7.5s vs 2.7s в Round 4 (8 dirs) — 24 dirs scale linearly. Total CD 64.6s.
+- **Verdict:** NOISE (0.9060 vs trial9 0.9065 = -0.0005, в noise floor).
+- **24 dirs vs 8 dirs:** ~22 extra accepts overall (180 vs 158), но floor practically same (0.9060 vs Round 5 0.9058). Плюс затраты per-round 2.8× выше. **Marginal benefit.**
+- **Confirmation of "CD floor depends on pre-CD start":** Round 4 pre-CD 0.9088 → 0.8977; Round 5/6 pre-CD ~0.916 → 0.906. CD signature ~-0.011 absolute, но реальный best зависит от того, какой basin случайно достался.
+- **Path forward (Round 7+):**
+  1. **Pair-swap CD (path D)** [PRIORITY]: orthogonal к single-macro CD. Try swap positions of pair (i, j) → может пробить single-macro floor если есть зеркально-плохо размещённые.
+  2. **SA-style CD:** accept некоторых ухудшающих moves с вероятностью exp(-Δ/T) → escape local. Risk: hard tune of T schedule.
+  3. **Bigger top-N seeds (top-20)**: дополнительная диверсификация. Risk: при single-batch pre-CD spread ~0.005, все 20 sit в одном basin.
+  4. **Restart CD with random jitter:** после convergence добавить случайные jitters к 5-10% макросов и пере-CD. Multiple cycles.
+  5. **Multi-batch reuse:** запустить gradient batch 2-3 раза с разным seed, polish best of all batches. Cost: 2-3× wall.
+
 ---
 
 ## 8. Iteration prompt (для coder/reviewer/orchestrator triad)

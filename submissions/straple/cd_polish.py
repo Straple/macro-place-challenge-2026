@@ -374,6 +374,18 @@ def cd_polish_gpu(benchmark, plc, pos_full: np.ndarray,
         sh = cell_h * sf
         if n_directions == 4:
             offsets = [(-sw, 0.0), (+sw, 0.0), (0.0, -sh), (0.0, +sh)]
+        elif n_directions == 24:
+            offsets = [(dx, dy)
+                       for dx in (-2.0*sw, -sw, 0.0, +sw, +2.0*sw)
+                       for dy in (-2.0*sh, -sh, 0.0, +sh, +2.0*sh)
+                       if not (dx == 0.0 and dy == 0.0)]
+        elif n_directions == 48:
+            offsets = [(dx, dy)
+                       for dx in (-3.0*sw, -2.0*sw, -sw, 0.0,
+                                  +sw, +2.0*sw, +3.0*sw)
+                       for dy in (-3.0*sh, -2.0*sh, -sh, 0.0,
+                                  +sh, +2.0*sh, +3.0*sh)
+                       if not (dx == 0.0 and dy == 0.0)]
         else:
             offsets = [(dx, dy) for dx in (-sw, 0.0, +sw)
                        for dy in (-sh, 0.0, +sh)
