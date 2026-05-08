@@ -476,6 +476,10 @@ def main():
                           f"{cd_time_budget:.0f}s by WALL_TL", flush=True)
             cd_proxy_chunk_n = int(os.environ.get(
                 "STRAPLE_BATCH_CD_GPU_PROXY_CHUNK_N", "32"))
+            cd_approx_verify = os.environ.get(
+                "STRAPLE_BATCH_CD_GPU_APPROX", "0") == "1"
+            cd_approx_threshold = float(os.environ.get(
+                "STRAPLE_BATCH_CD_GPU_APPROX_THRESHOLD", "1e-5"))
             sf_str = os.environ.get(
                 "STRAPLE_BATCH_CD_SF",
                 "0.5,0.25,0.125,0.0625,0.03125,0.015625")
@@ -483,6 +487,8 @@ def main():
             print(f"[gpu_run_one] CD polish (GPU filter) on best seed: "
                   f"rounds={cd_rounds} dirs={cd_dirs} topk={cd_topk} "
                   f"chunk={cd_macro_chunk} proxy_chunk_n={cd_proxy_chunk_n} "
+                  f"approx_verify={cd_approx_verify} "
+                  f"approx_threshold={cd_approx_threshold:g} "
                   f"sf={cd_sf}", flush=True)
             name_to_global = {}
             for bidx, idx in enumerate(plc.hard_macro_indices):
@@ -516,6 +522,8 @@ def main():
                 macro_chunk=cd_macro_chunk,
                 time_budget=cd_time_budget,
                 proxy_chunk_n=cd_proxy_chunk_n,
+                approx_verify=cd_approx_verify,
+                approx_threshold=cd_approx_threshold,
                 verbose=True)
             cd_dt = time.time() - t_cd
         else:

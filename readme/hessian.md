@@ -330,6 +330,26 @@ scp evyukhnevich@103.76.52.240:macro-place/.remote_runs/stats_ROUND_NAME.json /t
   - Альтернатива: **approximate verify** — заменить TILOS proxy на gpu_proxy_batched для всех TOPK candidates (не только rank). 50ms vs 1.82s → 36× speedup. Risk: GPU proxy может расходиться с точным.
   - Backup: Path D pair-swap CD (orthogonal к single-macro CD).
 
+#### Round 4 — Approx verify (GPU-only) — **WIN** — 2026-05-08
+- **Hypothesis:** TILOS verify @ 1.82s/call — bottleneck. Заменить на gpu_proxy_batched (~50ms/chunk) которое уже считается всё равно для ranking. GPU proxy is "точное Google-воспроизведение" → ranking должен match TILOS. Per-macro decision основан на GPU proxy против per-chunk baseline. Final TILOS verify guards against approximation error: revert если whole-run proxy не лучше original.
+- **Code:** добавлены параметры `approx_verify` и `approx_threshold` в `cd_polish_gpu`. В approx mode: per-chunk baseline через single-pos `gpu_proxy_batched`, per-macro accept если best valid candidate < baseline - threshold (no TILOS calls). Финальный TILOS check: revert на `pos_orig`/`base_proxy_orig` если final TILOS не улучшил. Env: `STRAPLE_BATCH_CD_GPU_APPROX=1`, `STRAPLE_BATCH_CD_GPU_APPROX_THRESHOLD=1e-5`.
+- **Run config:**
+  ```
+  STRAPLE_BATCH_CD_POLISH=1 STRAPLE_BATCH_CD_GPU_FILTER=1
+  STRAPLE_BATCH_CD_GPU_APPROX=1 STRAPLE_BATCH_CD_ROUNDS=6
+  STRAPLE_BATCH_WALL_TL=1700
+  ```
+- **Result:** Distribution: min=0.9088 p25=0.9785 median=1.0633 mean=1.0498 std=0.0736. CD: 0.9088 → **0.8977** (-0.0111 = -1.2% from CD start) — все 6 rounds выполнены за 19.9s total (vs 825s в Round 3 для 2 rounds). 169 accepts: R1=19, R2=44, R3=43, R4=39, R5=15, R6=9. Per-round verify time ~0.1-0.2s (GPU proxy lookup, no TILOS). Wall_elapsed 874s = 14.6 min (раньше CD остановки гарантированно укладывается в budget).
+- **Verdict:** **WIN** (0.8977 vs trial9 0.9065 = -0.0088, well below 0.005 noise floor and below WIN threshold 0.901).
+- **Why approx работает:** gpu_proxy_batched "точное Google-воспроизведение" → ranking GPU candidates correlates с TILOS. Final TILOS verify (single call) подтверждает кумулятивное улучшение реальное. Stale per-chunk baseline approximation OK потому что shifts macro-by-macro малы → drift минимален.
+- **Caveat:** verbose log показывает `proxy=0.9088` всегда (stale base_proxy не обновляется в approx mode), но итоговый TILOS — это правда (0.8977).
+- **Path forward (Round 5+):**
+  1. **Multi-seed approx CD**: применить approx CD к top-3 или top-5 seeds (не только best one), взять best of polished. Затраты per seed ~20s → 3 seeds = ~60s extra. Может пробить ниже 0.89.
+  2. **More aggressive sf**: добавить ещё меньшие sf (0.0078, 0.0039) после R6 — дополнительные fine-grain rounds.
+  3. **Per-chunk baseline refresh**: пересчитывать GPU baseline после каждых N accepts чтобы уменьшить drift.
+  4. **Combine with path D (pair-swap)**: pair swap operations в approx mode после single-macro CD.
+  5. **Larger initial sf**: попробовать sf=1.0 и sf=2.0 в начале (большие jumps когда GPU proxy надёжен) — но риск нарушить overlap для много макросов.
+
 ---
 
 ## 8. Iteration prompt (для coder/reviewer/orchestrator triad)

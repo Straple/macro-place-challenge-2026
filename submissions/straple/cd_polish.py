@@ -228,7 +228,9 @@ def cd_polish_gpu(benchmark, plc, pos_full: np.ndarray,
                   macro_chunk: int = 64,
                   verbose: bool = False,
                   time_budget: float = 0.0,
-                  proxy_chunk_n: int = 32) -> tuple[np.ndarray, float]:
+                  proxy_chunk_n: int = 32,
+                  approx_verify: bool = False,
+                  approx_threshold: float = 1e-5) -> tuple[np.ndarray, float]:
     """GPU-batched CD polish.
 
     Two-stage filter for each hard macro i:
@@ -246,6 +248,10 @@ def cd_polish_gpu(benchmark, plc, pos_full: np.ndarray,
         topk_verify: how many top GPU-ranked candidates to verify with TILOS.
         macro_chunk: batch size for GPU evaluation (memory budget).
         time_budget: seconds; 0 = no limit (only round count limits).
+        approx_verify: if True, skip TILOS verify per move and trust GPU
+            ranking. Final TILOS verify gates whole-run acceptance.
+        approx_threshold: in approx mode, accept move only if GPU proxy
+            improves by at least this absolute amount over chunk baseline.
     """
     import torch
     sys_path_added = False
@@ -330,10 +336,30 @@ def cd_polish_gpu(benchmark, plc, pos_full: np.ndarray,
     base_proxy, base_ovrlp = _proxy_at(pos)
     if verbose:
         print(f"[cd_polish_gpu] starting proxy={base_proxy:.4f} "
-              f"ovrlp={base_ovrlp} (device={device})", flush=True)
+              f"ovrlp={base_ovrlp} (device={device}) "
+              f"approx_verify={approx_verify}", flush=True)
     accept_threshold_overlap = base_ovrlp
+    pos_orig = pos.copy()
+    base_proxy_orig = base_proxy
 
     pos_t = torch.tensor(pos, dtype=torch.float32, device=device)
+
+    def _gpu_proxy_at(pos_tensor: torch.Tensor) -> float:
+        with torch.no_grad():
+            single_pos = pos_tensor.unsqueeze(0)
+            proxy_one, _ = gpu_proxy_batched(
+                single_pos, sizes_t,
+                macro_idx_p, offsets_p, mask_p,
+                canvas_w, canvas_h, grid_rows, grid_cols,
+                num_nets_used,
+                n_hard=n_hard,
+                edges_pkg=edges_pkg,
+                smooth_matrices=smooth_matrices,
+                routing_consts=routing_consts,
+                wl_pkg=wl_pkg,
+                chunk_n=proxy_chunk_n,
+            )
+        return float(proxy_one[0].item())
 
     t_start = time.time()
     time_exceeded = False
@@ -415,58 +441,84 @@ def cd_polish_gpu(benchmark, plc, pos_full: np.ndarray,
             gpu_filter_time += time.time() - t_g
 
             t_v = time.time()
+            chunk_baseline_gpu = None
+            if approx_verify:
+                chunk_baseline_gpu = _gpu_proxy_at(pos_t)
             for local_i, i in enumerate(chunk_ids):
                 if time_budget > 0 and (time.time() - t_start) >= time_budget:
                     time_exceeded = True
                     break
                 proxy_dirs = proxy_K_2d[local_i]
                 order = np.argsort(proxy_dirs)
-                tried = 0
                 best_dx, best_dy = 0.0, 0.0
-                best_proxy_local = base_proxy
-                for d_idx in order:
-                    if tried >= topk_verify:
+                if approx_verify:
+                    for d_idx in order:
+                        dx = float(offsets_np[d_idx, 0])
+                        dy = float(offsets_np[d_idx, 1])
+                        nx = pos[i, 0] + dx
+                        ny = pos[i, 1] + dy
+                        if nx - half_w[i] < -1e-6 or nx + half_w[i] > canvas_w + 1e-6:
+                            skip_border += 1
+                            continue
+                        if ny - half_h[i] < -1e-6 or ny + half_h[i] > canvas_h + 1e-6:
+                            skip_border += 1
+                            continue
+                        if _has_new_overlap_with(i, nx, ny):
+                            skip_overlap += 1
+                            continue
+                        gpu_cand = float(proxy_dirs[d_idx])
+                        if gpu_cand < chunk_baseline_gpu - approx_threshold:
+                            best_dx, best_dy = dx, dy
+                        else:
+                            skip_no_improve += 1
                         break
-                    dx = float(offsets_np[d_idx, 0])
-                    dy = float(offsets_np[d_idx, 1])
-                    nx = pos[i, 0] + dx
-                    ny = pos[i, 1] + dy
-                    if nx - half_w[i] < -1e-6 or nx + half_w[i] > canvas_w + 1e-6:
-                        skip_border += 1
-                        continue
-                    if ny - half_h[i] < -1e-6 or ny + half_h[i] > canvas_h + 1e-6:
-                        skip_border += 1
-                        continue
-                    if _has_new_overlap_with(i, nx, ny):
-                        skip_overlap += 1
-                        continue
-                    tried += 1
-                    pos[i, 0] = nx
-                    pos[i, 1] = ny
-                    t_call = time.time()
-                    p_try, o_try = _proxy_at(pos)
-                    dt_call = time.time() - t_call
-                    proxy_call_time_sum += dt_call
-                    if dt_call > proxy_call_time_max:
-                        proxy_call_time_max = dt_call
-                    proxy_calls += 1
-                    pos[i, 0] -= dx
-                    pos[i, 1] -= dy
-                    if o_try > accept_threshold_overlap:
-                        skip_overlap += 1
-                        continue
-                    if p_try < best_proxy_local - 1e-6:
-                        best_proxy_local = p_try
-                        best_dx, best_dy = dx, dy
-                    else:
-                        skip_no_improve += 1
+                else:
+                    tried = 0
+                    best_proxy_local = base_proxy
+                    for d_idx in order:
+                        if tried >= topk_verify:
+                            break
+                        dx = float(offsets_np[d_idx, 0])
+                        dy = float(offsets_np[d_idx, 1])
+                        nx = pos[i, 0] + dx
+                        ny = pos[i, 1] + dy
+                        if nx - half_w[i] < -1e-6 or nx + half_w[i] > canvas_w + 1e-6:
+                            skip_border += 1
+                            continue
+                        if ny - half_h[i] < -1e-6 or ny + half_h[i] > canvas_h + 1e-6:
+                            skip_border += 1
+                            continue
+                        if _has_new_overlap_with(i, nx, ny):
+                            skip_overlap += 1
+                            continue
+                        tried += 1
+                        pos[i, 0] = nx
+                        pos[i, 1] = ny
+                        t_call = time.time()
+                        p_try, o_try = _proxy_at(pos)
+                        dt_call = time.time() - t_call
+                        proxy_call_time_sum += dt_call
+                        if dt_call > proxy_call_time_max:
+                            proxy_call_time_max = dt_call
+                        proxy_calls += 1
+                        pos[i, 0] -= dx
+                        pos[i, 1] -= dy
+                        if o_try > accept_threshold_overlap:
+                            skip_overlap += 1
+                            continue
+                        if p_try < best_proxy_local - 1e-6:
+                            best_proxy_local = p_try
+                            best_dx, best_dy = dx, dy
+                        else:
+                            skip_no_improve += 1
+                    if best_dx != 0.0 or best_dy != 0.0:
+                        base_proxy = best_proxy_local
                 if best_dx == 0.0 and best_dy == 0.0:
                     continue
                 pos[i, 0] += best_dx
                 pos[i, 1] += best_dy
                 pos_t[i, 0] = float(pos[i, 0])
                 pos_t[i, 1] = float(pos[i, 1])
-                base_proxy = best_proxy_local
                 improvements += 1
                 accept_count += 1
             verify_time += time.time() - t_v
@@ -496,4 +548,12 @@ def cd_polish_gpu(benchmark, plc, pos_full: np.ndarray,
     if verbose:
         print(f"[cd_polish_gpu] final proxy={final_proxy:.4f} "
               f"ovrlp={final_ovrlp}", flush=True)
+    if approx_verify and (final_proxy >= base_proxy_orig - 1e-6
+                          or final_ovrlp > base_ovrlp):
+        if verbose:
+            print(f"[cd_polish_gpu] approx_verify REVERT: TILOS final "
+                  f"{final_proxy:.4f} ovrlp={final_ovrlp} not better than "
+                  f"orig {base_proxy_orig:.4f} ovrlp={base_ovrlp} "
+                  f"-- returning original pos", flush=True)
+        return pos_orig, base_proxy_orig
     return pos, final_proxy
