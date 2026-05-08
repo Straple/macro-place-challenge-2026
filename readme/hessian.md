@@ -389,6 +389,21 @@ scp evyukhnevich@103.76.52.240:macro-place/.remote_runs/stats_ROUND_NAME.json /t
 - **Verdict:** NOISE (0.9083 vs trial9 0.9065 = +0.0018, в noise). CD signature consistent: -0.010 absolute.
 - **Confirmation #2:** pre-CD start dominates final result. Same pattern as Round 5/6.
 
+#### Round 8 — per-accept GPU baseline refresh — REGRESSION — 2026-05-08
+- **Hypothesis:** В approx mode chunk-baseline становится stale после accepts → drift. Refresh baseline после каждого accept'а делает алгоритм accurate (как точный CD).
+- **Code (`submissions/straple/cd_polish.py`):** после `improvements += 1`, в approx mode пересчитать `chunk_baseline_gpu = _gpu_proxy_at(pos_t)`. Cost: ~5ms × accept_count = ~150ms/round (negligible).
+- **Run config:** same as Round 4 (DIRS=8, ROUNDS=8, single-seed).
+- **Result:** pre-CD min=0.9119. После 8 rounds: **0.9044** (-0.0075). CD 27.1s, wall 15 min.
+- **Per-round accepts:** 7+12+9+9+12+7+7+7 = **70 accepts** (vs typical 150-180 без refresh!). **Per-accept refresh -55% accepts.**
+- **Verdict:** REGRESSION. CD signature -0.0075 absolute (vs -0.010 typical). 0.9044 vs trial9 0.9065 = -0.0021 — better than Round 5/6/7 only потому что pre-CD был лучше (0.9119 vs ~0.916).
+- **Insight: drift в approx mode — это feature, не bug.** Stricter refresh обрезает marginal accepts которые в drift-mode coincidentally дрейфуют в правильную сторону. Final TILOS verify уже gates валидность — extra accuracy за счёт fewer accepts ухудшает abs improvement.
+- **Fix:** revert на per-chunk only baseline (Round 4 default).
+- **Path forward (Round 9+):**
+  1. **Revert Round 8 changes**, вернуться к per-chunk baseline.
+  2. **Relax accept threshold:** approx_threshold=0 (admit any GPU-improvement) или -1e-4 (Allow slight worsening = SA-like).
+  3. **Multi-seed top-N=20+** в Round 4 paradigm (no per-accept refresh).
+  4. **Implement pair-swap CD** (path D, orthogonal).
+
 ---
 
 ## 8. Iteration prompt (для coder/reviewer/orchestrator triad)

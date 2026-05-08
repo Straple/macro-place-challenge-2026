@@ -533,6 +533,8 @@ def cd_polish_gpu(benchmark, plc, pos_full: np.ndarray,
                 pos_t[i, 1] = float(pos[i, 1])
                 improvements += 1
                 accept_count += 1
+                if approx_verify:
+                    chunk_baseline_gpu = _gpu_proxy_at(pos_t)
             verify_time += time.time() - t_v
             if time_exceeded:
                 break
