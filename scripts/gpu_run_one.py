@@ -568,7 +568,29 @@ def main():
                         approx_verify=cd_approx_verify,
                         approx_threshold=cd_approx_threshold,
                         approx_refresh_per_accept=cd_approx_refresh,
-                        verbose=True)
+                        verbose=False)
+                    seed_pswap_enable = os.environ.get(
+                        "STRAPLE_BATCH_PAIR_SWAP_PER_SEED", "0") == "1"
+                    if seed_pswap_enable:
+                        psw_pos, psw_proxy = pair_swap_polish_gpu(
+                            benchmark, plc, polished_seed_pos,
+                            proxy_pkgs=proxy_pkgs_cd,
+                            n_neighbors=int(os.environ.get(
+                                "STRAPLE_BATCH_PAIR_SWAP_NEIGHBORS", "12")),
+                            n_rounds=int(os.environ.get(
+                                "STRAPLE_BATCH_PAIR_SWAP_ROUNDS", "6")),
+                            verbose=False,
+                            time_budget=0.0,
+                            proxy_chunk_n=cd_proxy_chunk_n,
+                            chunk_pairs=int(os.environ.get(
+                                "STRAPLE_BATCH_PAIR_SWAP_CHUNK", "256")))
+                        if psw_proxy < polished_seed_proxy - 1e-6:
+                            polished_seed_proxy = psw_proxy
+                            polished_seed_pos = psw_pos
+                    print(f"[gpu_run_one] -- seed rank={rank+1}/"
+                          f"{cd_top_n_seeds} k={int(k)} "
+                          f"start={seed_orig_proxy:.4f} -> "
+                          f"end={polished_seed_proxy:.4f}", flush=True)
                     if polished_seed_proxy < best_polished_proxy - 1e-6:
                         best_polished_proxy = polished_seed_proxy
                         best_polished_pos = polished_seed_pos.astype(np.float32)

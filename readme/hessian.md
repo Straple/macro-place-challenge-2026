@@ -509,6 +509,20 @@ scp evyukhnevich@103.76.52.240:macro-place/.remote_runs/stats_ROUND_NAME.json /t
   3. Single-macro CD on best (approx_verify, 8 rounds)
   4. Pair-swap CD on result (12 neighbors, 6 rounds)
 
+#### Round 17 — Идея #4: Multi-seed top-5 × (CD + pair-swap) — NOISE / lateral — 2026-05-09
+- **Hypothesis:** Round 16 pipeline (CD + pair-swap) на TOP-5 seeds, take best polished. Покрывает разные basins → потенциально выше chance найти deeper floor.
+- **Code:** в `scripts/gpu_run_one.py` multi-seed loop теперь зовёт `pair_swap_polish_gpu` if `STRAPLE_BATCH_PAIR_SWAP_PER_SEED=1` после CD per seed.
+- **Run config:** `STRAPLE_BATCH_CD_GPU_TOP_N_SEEDS=5 STRAPLE_BATCH_PAIR_SWAP_PER_SEED=1` поверх Round 16.
+- **Result:** top-5 by pre-CD: 0.9082, 0.9152, 0.9156, 0.9181, 0.9195. После CD+pswap each:
+  - k=183: 0.9082 → 0.8908 (best, -0.0174)
+  - k=222: 0.9152 → 0.9014
+  - k=93: 0.9156 → 0.9009
+  - k=66: 0.9181 → 0.9040
+  - k=45: 0.9195 → 0.9045
+  Wall 28.6 min, CD time total 217s. Best **0.8908**.
+- **Verdict:** **NOT NEW BEST** (vs Round 16 0.8871 = +0.0037 worse). Same pattern as Round 5/9: multi-seed within narrow pre-CD spread (0.91-0.92) каждый seed converges к ~ basin_min - 0.014, best of N still bounded by lowest pre-CD.
+- **Что delivered:** confirms hypothesis "pre-CD start dominates". Multi-seed бесполезен при narrow distribution. Best of top-5 ≈ best of top-1 + variance noise.
+
 
 
 **Подтверждённый pattern:** CD polish даёт **-0.010 ± 0.001 absolute** improvement регardless of tweaks. Floor определяется pre-CD (gradient batch outcome). Random tweaks (more dirs, multi-seed top-N, larger sf, restart with jitter, longer gradient) — не пробивают.
