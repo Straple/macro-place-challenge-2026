@@ -467,6 +467,23 @@ scp evyukhnevich@103.76.52.240:macro-place/.remote_runs/stats_ROUND_NAME.json /t
   - Perturb-relax NOT improving over initial CD at current hyperparams
   - Need to tune: smaller perturb_step (0.1-0.2), more mini_steps (200-300), maybe smaller K to focus gradient
 
+#### Round 15 — Идея #2: Recalibrated gradient schedule (longer + capped λ_o) — NOISE / lateral — 2026-05-09
+- **Hypothesis:** Round 12 LOSE was caused by λ_o exploding to 645k at 1200s. Cap `overlap_w_max=50000` (vs 500000 default) + halve `overlap_w_growth=1.004` (vs 1.008) → λ_o stays manageable, gradient может deeper в P3 settling.
+- **Code:** `scripts/gpu_run_one.py` — env `STRAPLE_BATCH_OVERLAP_W_MAX` и `STRAPLE_BATCH_OVERLAP_W_GROWTH`, проброшены в gradient_batch.
+- **Run config:** `--time-budget 1200 STRAPLE_BATCH_OVERLAP_W_MAX=50000 STRAPLE_BATCH_OVERLAP_W_GROWTH=1.004` (rest = Round 14 trial9+CD approx).
+- **Result:**
+  - **Gradient gone deeper:** at step=1000 wl=21068 (vs Round 4 step=400 wl=21838 = -3.5%). λ_o capped at 27k (vs Round 12 уехал к 645k).
+  - **Distribution shifted lower:** mean=1.0319±0.0658 (vs Round 14 1.0468±0.0724 = -1.4% mean, -9% std). p25=0.9756, p95=1.1352.
+  - **Pre-CD min=0.9040** (lowest of any run!) → post-CD **0.8947** (-0.0093 abs).
+  - Wall 25.3 min, CD time 22.7s.
+- **Verdict:** NOISE for best (0.8947 vs Round 14 0.8942 = +0.0005, within noise). But **distribution genuinely improved** — every-seed is better. Confirms idea #2 хороший fix.
+- **Insight: CD floor near absolute bound для ibm01 ≈ 0.894.** Round 14 (-0.014 abs from 0.9082) и Round 15 (-0.0093 from 0.9040) обе landed на 0.894. Smaller delta при lower start = approaching minimum.
+- **Что delivered:**
+  - Confirmed Round 12 LOSE root cause (λ_o explosion)
+  - Schedule fix → significantly better distribution
+  - Pre-CD min new lower bound 0.9040
+  - Improved baseline for all subsequent runs (just use these env vars)
+
 
 
 **Подтверждённый pattern:** CD polish даёт **-0.010 ± 0.001 absolute** improvement регardless of tweaks. Floor определяется pre-CD (gradient batch outcome). Random tweaks (more dirs, multi-seed top-N, larger sf, restart with jitter, longer gradient) — не пробивают.

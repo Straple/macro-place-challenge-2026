@@ -154,6 +154,10 @@ def main():
     cohesion_beta_start = float(os.environ.get("STRAPLE_BATCH_COHESION_START", "0"))
     cohesion_beta_end = float(os.environ.get("STRAPLE_BATCH_COHESION_END", "0"))
     grad_lr = float(os.environ.get("STRAPLE_BATCH_LR", "0.3"))
+    grad_overlap_w_max = float(os.environ.get(
+        "STRAPLE_BATCH_OVERLAP_W_MAX", "500000"))
+    grad_overlap_w_growth = float(os.environ.get(
+        "STRAPLE_BATCH_OVERLAP_W_GROWTH", "1.008"))
     pos_K, stats = gradient_batch(
         benchmark, plc, K=args.K,
         num_steps=20000,
@@ -173,6 +177,8 @@ def main():
         cong_weight=cong_weight,
         per_k_diversity=per_k_diversity,
         lr=grad_lr,
+        overlap_w_max=grad_overlap_w_max,
+        overlap_w_growth=grad_overlap_w_growth,
     )
     grad_time = time.time() - t0
     if torch.cuda.is_available():
