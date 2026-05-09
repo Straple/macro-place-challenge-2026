@@ -774,6 +774,19 @@ STRAPLE_BATCH_PAIR_SWAP_ROUNDS=6
 
 ---
 
+#### result-action3 — M1 joint p-norm cong+density loss — **LOSE/FAIL** — 2026-05-09
+- **Hypothesis:** Replace additive `0.5·cong + 0.5·dens` with Chebyshev p-norm `((cw·cong_norm)^p + (dw·dens_norm)^p)^(1/p)` где cong_norm = cong_total / cong_total.detach() (ratio = 1 numerically, gradient flows). p=4 should produce knee-seeking geometry per Miettinen 1999.
+- **Code:** Refactored `submissions/straple/gradient_batch.py` joint_p branches per improve.md skeleton (added detach-normalization that previous partial implementation had missed). Added per-K extension. Tests: tests/test_joint_loss.py 4 sanity checks pass. Env `STRAPLE_BATCH_JOINT_LOSS_P=4` (default 0).
+- **Smoke test #1 (p=4, seed=42):** killed at step=200. Step 100: dpen=260832 (vs baseline 17320 = **15× explosion**), ovf=0.688 (vs baseline 0.369), λ_d=0.01 (init). Step 200: λ_d=2000 (max ceiling hit), ovf=0.199, dpen=10010.
+- **Smoke test #2 (p=2, seed=42):** identical failure mode at steps 100/200. p=2 ≠ p=4 in math but same explosion: dpen=260k, λ_d ramps to 2000 max.
+- **Math analysis (root cause):** Plan's detach-normalize formula has loss numerically equal to `(cw^p + dw^p)^(1/p) = constant`. Gradient through `cong_norm = cong_total / cong_total.detach()` scales as `1/cong_total.detach()`. For density, dpen.detach() ~ 3000 → gradient on dens divided by 3000, **kills it**. Once λ_d ramps under overflow control, dw = density_weight scales to 2000+ → `dw^p = 1.6e13` dominates joint_pen → also kills cong gradient. Optimizer left with ~0 useful signal on both components → density stays high → overflow stays high → λ_d max → loop.
+- **Verdict:** **LOSE.** Plan's joint p-norm formulation is fundamentally incompatible with our overflow-driven dynamic λ_d update. Both p values blow up identically. Abandoning M1 for ibm01 in this paradigm.
+- **Не делать в будущем:** detach-normalized p-norm joint loss with our dynamic λ_d — ratio + dynamic weight + power amplifies pathology. Если возвращаться к knee-seeking, нужно либо фиксированные weights (не λ_d), либо joint_pen без normalization on raw scaled values, либо абсолютные target-relative ratios `(cong/cong_target)^p + (dens/dens_target)^p` (не tested but theoretically more stable).
+- **Status:** Code shipped under env-gate STRAPLE_BATCH_JOINT_LOSS_P (default 0). Backwards compat preserved. Kept in tree for any future revival, но default OFF.
+- **Next:** Action #5 (MOTPE HPO) — auto-tune existing pipeline, no loss reformulation.
+
+---
+
 **Подтверждённый pattern:** CD polish даёт **-0.010 ± 0.001 absolute** improvement регardless of tweaks. Floor определяется pre-CD (gradient batch outcome). Random tweaks (more dirs, multi-seed top-N, larger sf, restart with jitter, longer gradient) — не пробивают.
 
 **Реальные пути для breakthrough:**
