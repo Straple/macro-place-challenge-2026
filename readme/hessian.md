@@ -748,7 +748,31 @@ STRAPLE_BATCH_PAIR_SWAP_ROUNDS=6
 - ML-based macro placement (RL-trained policy)
 - Different objective formulation (joint cong+density beyond Pareto)
 
+#### diag-h2 — Action #1 component breakdown trajectory — 2026-05-09
+- **What:** instrumented gpu_run_one.py with 5-stage breakdown logging (post-gradient raw, post-legalize, post-cd, post-pair-swap, post-triple-cycle). New module `submissions/straple/breakdown_log.py`, env `STRAPLE_BATCH_BREAKDOWN_LOG=1` (default off).
+- **Run config:** trial9 baseline (CD+pair-swap rounds=8+triple-cycle), 1200s gradient, K=384, ibm01.
+- **Result trajectory (single run):**
+  | stage | proxy | WL | dens | cong | wl_frac | dens_frac | cong_frac | ovl |
+  |---|---|---|---|---|---|---|---|---|
+  | post-gradient (raw best k=183) | 0.9124 | 0.0711 | 0.5711 | 1.1116 | 0.078 | 0.313 | **0.609** | 108 |
+  | post-legalize (best k=93) | 0.9101 | 0.0707 | 0.5951 | 1.0838 | 0.078 | 0.327 | 0.595 | 0 |
+  | post-cd | 0.8960 | 0.0708 | 0.5802 | 1.0702 | 0.079 | 0.324 | 0.597 | 0 |
+  | post-pair-swap | 0.8940 | 0.0712 | 0.5799 | 1.0658 | 0.080 | 0.324 | 0.596 | 0 |
+  | post-triple-cycle | 0.8938 | 0.0712 | 0.5798 | 1.0655 | 0.080 | 0.324 | 0.596 | 0 |
+  Final 0.8938 — within noise of Round 23 best 0.8856 (±0.005-0.01).
+- **🔑 Key insights:**
+  1. **Cong dominates every stage (59-61%).** post-gradient cong_frac=0.609 — triggers improve.md decision rule `cong_fraction(post-gradient) ≥ 0.55`.
+  2. **Cong-floor is set by gradient phase, not polish.** Cong drops 1.1116→1.0655 across full pipeline = -0.046 absolute. Of that: legalize -0.028 (60%), CD -0.014 (30%), pair-swap+triple -0.005 (10%). Pair-swap and triple-cycle are essentially **noop on congestion** — they polish density and WL, not cong.
+  3. **Density bumps post-legalize.** dens grows 0.5711→0.5951 (+0.024) after C++ legalize redistributes overlapping macros. CD reverses to 0.5802. Density only weakly responds to polish.
+  4. **WL stable ~0.0708-0.0712** across all stages. WL is solved by gradient phase, polish doesn't touch it.
+- **Decision rule per improve.md v4:**
+  - `cong_fraction(post-gradient) = 0.609 ≥ 0.55` → **SKIP** Hessian/L-BFGS (Action #4 deprioritized).
+  - **GO Action #2 (DREAMPlace black-box)** + **Action #3 (M1 joint p=4 loss)**.
+  - L-BFGS would attack gradient-phase WL/density convergence, but cong is the bottleneck and cong is **not optimizable by gradient finisher** — it's a function of the macro layout topology.
+- **S1 status:** deferred until Action #2 install. No external reference placement available locally for ibm01 (only `initial.plc` from MacroPlacement = un-optimized CT init, proxy ≈ 1.04 — useless as ceiling probe). DREAMPlace install (Action #2 step 2) provides the reference automatically.
+- **Verdict:** DIAGNOSTIC SUCCESS. Confirmed cong is bottleneck, gradient phase locks cong-floor, polish operators only touch dens+WL. Routing to Action #2 first (paradigm shift attempts at gradient phase), then Action #3 (loss reformulation) parallel.
 
+---
 
 **Подтверждённый pattern:** CD polish даёт **-0.010 ± 0.001 absolute** improvement регardless of tweaks. Floor определяется pre-CD (gradient batch outcome). Random tweaks (more dirs, multi-seed top-N, larger sf, restart with jitter, longer gradient) — не пробивают.
 
