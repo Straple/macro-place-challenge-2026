@@ -463,7 +463,11 @@ def pair_swap_polish_gpu(benchmark, plc, pos_full: np.ndarray,
                           verbose: bool = False,
                           time_budget: float = 0.0,
                           proxy_chunk_n: int = 32,
-                          chunk_pairs: int = 256) -> tuple[np.ndarray, float]:
+                          chunk_pairs: int = 256,
+                          rank_mode: str = "proxy",
+                          rank_cong_weight: float = 1.0,
+                          rank_wl_weight: float = 1.0,
+                          rank_dens_weight: float = 0.5) -> tuple[np.ndarray, float]:
     """Pair-swap polish: for each macro, try swap with K-nearest neighbors.
 
     Pipeline per round:
@@ -556,6 +560,26 @@ def pair_swap_polish_gpu(benchmark, plc, pos_full: np.ndarray,
 
     pos_t = torch.tensor(pos, dtype=torch.float32, device=device)
     base_gpu = _gpu_proxy(pos_t)
+
+    def _gpu_rank(pos_tensor: torch.Tensor) -> float:
+        if rank_mode == "proxy":
+            return _gpu_proxy(pos_tensor)
+        with torch.no_grad():
+            single = pos_tensor.unsqueeze(0)
+            _, c = gpu_proxy_batched(
+                single, sizes_t, macro_idx_p, offsets_p, mask_p,
+                canvas_w, canvas_h, grid_rows, grid_cols, num_nets_used,
+                n_hard=n_hard,
+                edges_pkg=edges_pkg, smooth_matrices=smooth_matrices,
+                routing_consts=routing_consts, wl_pkg=wl_pkg,
+                chunk_n=proxy_chunk_n)
+        if rank_mode == "cong":
+            return float(c["congestion"][0].item())
+        return float(rank_wl_weight * c["wl"][0].item()
+                     + rank_dens_weight * c["density"][0].item()
+                     + rank_cong_weight * c["congestion"][0].item())
+
+    base_rank = _gpu_rank(pos_t)
     t_start = time.time()
 
     for r in range(n_rounds):
@@ -637,18 +661,26 @@ def pair_swap_polish_gpu(benchmark, plc, pos_full: np.ndarray,
                 continue
 
             with torch.no_grad():
-                proxy_K, _comp = gpu_proxy_batched(
+                proxy_K, comp = gpu_proxy_batched(
                     cand, sizes_t, macro_idx_p, offsets_p, mask_p,
                     canvas_w, canvas_h, grid_rows, grid_cols, num_nets_used,
                     n_hard=n_hard,
                     edges_pkg=edges_pkg, smooth_matrices=smooth_matrices,
                     routing_consts=routing_consts, wl_pkg=wl_pkg,
                     chunk_n=proxy_chunk_n)
-            arr = proxy_K.cpu().numpy()
+            if rank_mode == "cong":
+                rank_K = comp["congestion"]
+            elif rank_mode == "blend":
+                rank_K = (rank_wl_weight * comp["wl"]
+                          + rank_dens_weight * comp["density"]
+                          + rank_cong_weight * comp["congestion"])
+            else:
+                rank_K = proxy_K
+            arr = rank_K.cpu().numpy()
             arr_v = np.where(valid, arr, np.inf)
             best_ci = int(np.argmin(arr_v))
             best_val = float(arr_v[best_ci])
-            if best_val >= base_gpu - 1e-6:
+            if best_val >= base_rank - 1e-6:
                 continue
             i_best, j_best = int(chunk[best_ci, 0]), int(chunk[best_ci, 1])
             tmp = pos[i_best].copy()
@@ -658,7 +690,8 @@ def pair_swap_polish_gpu(benchmark, plc, pos_full: np.ndarray,
             pos_t[i_best, 1] = float(pos[i_best, 1])
             pos_t[j_best, 0] = float(pos[j_best, 0])
             pos_t[j_best, 1] = float(pos[j_best, 1])
-            base_gpu = best_val
+            base_rank = best_val
+            base_gpu = _gpu_proxy(pos_t) if rank_mode != "proxy" else best_val
             round_accepts += 1
 
         if verbose:

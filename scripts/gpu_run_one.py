@@ -702,6 +702,14 @@ def main():
             "STRAPLE_BATCH_PAIR_SWAP_CHUNK", "256"))
         pswap_tb = float(os.environ.get(
             "STRAPLE_BATCH_PAIR_SWAP_TIME_BUDGET", "0"))
+        pswap_rank_mode = os.environ.get(
+            "STRAPLE_BATCH_PAIR_SWAP_RANK_MODE", "proxy")
+        pswap_rank_cw = float(os.environ.get(
+            "STRAPLE_BATCH_PAIR_SWAP_RANK_CONG_W", "1.0"))
+        pswap_rank_ww = float(os.environ.get(
+            "STRAPLE_BATCH_PAIR_SWAP_RANK_WL_W", "1.0"))
+        pswap_rank_dw = float(os.environ.get(
+            "STRAPLE_BATCH_PAIR_SWAP_RANK_DENS_W", "0.5"))
         if wall_tl > 0:
             wall_remaining = wall_tl - (time.time() - t0) - wall_reserve
             if pswap_tb <= 0 or pswap_tb > wall_remaining:
@@ -718,7 +726,11 @@ def main():
             verbose=True,
             time_budget=pswap_tb,
             proxy_chunk_n=cd_proxy_chunk_n,
-            chunk_pairs=pswap_chunk)
+            chunk_pairs=pswap_chunk,
+            rank_mode=pswap_rank_mode,
+            rank_cong_weight=pswap_rank_cw,
+            rank_wl_weight=pswap_rank_ww,
+            rank_dens_weight=pswap_rank_dw)
         ps_dt = time.time() - t_ps
         if ps_proxy < best_proxy - 1e-6:
             print(f"[gpu_run_one] PAIR_SWAP IMPROVED: "
