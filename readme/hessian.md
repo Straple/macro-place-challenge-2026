@@ -663,6 +663,18 @@ STRAPLE_BATCH_PAIR_SWAP_ROUNDS=6
   --time-budget 1200
   ```
 
+#### Round 24 — Extended pair-swap (rounds=12, neighbors=16) — wash — 2026-05-09
+- **Hypothesis:** Round 23 pair-swap rounds=8 не сошёлся (R8=5 acc). Extended rounds=12 + more neighbors → deeper.
+- **Run config:** `STRAPLE_BATCH_PAIR_SWAP_NEIGHBORS=16 STRAPLE_BATCH_PAIR_SWAP_ROUNDS=12 STRAPLE_BATCH_TRIPLE_CYCLE_NEIGHBORS=8` (rest = Round 23).
+- **Result:** Pre-CD 0.9071 (worse than Round 23 0.9034!). CD 0.8967, pair-swap **0.8918** (-0.0049 abs, converged R11), triple-cycle 0 acc. Wall 26.8 min.
+- **Verdict:** **NOT NEW BEST** (0.8918 vs Round 23 0.8856 = +0.0062 worse).
+- **Pair-swap performance:**
+  - Round 16 (rounds=6): -0.0032 abs
+  - Round 23 (rounds=8): -0.0045 abs
+  - Round 24 (rounds=12, more neighbors): -0.0049 abs
+  - Diminishing returns — пары converge quickly
+- **Conclusion:** pair-swap rounds=8-10, neighbors=12 — sweet spot. Дальнейшее extension marginal. **Pre-CD start dominates.**
+
 
 
 **Подтверждённый pattern:** CD polish даёт **-0.010 ± 0.001 absolute** improvement регardless of tweaks. Floor определяется pre-CD (gradient batch outcome). Random tweaks (more dirs, multi-seed top-N, larger sf, restart with jitter, longer gradient) — не пробивают.
