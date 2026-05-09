@@ -852,24 +852,60 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
         # Per-K weighting: instead of summed total, sum (per-K loss * per-K mul)
         # for components that vary per seed: density, anchor, cong.
         # WL and overlap stay shared (already vectorized over K).
+        #
+        # Action #3 (M1): when STRAPLE_BATCH_JOINT_LOSS_P>0, replace additive
+        # cong+dens with Chebyshev p-norm. Components are detach-normalized
+        # (x / x.detach() = 1.0 numerically with gradient flowing through), so
+        # gradient direction follows knee-seeking geometry while numerical loss
+        # value depends only on weight magnitudes. See improve.md v4 Action #3.
+        joint_p = float(os.environ.get("STRAPLE_BATCH_JOINT_LOSS_P", "0"))
         if per_k_diversity:
             density_per_K = density_weight * lambda_mul_K_t * dpen_K
             cong_per_K = cong_weight * cong_mul_K_t * cong_K
-            # anchor_loss_total already weighted globally; if per_k, we can't
-            # easily decompose without redoing — skip for now (uses global β)
-            loss = (wl_total + density_per_K.sum()
-                    + cur_overlap_w_phase * overlap_total
-                    + anchor_loss_total
-                    + cohesion_loss_total
-                    + cong_per_K.sum()
-                    + topk_density_weight * density_topk_total)
+            if joint_p > 0:
+                eps = 1e-9
+                cong_norm_K = cong_K / cong_K.detach().clamp_min(eps)
+                dens_norm_K = dpen_K / dpen_K.detach().clamp_min(eps)
+                cong_w_per_K = cong_weight * cong_mul_K_t
+                dens_w_per_K = density_weight * lambda_mul_K_t
+                joint_pen_K = (
+                    (cong_w_per_K * cong_norm_K) ** joint_p
+                    + (dens_w_per_K * dens_norm_K) ** joint_p
+                    + eps
+                ) ** (1.0 / joint_p)
+                joint_pen = joint_pen_K.sum()
+                loss = (wl_total + cur_overlap_w_phase * overlap_total
+                        + anchor_loss_total + cohesion_loss_total
+                        + topk_density_weight * density_topk_total
+                        + joint_pen)
+            else:
+                loss = (wl_total + density_per_K.sum()
+                        + cur_overlap_w_phase * overlap_total
+                        + anchor_loss_total
+                        + cohesion_loss_total
+                        + cong_per_K.sum()
+                        + topk_density_weight * density_topk_total)
         else:
-            loss = (wl_total + density_weight * dpen_total
-                    + cur_overlap_w_phase * overlap_total
-                    + anchor_loss_total
-                    + cohesion_loss_total
-                    + cong_weight * cong_total
-                    + topk_density_weight * density_topk_total)
+            if joint_p > 0:
+                eps = 1e-9
+                cong_norm = cong_total / cong_total.detach().clamp_min(eps)
+                dens_norm = dpen_total / dpen_total.detach().clamp_min(eps)
+                joint_pen = (
+                    (cong_weight * cong_norm) ** joint_p
+                    + (density_weight * dens_norm) ** joint_p
+                    + eps
+                ) ** (1.0 / joint_p)
+                loss = (wl_total + cur_overlap_w_phase * overlap_total
+                        + anchor_loss_total + cohesion_loss_total
+                        + topk_density_weight * density_topk_total
+                        + joint_pen)
+            else:
+                loss = (wl_total + density_weight * dpen_total
+                        + cur_overlap_w_phase * overlap_total
+                        + anchor_loss_total
+                        + cohesion_loss_total
+                        + cong_weight * cong_total
+                        + topk_density_weight * density_topk_total)
         # Optional per-macro velocity scaling. Two flavours:
         #   STRAPLE_BATCH_VELOCITY_SCALE   — boost ∝ |∂total_loss/∂pos|
         #   STRAPLE_BATCH_VELOCITY_WL_SCALE — boost ∝ |∂WL/∂pos|  (this macro's
