@@ -1,548 +1,512 @@
-# Improve.md v3 — план прорыва от 0.8856 → < 0.8
+# Improve.md v4 — FINAL action plan от 0.8856 → ≤0.85
 
-> v1 (6 research agents) → v2 (3 reviewers: math, impl, missing ideas) → v3 (3 reviewers: experimental rigor, practical execution, contrarian challenge).
-> Target ≤ 0.8 на ibm01 через **gradient + Hessian/2nd-order info** + diagnostics, без multi-month ML/RL.
-
-## Контекст
-
-- **Best 0.8856** (Round 23, single-shot lucky). Median pipeline ~0.890-0.895 (Round 28 replay = 0.8955).
-- **Target ≤ 0.8.** Gap до vmallela 0.7644 = +16%.
-- **Pipeline:** Adam batch K=384 (1200s) → C++ legalize → CD approx (8 rounds) → pair-swap (KNN=12, 8 rounds) → triple-cycle → CD postswap.
-- **Wall:** 36+ rounds в этой сессии. История в `hessian.md` секция 7.5.
+> Прошёл 4 итерации с 12 агентами:
+> - v1: 6 research agents (Hessian, Newton/quasi-Newton, Approximations, Critical, Synthesis, Web/papers)
+> - v2: 3 reviewers (math, impl, missing ideas)
+> - v3: 3 reviewers (rigor, execution, contrarian)
+> - v4: 4 reviewers (verification, protocols, devil's advocate, final synthesis)
+>
+> **One-line pitch:** Diagnostics-first (Day 1-2) → DREAMPlace black-box paradigm shift (Day 3-4) → joint loss + L-BFGS (Day 5-7) → Bayesian HPO overnight. Realistic target **0.85-0.87**, stretch **0.79-0.82**.
 
 ---
 
-## ⚠️ v3 Critical reframing — contrarian challenges (must address FIRST)
+## ⭐ Executive Summary — что и почему
 
-**Все Tier 1-3 предполагают "continuous optimization paradigm правильна". Это не обязательно так.**
+**Текущий best:** 0.8856 (Round 23, lucky single-shot). **Median pipeline:** ~0.890-0.895.
 
-### Challenge C1: Wrong objective hypothesis
-Proxy = WL_smooth + 0.5·density_RUDY + 0.5·cong_RUDY. Vmallela 0.7644 может оптимизировать **другую quantity** (routed HPWL, FLUTE Steiner) которая correlates но имеет лучший landscape. Все наши Tier 1 wasted если loss formulation сама — bottleneck.
+**Кальибрированные probabilities (devil's advocate honest):**
+- P(reach 0.85 in 1 week) ≈ **0.20-0.35**
+- P(reach 0.80 in 2 weeks) ≈ **0.05-0.15**
+- P(zero improvement) ≈ **0.20-0.25**
 
-### Challenge C2: ePlace overkill для 246 macros
-ePlace machinery (FFT density 32×32 grid, gaussian mollification) designed для standard cells (миллионы tiny rects). Для IBM01 hard macros n=246 это **MILP-tractable**. Continuous relaxation сама вносит approximation errors которые constrain optimum.
+**5 Actions ranked by `expected_value × probability_success`:**
 
-### Challenge C3: Saddle obsession + noise floor
-σ ≈ 0.01 (Round 28 replay). Vast majority differences между rounds — **noise**. Hessian methods cannot distinguish noise-equilibrium от saddle-equilibrium. Даже 90% saddles может означать landscape garbage, not solvable through 2nd-order.
+| # | Action | Confidence | Time | Realistic Δ | Stretch Δ |
+|---|---|---|---|---|---|
+| 1 | **H2 + S1 diagnostics** (Phase 0) | 9/10 | 5-7h | 0 (gates) | 0 |
+| 2 | **DREAMPlace M3 black-box** | 7/10 | 12-18h | -0.02 | -0.06 |
+| 3 | **M1 Joint p=4 cong+density loss** | 6/10 | 4-6h | -0.005 | -0.015 |
+| 4 | **L-BFGS late-stage finisher** | 7/10 (down from 8/10) | 8-12h | -0.005 | -0.010 |
+| 5 | **MOTPE Bayesian HPO overnight** | 7/10 (down from 8/10) | 8-12h+12h GPU | -0.008 | -0.015 |
 
-### Challenge C4: K=384 cargo cult
-384 = legacy. ROI per seed degrades после ~K=32 (within-batch correlation). 384×1200s = 460 GPU-min на **redundant exploration of one basin**. K=32 с 4× longer schedule + hyperparam-perturbed restarts likely сильнее.
-
-### Challenge C5: Pipeline lock-in
-"Adam → legalize → CD → pair-swap → triple-cycle" frozen as axiomatic. 8 dirs CD = "что было кодить удобно". 4? 16? 24 (orient-aware)? Not ablated. Same для KNN=12.
-
-### → Phase 0 + S1+S2 sanity checks must run BEFORE Phase 1
-
-**S1. Loss-floor probe** (2h): compute OUR proxy на externally-known good IBM01 placement (e.g., DREAMPlace public, or known reference). Three outcomes:
-- proxy ≈ 0.76 → pipeline weaker, optimization problem (continue improve.md path)
-- proxy ≈ 0.90 → **proxy formulation mismatch** — target unreachable через эту loss (pivot к M3 black-box)
-- proxy ≈ 0.85 → partial mismatch
-
-**S2. Diag-only Hessian gate** (3-5h, prev Tier 2.6 → now Phase 0): простейший Newton — `Δ = -g/diag(H+λI)`. If <0.001 improvement → abandon entire Newton track (Tier 1.1, 1.2, 1.3 share assumption).
-
-**A2. SA-from-scratch on grid** (30 min CPU): random valid placement → SA с {single-move, pair-swap, triple-cycle} neighborhoods. Если final < 0.92 без gradient → pipeline simplification trumps Newton.
+**Cumulative pessimistic 0.881 / realistic 0.866 / stretch 0.795** (from 0.8856).
 
 ---
 
-## ⚠️ v2 Math/impl corrections (preserved in v3)
+## 🚫 KILL LIST (не делать — low ROI / already debunked)
 
-### 1. ESGD-M Hutchinson — было wrong в v1
-**Wrong:** `D ≈ √diag(H²)` через `E[v⊙Hv]` (это даёт `diag(H)`, signed!).
-**Correct:** `D ≈ √E[(Hv)⊙(Hv)]` (per Dauphin 2015 §2-3).
-
-### 2. Cross-terms x↔y нулевые ТОЛЬКО для bbox WL (8% loss)
-density+cong (92% proxy) имеют cross-terms ≠ 0. Per-macro 2×2 Newton требует full analytical Hessian, не just WL.
-
-### 3. SFN: Tikhonov damping вместо |λ|
-**Correct:** `Δ = -∑_i (g·v_i · λ_i / (λ_i² + δ²)) · v_i`, δ = 0.01·|λ_max|. При λ→0 не взрывается.
-
-### 4. Adaptive Levenberg-Marquardt вместо λ=1e-3
-```
-if det(H_i)>0 and trace(H_i)>0: Δ = -H_i⁻¹·g
-else: H_i ← H_i + (|λ_min|+ε)·I  # explicit shift
-backtracking line search: α=1; while L(x+αΔ)>L(x)+c·α·g·Δ: α*=0.5
-```
-
-### 5. Hutchinson noise floor
-2-3 probes слишком noisy (~50% relative error). Need N=10-20 + EMA: `D_t = β·D_{t-1} + (1−β)·(Hv)⊙(Hv)`, β=0.999.
-
-### 6. Effort estimates inflated
-| Idea | Original | Real |
-|---|---|---|
-| Tier 1.1 Newton | 6-8h | **12-18h** |
-| Tier 1.2 ESGD-M | 3-4h | **5-7h** (HVP refactor) |
-| Tier 2.2 L-BFGS | 6-10h | **8-12h** |
-| Tier 2.4 BB | 2-3h | **3-4h** (NOT drop-in for Adam) |
-
-### 7. `_hvp_fd` не reusable — uses lightweight loss
-Need refactor для full loss HVP (+4h).
+1. **Tier 1.1 Per-macro 2×2 Newton CD** — paradigm risk (v1-v7 saddle history showed 768 escapes all in noise); density Hessian derivation 12-18h; gated by S2 which is itself inconclusive at -0.002 zone.
+2. **Tier 1.3 SFN / Cubic Newton** — same paradigm mismatch; σ ≈ 0.01 noise dominates curvature signal.
+3. **Tier 2.3 Hall spectral init** — Round 31 already failed; "schedule recalibration" hopeware.
+4. **Tier 2.4 BB step** — NOT Adam drop-in (Round 27); separate optimizer track explodes (Round 11).
+5. **A2 SA-from-scratch** — Round 23 full-stack 0.8856 vs random ≫ 0.95; gradient phase essential, no need to re-verify.
 
 ---
 
-## ⚠️ v3 Statistical rigor
+## ⚠️ Devil's advocate adjustments (Important!)
 
-### Power analysis for diagnostics
-Round 28 replay measured `σ ≈ 0.005`. For honest detection of `Δ = 0.005 abs` (Cohen's d ≈ 1.0, 80% power, two-sided α=0.05):
+**v3 over-optimistic in:**
+- L-BFGS 8/10 → **7/10:** legalize discontinuity (snap-to-grid jump) corrupts curvature pairs. Real use case = pre-legalize gradient phase only, не post-legalize.
+- M5 Bayesian HPO 8/10 → **7/10:** N=17 paired per trial impossible at single T4 (would need 50+h per HPO trial). Adjusted protocol: N=1 per trial, top-3 verified with N=5.
 
-**N ≥ 17 paired runs per arm.** Original plan N=5 only detects `d ≥ 1.85` (= 0.0093 abs, way too coarse).
+**v3 under-rated:**
+- Tier 2.5 SA-style CD acceptance 7/10 → **8/10:** cheapest, orthogonal, low risk. **Add as Day 1 sidecar.**
 
-### Multi-comparison correction
-14 hypotheses tested → expected 0.7 false positives at α=0.05.
+**S1 access problem (CRITICAL):**
+- "Known-good external placement for ibm01" может быть **недоступен** в protobuf format. Catch-22: чтобы запустить S1 sanity check нужен Bookshelf converter, который сам = 1-2 дня (Action #2 dependency).
+- **Fallback:** если нет access к vmallela's placement → запустить **DREAMPlace директно** (Action #2 first) → use ITS output как known-good для S1.
+- → Order changes: **Action #1 H2 logging first (2h independent), then Action #2 partial (just install + run DREAMPlace), then S1 уsing DREAMPlace output.**
 
-**Benjamini-Hochberg FDR-q=0.10:** rank p-values, accept idea k iff `p_(k) ≤ k·0.10/14`. Equivalent for σ=0.005:
-```
-require Δ ≥ 0.005·√(2·ln(14/k))
-≈ 0.0115 для k=1, dropping to 0.005 при k=14
-```
-
-### Convergence-class taxonomy
-| Method | Convergence | Trust |
-|---|---|---|
-| L-BFGS (Wolfe LS) | Globally to stationary, locally super-linear | high |
-| Cubic Newton (Cartis-Gould) | Global O(ε⁻³/²) to 2nd-order points | high |
-| ESGD-M | No global guarantee (stochastic precond.) | medium |
-| Per-macro Newton (LM-damped) | Local quadratic, global w/ LS | medium |
-| AL (Bertsekas) | Global if ω↑ unbounded | medium |
-| SFN Tikhonov | Local first-order on saddles | low-medium |
-
-### Failure modes (per Tier-1)
-- **1.1:** density Hessian sign chaotic (`G''(x)·G'(y)` may be ≥0 with negative diag → indef 2×2). Detect via `det<0 ∧ trace<0` counter.
-- **1.2:** EMA diverges if `(Hv)²` mean drifts → `D_t/D_{t-50}` ratio outside `[0.5,2]`.
-- **1.4:** dual blow-up `μ_k → ∞` → clamp `μ_k ≤ 1e6`.
-- **2.2:** L-BFGS curvature loss `s_k·y_k ≤ 1e-10·‖s_k‖‖y_k‖` → skip pair update via Powell damping.
+**Compute budget reality (devil's advocate):**
+- v3 claimed 13h Phase 0 GPU + 56h Phase 1 (4 ideas × N=17 paired). Single T4 = 7h/day continuous.
+- Realistic: **N=5-8 paired** (not 17), use Wilcoxon rank-sum test (more robust to non-normality). Detection threshold 0.005 abs.
 
 ---
 
-## Tier 1 — Highest ROI (revised confidences)
+## Action #1: H2 Component Breakdown Logging + S1 Loss-Floor Probe
 
-### 1.1 Per-macro 2×2 Newton CD ★★★ (revised: 5/10)
+### ЧТО
+Залогировать WL/density/cong на 5 точках pipeline + прогнать наш proxy на known-good external IBM01 placement (DREAMPlace public output).
 
-**Method:** local 2×2 Hessian H_i для каждого макроса с **full loss components**:
-- WL_smooth (LSE bbox): closed form softmax derivatives, b=0 для same-macro
-- Density (ePlace eDensity): Bell convolution → `∂²E_d/∂x∂y = Σ_pq [φ_pq·b'_x·b'_y + (∂φ/∂y)·b'_x·b_y + (∂φ/∂x)·b_x·b'_y + (∂²φ/∂x∂y)·b_x·b_y]`. Reuses FFT'd `φ` from forward (+5%/step).
-- Cong (RUDY top-5%): bilinear → b ≠ 0
-- Overlap (rect_quad): pairwise quadratic, analytical
+### ПОЧЕМУ — High confidence
+- **Mechanism:** Round 18 showed cong=61% post-pipeline. H2 даёт **trajectory** через 5 stages → видно где cong "застывает". Если cong=0.95 уже после gradient → Newton/L-BFGS на gradient phase wasted (cong не двигается там). Если cong падает с 1.20→1.05 в pair-swap → есть hook для discrete moves.
+- **Evidence:** Rounds 19-20 showed Pareto cong↔density (cong↓ ⇒ dens↑). Без trajectory не знаем **откуда** frontier.
+- **Why others не addressэт:** все Tier 1 ideas (Newton/L-BFGS/AL) работают на gradient phase. Если cong dominates **post-CD** — Newton wasted.
+- **Theoretical backing:** Bishop-style component analysis. Самая дешёвая, самая высокоinformative diagnostic.
 
-**Step formula (Modified Newton, per math reviewer):**
-```
-if det(H_i) > 0 and trace(H_i) > 0:
-    Δ = -H_i⁻¹·g
-else:
-    H_i ← H_i + (|λ_min|+ε)·I
-backtracking: α=1; while L(x+αΔ) > L(x) + c·α·g·Δ: α*=0.5
-```
+### КАК
+1. **Создать** `submissions/straple/breakdown_log.py` (~60 lines):
+   ```python
+   class BreakdownLogger:
+       def __init__(self, benchmark, plc, run_id):
+           self.b, self.p, self.run_id = benchmark, plc, run_id
+       def log(self, pos, stage, seed=None):
+           cost = compute_proxy_cost(pos, self.b, self.p)
+           print(f"[BREAKDOWN stage={stage} seed={seed} "
+                 f"wl={cost['wirelength_cost']:.4f} "
+                 f"dens={cost['density_cost']:.4f} "
+                 f"cong={cost['congestion_cost']:.4f} "
+                 f"proxy={cost['proxy_cost']:.4f} "
+                 f"ovl_n={cost['overlap_count']}]", flush=True)
+   ```
+2. **Wire в 5 sites:**
+   - `gradient_batch.py` ~line 970 (post-gradient best seed)
+   - `placer.py:861` (post-legalize)
+   - `cd_polish.py:139` (post-CD)
+   - `cd_polish.py:539` (post-pair-swap)
+   - `cd_polish.py:872` (post-triple-cycle)
+3. **Env:** `STRAPLE_BATCH_BREAKDOWN_LOG=1` (default off).
+4. **S1 fallback (no external placement available):** если нет vmallela / DREAMPlace public reference, запустить DREAMPlace ourselves (overlap with Action #2 install) → use its output как S1 reference.
+5. **Test:** 1 baseline trial9 run (~25 min) с logging + S1 на DREAMPlace output.
 
-**Alternative: Cubic-Regularized 2×2 (closed form, math reviewer S4):**
-```
-Eigendecompose H = QΛQᵀ, g̃ = Qᵀg
-s̃_i = -g̃_i / (λ_i + σ),  σ = M·‖s̃‖
-Solve secular: σ² - M²·Σ g̃_i²/(λ_i+σ)² = 0  (1D Newton bracket)
-s = Q·s̃
-```
-Globally convergent, escapes saddles. Preferred over Modified Newton.
+### Done criterion
+- Breakdown log на all 5 stages, valid floats.
+- Decision rule (refined):
+  - `cong_fraction(post-gradient) ≥ 0.55` → **SKIP** Hessian/L-BFGS, GO Action #2 + #3 only.
+  - `S1 proxy on reference ≈ 0.76` → continuous path viable, Action #4 (L-BFGS) worthwhile.
+  - `S1 proxy ≥ 0.88` → proxy formulation **hard ceiling**; abort optimization track, GO Action #5 only.
 
-**Implementation:**
-- New file `submissions/straple/per_macro_newton.py`
-- Integrate **в gradient_batch.py BEFORE legalize**
-- Env `STRAPLE_BATCH_NEWTON_CD=1`, mutex с PLATEAU_OPS / SADDLE
-- Trust-region clamp: `‖Δ‖ ≤ STRAPLE_BATCH_NEWTON_TR · cell_size`
+### Risks
+- **No external placement access** (high P) → run DREAMPlace ourselves for S1.
+- **TILOS overhead 10s** → negligible.
 
-**Expected gain:** -0.005..-0.010 (full loss). WL-only marginal -0.001.
-**Effort:** **12-18h** (full loss Hessian).
-**Confidence:** **5/10** (per critic — cong/density derivations non-trivial, paradigm risk).
-
-### 1.2 ESGD-M (Hessian-diagonal preconditioner) ★★★★
-
-**Method (corrected):**
-```
-D_t = β·D_{t-1} + (1−β)·(Hv)⊙(Hv), β=0.999, v∈{±1}
-update: x ← x - η·g/√(D_t + ε)
-```
-N=5-10 probes accumulated, refresh каждые 50 steps. HVP via FD на FULL loss.
-
-**Implementation:**
-- Refactor `_hvp_fd` → full loss (+4h)
-- Custom step within gradient loop, не replace `optimizer = torch.optim.Adam`
-- Env `STRAPLE_BATCH_OPT=esgdm`
-
-**Expected gain:** pre-CD min 0.91 → 0.89-0.90 → final 0.870-0.880.
-**Effort:** 5-7h.
-**Confidence:** 7/10. **Source:** [Dauphin 2015 arxiv 1502.04390](https://arxiv.org/abs/1502.04390).
-
-### 1.3 Saddle-Free Newton (SFN) — fix v6 ★★★
-
-**Method (corrected):**
-```
-Δ = -∑_i (g·v_i · λ_i / (λ_i² + δ²)) · v_i  # Tikhonov, не |λ|
-δ = 0.01·|λ_max|
-```
-Lanczos top-k=10 eigenpairs.
-
-**Bug fixes for v6:**
-- σ via 10-15 Lanczos шагов с **selective re-orthogonalization** (Parlett-Scott)
-- Eigvec normalization explicit ‖v_i‖=1
-- HVP на **full loss**
-- Tikhonov damping (no singular at λ→0)
-
-**Alternative: Inexact Newton-CG (Steihaug truncation):**
-- Solve `H·Δ = -g` via CG, stop when `‖r_k‖ ≤ η_k·‖g‖` with η_k=min(0.5, √‖g‖)
-- If CG hits negative curvature direction d → return d (Steihaug)
-- **No σ shift needed**, automatic saddle escape
-
-**Effort:** 1.5-2 days. **Confidence:** 5-6/10.
-
-### 1.4 Augmented Lagrangian (AL) для overlap ★★★★
-
-**Method (corrected with projection):**
-```
-L = WL + μ·overlap + (ω/2)·overlap²
-μ_{k+1} = max(0, μ_k + ω·overlap_k)  # projection ≥0
-# Bertsekas §4.2: ω×=2 if ‖overlap_k‖ > η·‖overlap_{k-1}‖, η=0.25
-```
-
-**Mutex:** disable `cur_overlap_w_phase` schedule when `STRAPLE_BATCH_AUGLAG=1`.
-
-**Expected gain:** distribution shift как Round 15 (mean -1.4%) plus best -0.5%.
-**Effort:** 8-12h. **Confidence:** 6/10.
+### Time: 5-7h. **Confidence: 9/10** (diagnostics не fail).
 
 ---
 
-## Tier 2 — Medium effort
+## Action #2: DREAMPlace Black-Box Integration (M3)
 
-### 2.1 Cubic-Regularized Newton (Cartis-Gould-Toint 2011, closed form 2×2)
-Применение в Tier 1.1. **Globally convergent O(ε⁻³/²)**. **+6h.** **Confidence:** 6/10.
+### ЧТО
+Конвертировать ibm01 protobuf → Bookshelf, запустить DREAMPlace, использовать его placement как input для нашего CD+pair-swap+triple stack.
 
-### 2.2 L-BFGS late-stage finisher ★★★★ (highest confidence)
+### ПОЧЕМУ — High expected value (binary outcome)
+- **Mechanism:** наш Adam batch K=384 — generic optimizer без macro-specific tricks (Lipschitz adaptive Nesterov, line search, multi-grid density). DREAMPlace = 8+ years placement-specific engineering. Round 27 показал что custom Nesterov у нас не работает без full DREAMPlace stack — нет смысла reinvent.
+- **Evidence:** UT Austin paper claims DREAMPlace AVG17 ≈ 1.41 (мы на ~1.0 = +40% хуже). Vmallela (1st place) likely uses DREAMPlace + custom CD. Round 12 showed time_budget extension hurts без adaptive optimizer.
+- **Why others не address:** Tier 1 Newton/SFN — micro-optimization within broken framework. M3 = **paradigm replacement**.
+- **Theoretical backing:** Chen ICCAD 2023 explicit DREAMPlace + L-BFGS. State-of-art baseline.
 
-**Method:** m=10 history, batched two-loop. После step ~1000 switch с Adam.
+### КАК
+1. **Bookshelf converter:** `scripts/proto_to_bookshelf.py` (~150 lines): protobuf netlist + sizes → .nodes/.nets/.pl/.scl/.wts/.aux. Validate via WL round-trip test.
+2. **DREAMPlace install:** `git clone limbo018/DREAMPlace`, build CUDA extension в Docker (avoid host CUDA conflicts on T4).
+3. **Wrapper** `scripts/dreamplace_run.py`: protobuf → convert → run DREAMPlace → read .pl → convert back.
+4. **Integration в pipeline:** `STRAPLE_BATCH_DREAMPLACE=1` в `gpu_run_one.py`. Если set → SKIP gradient batch, используем DREAMPlace pos как single best seed → applies legalize → CD → pair-swap → triple.
+5. **Test:** ibm01 single-run 30 min (DREAMPlace ~10 min + наш pipeline 15 min + buffer).
 
-**Scaling formula (verified by math reviewer):**
-```
-γ_k = (s_k·y_k) / (y_k·y_k)  # Shanno-Phua/Nocedal-Wright Eq 7.20
-H_0 = γ_k·I  per-batch (γ_k ∈ R^K)
-```
-Powell damping: if `s_k·y_k < 1e-10·‖s_k‖·‖y_k‖` → `θ = 0.8·s·B·s/(s·B·s − s·y)`, `y_k ← θ·y_k + (1−θ)·B·s`.
+### Done criterion
+- DREAMPlace runs без crash на ibm01.
+- Returns valid .pl (legalize succeeds, no overlaps).
+- Final proxy after CD+pair-swap stack: **single run target ≤ 0.86, paired N=5 median ≤ 0.87.**
+- If DREAMPlace alone gives < 0.88 без CD → NEW BEST, integrate as default.
 
-**Implementation skeleton (per practical reviewer):**
-```python
-class BatchedLBFGS:
-    def __init__(self, K, n_active, m=10, device, dtype):
-        self.s = zeros(m, K, n_active, 2)
-        self.y = zeros(m, K, n_active, 2)
-        self.rho = zeros(m, K)
-        self.head = 0; self.size = 0
+### Risks
+- **Bookshelf format mismatch** (soft macros, blockages) → ibm01 has 246 hard, 894 soft; treat soft as standard cells, validate WL preservation round-trip.
+- **CUDA version conflicts** на T4 → use Docker DREAMPlace official image; CPU build fallback.
 
-    def two_loop(self, g):
-        # ... (см. полный код в repo лог reviewer 2)
-```
-Full skeleton ~100 lines в `submissions/straple/lbfgs_finisher.py`.
-
-**Trigger:** `STRAPLE_BATCH_LBFGS_FROM_STEP=1000`.
-**Memory:** 10·384·1140·2·4 = 35 MB ✓ (use `n_active`, not `n_total`).
-**Expected gain:** pre-CD min 0.904 → 0.895-0.90 → final 0.880-0.890.
-**Effort:** 8-12h. **Confidence:** 8/10. **Source:** [Liu-Nocedal 1989](https://link.springer.com/article/10.1007/BF01589116), [Chen ICCAD 2023](https://yibolin.com/publications/papers/PLACE_ICCAD2023_Chen.pdf).
-
-### 2.3 Hall placement init — re-investigate
-INIT=spectral failed (Round 31). Maybe needs schedule recalibration. **4-6h.** **Confidence:** 4/10.
-
-### 2.4 BB step (NOT Adam drop-in)
-Separate optimizer track (`STRAPLE_BATCH_OPT=sgd_bb`). **3-4h.** **Confidence:** 4/10.
-
-### 2.5 SA-style probabilistic CD acceptance ★★★★
-P=exp(−Δ/T) accept worse moves. T cooling. ε-greedy random direction. **2-4h.** **Confidence:** 7/10.
+### Time: 12-18h (1.5-2 days). **Confidence: 7/10** (binary).
 
 ---
 
-## Tier 3 — Cheap experiments + missing ideas (v2)
+## Action #3: M1 Joint p=4 Cong+Density Loss
 
-### 3.1-3.5 (subsampled WL, K=1024, importance-sampled CD, path-relinking, multi-grid density) — see v2
+### ЧТО
+Заменить additive `0.5·cong + 0.5·dens` на Chebyshev p-norm `((cw·cong)^p + (dw·dens)^p)^(1/p)` с p=4 в gradient loss.
 
-### 🆕 M1. Joint cong+density regularizer ★★★★ [HIGH PRIORITY]
+### ПОЧЕМУ — Targets ROOT CAUSE
+- **Mechanism:** Round 19 (cong_w=20) и Round 20 (cong_w=15+top_pct=0.05) обе хитнули **симметричный Pareto frontier** (cong↓ ⇒ dens↑ symmetrically). Additive loss `cong+dens` имеет линейные level-curves → optimizer движется ВДОЛЬ frontier (trade-off). p=4 имеет L_∞-like level-curves → **knee-seeking** → finds Pareto knee corner.
+- **Evidence:** Round 18 breakdown: post-pair-swap cong=1.05, dens=0.58, WL=0.07. Knee target — где cong≈dens≈0.7 → proxy ≈ 0.07 + 0.5·0.7 + 0.5·0.7 = **0.77** (близко к vmallela 0.7644).
+- **Why others не address:** все optimizer changes (Newton/L-BFGS/AL) работают на ту же loss → движутся по тому же frontier. M1 = **loss reformulation** → меняет geometry, не optimizer.
+- **Theoretical backing:** Chebyshev scalarization (Miettinen 1999, Multiobjective Optimization). p=4 — empirically close to L_∞ smooth gradient.
 
-**Method (Chebyshev p=4 approximation of max):**
-```python
-joint_pen = ((cong_weight·cong_norm)^p + (density_weight·dens_norm)^p)^(1/p)
-# p=4 → close to L_∞ norm, smooth gradient
-```
-Двигает к **knee point** Pareto frontier, не вдоль.
-
-**Implementation (per practical reviewer):** edit `gradient_batch.py:867`:
+### КАК
+**Edit `submissions/straple/gradient_batch.py:867`:**
 ```python
 joint_p = float(os.environ.get("STRAPLE_BATCH_JOINT_LOSS_P", "0"))
 if joint_p > 0:
-    cong_norm = cong_total / cong_total.detach().clamp_min(1e-9)
-    dens_norm = dpen_total / dpen_total.detach().clamp_min(1e-9)
-    joint_pen = ((cong_weight·cong_norm)**joint_p + (density_weight·dens_norm)**joint_p)**(1.0/joint_p)
-    loss = wl_total + cur_overlap_w_phase·overlap_total + ... + joint_pen
+    eps = 1e-9
+    cong_norm = cong_total / cong_total.detach().clamp_min(eps)
+    dens_norm = dpen_total / dpen_total.detach().clamp_min(eps)
+    joint_pen = ((cong_weight * cong_norm)**joint_p +
+                 (density_weight * dens_norm)**joint_p)**(1.0/joint_p)
+    loss = (wl_total + cur_overlap_w_phase * overlap_total
+            + anchor_loss_total + cohesion_loss_total
+            + topk_density_weight * density_topk_total
+            + joint_pen)
 else:
-    # original loss
+    loss = ... (original additive)
 ```
-Backwards compat: `JOINT_LOSS_P=0` (default) ≡ baseline.
 
-**Effort:** 4-6h. **Confidence:** 6/10.
+**Env:** `STRAPLE_BATCH_JOINT_LOSS_P=4` (default 0 = backwards compat).
 
-### 🆕 M3. Bookshelf → DREAMPlace black-box ★★★★ [PARALLEL TRACK]
-Convert protobuf → Bookshelf, run DREAMPlace. **1-2 days.** Binary outcome (works or not). **Confidence:** 7/10.
+**Unit test:** `tests/test_joint_loss.py` — gradcheck synthetic 4-macro.
 
-### 🆕 M5. Bayesian HPO ★★★★ [HIGH PRIORITY]
-MOTPE-Optuna 30-50 trials over 7 hyperparams. **1 day setup + overnight GPU.** **Confidence:** 8/10.
+**Test:** paired N=5 baseline vs p=4 (если v3 budget reality cuts N=17→5).
+
+### Done criterion
+- Unit test passes.
+- Run без NaN through 500 steps.
+- Pre-CD min ≤ 0.90 (vs typical 0.91) on single run.
+- Paired N=5: median Δ ≤ -0.005.
+- Breakdown: cong<1.00 AND dens<0.70 simultaneously (knee found).
+- Если pre-CD не двигается ≤ 0.91 в 3 runs → drop p=4, try p=2 (smoother).
+
+### Risks
+- **Gradient instability при p=4** — clamp_min(1e-9), `torch.isfinite` early-abort.
+- **Frontier shifts to different corner** — log breakdown per-step, abort если cong > 1.3 at step=200.
+
+### Time: 4-6h. **Confidence: 6/10** (theoretically clean, empirical risk).
 
 ---
 
-## Phase 0 — DIAGNOSTICS (must run BEFORE Phase 1)
+## Action #4: L-BFGS Late-Stage Finisher
 
-### S1. Loss-floor probe ★★★★★ [contrarian]
-Compute OUR proxy на externally-known good ibm01 placement.
-- proxy ≈ 0.76: continue continuous path
-- proxy ≈ 0.90: **proxy formulation issue** → pivot к M3
-- proxy ≈ 0.85: partial mismatch
+### ЧТО
+После Adam (step 1000), переключиться на batched L-BFGS (m=10, Wolfe LS) для super-linear convergence.
 
-**Effort:** 2h. **Critical** — без этого все Tier 1 blind.
+### ПОЧЕМУ — Highest math grounding
+- **Mechanism:** Adam — 1st-order, scale-invariant per-coord. К концу gradient phase (P3 settling) landscape почти-quadratic. L-BFGS approximates inverse Hessian через secant updates → **локально quadratic convergence**. Round 12 анализ: late steps Adam wastes — gradient noise dominates.
+- **Evidence:** Chen ICCAD 2023 Adam-only vs Adam→L-BFGS: -3-7% wirelength on standard benchmarks. DREAMPlace defaults к L-BFGS finisher. Round 30 showed extending pair-swap не пробивает -0.005 floor — final improvement должен идти от gradient phase.
+- **Why others не address:** Per-macro Newton (1.1) overkill 12-18h. SFN (1.3) saddle-specific (paradigm risk). L-BFGS — proven, batched, no Hessian computation.
+- **Theoretical backing:** Liu-Nocedal 1989 globally convergent с Wolfe LS, locally super-linear.
 
-### H1. Saddle frac diagnostic ★★★★★
-На сошедшейся точке посчитать sign(eig) распределения 2×2 локальных Hessian'ов.
+**⚠️ Devil's advocate concern (downgraded confidence):**
+- Legalize discontinuity (snap-to-grid jump) corrupts curvature pairs `s_k = pos_k - pos_{k-1}`. L-BFGS works ONLY pre-legalize gradient phase, не post-legalize.
+- Mitigation: drop history (`size=0`) at phase boundaries (overlap_w_phase transitions, schedule resets).
 
-**Decision rule (refined):** Newton justified iff:
+### КАК
+**Новый файл** `submissions/straple/lbfgs_finisher.py` (~150 lines):
+```python
+class BatchedLBFGS:
+    def __init__(self, K, n_active, m=10, device, dtype):
+        self.s = torch.zeros(m, K, n_active, 2, device=device, dtype=dtype)
+        self.y = torch.zeros_like(self.s)
+        self.rho = torch.zeros(m, K, device=device, dtype=dtype)
+        self.head = 0; self.size = 0; self.m = m
+
+    def two_loop(self, g):  # standard Liu-Nocedal Algo 7.4
+        q = g.clone()
+        alphas = []
+        for i in range(self.size):
+            idx = (self.head - 1 - i) % self.m
+            a = self.rho[idx] * (self.s[idx]*q).sum(dim=(1,2))
+            q = q - a[:, None, None] * self.y[idx]
+            alphas.append((idx, a))
+        # H_0 scaling: γ_k = (s_k·y_k)/(y_k·y_k)
+        if self.size > 0:
+            last = (self.head - 1) % self.m
+            sy = (self.s[last]*self.y[last]).sum(dim=(1,2))
+            yy = (self.y[last]*self.y[last]).sum(dim=(1,2)).clamp_min(1e-12)
+            gamma = (sy / yy).clamp_min(1e-6)
+            r = gamma[:, None, None] * q
+        else:
+            r = q
+        for idx, a in reversed(alphas):
+            b = self.rho[idx] * (self.y[idx]*r).sum(dim=(1,2))
+            r = r + (a - b)[:, None, None] * self.s[idx]
+        return -r  # search direction p
+
+    def push(self, s_new, y_new):
+        sy = (s_new*y_new).sum(dim=(1,2))
+        # Powell damping
+        valid = sy > 1e-10
+        # ... (apply θ blend where !valid)
+        self.s[self.head] = s_new
+        self.y[self.head] = y_new
+        self.rho[self.head] = 1.0 / sy.clamp_min(1e-12)
+        self.head = (self.head + 1) % self.m
+        self.size = min(self.size + 1, self.m)
 ```
-saddle_frac ≥ 0.30 AND mean(|λ_min|/|λ_max|) ≥ 0.05
-```
-Иначе expected Newton gain `< 0.001 abs` (since correction `~ |λ_neg|/cond·g`).
 
-**Effort:** 1 day. **Confidence:** 8/10.
-
-### H2. Component breakdown logging ★★★★★
-Log WL/density/cong в 5 точках pipeline.
-
-**Code skeleton (BreakdownLogger class, ~50 lines):** see file `submissions/straple/breakdown_log.py` (to create). Wire into 5 sites:
-- `placer.py:861` (post-legalize)
-- `gradient_batch.py:~970` (post-gradient)
-- `cd_polish.py:139,322,539,872` (CD/pair-swap/triple/postswap)
-
-Format:
-```
-[BREAKDOWN stage=post_legalize seed=23 wl=0.2841 dens=1.0234 cong=1.0851 proxy=0.9237 ovl_n=0]
+**Wire в gradient_batch.py ~line 700:**
+```python
+lbfgs_from_step = int(os.environ.get("STRAPLE_BATCH_LBFGS_FROM_STEP", "0"))
+if lbfgs_from_step > 0 and step >= lbfgs_from_step:
+    p = lbfgs.two_loop(grad)
+    # Wolfe LS, max 4 evals
+    alpha = wolfe_line_search(loss_fn, pos, p, grad, c1=1e-4, c2=0.9, max_evals=4)
+    pos_new = pos + alpha * p
+    grad_new = compute_grad(pos_new)
+    lbfgs.push(pos_new - pos, grad_new - grad)
+    pos = pos_new
+else:
+    optimizer.step()  # Adam
 ```
 
-**Decision rule:** if cong fraction(post-gradient) ≥ 0.55 → **loss formulation root cause**, GO M1+M3, SKIP all Hessian work.
+**Trigger:** `STRAPLE_BATCH_LBFGS_FROM_STEP=1000` (default 0).
 
-**Effort:** 2h. **Confidence:** 9/10.
+### Done criterion
+- No NaN/inf через 1200 steps.
+- Memory peak < 11 GB.
+- Pre-CD min ≤ 0.90 на 5/5 runs (paired).
+- Paired N=5 median Δ ≤ -0.003.
+- Если LS rejects > 50% steps → curvature corruption → revert.
 
-### H3. Variance calibration (N≥17, не 5)
-N≥17 trial9 baseline runs для honest σ_min, σ_median.
+### Risks
+- **Curvature corruption near phase boundaries** → drop history at transitions.
+- **LS wall-time blowup** → max 4 evals + parallel K amortizes.
 
-**Cost:** 17·25min = **7h GPU.**
-
-**Decision rule:**
-- σ ≤ 0.003 → 5-run pairs sufficient downstream
-- σ 0.003-0.008 → bump K to 512, require N=8 paired runs
-- σ ≥ 0.008 → critical: K=1024 + LHC mandatory; pin CUDA seed; cudnn deterministic
-
-### S2. Diag-only Hessian gate ★★★★★ [contrarian, was Tier 2.6]
-`Δ = -g/diag(H+λI)`. Gates Tier 1.1.
-
-**Effort:** 3-5h. **Decision:** if <0.001 improvement → abandon entire Newton track.
-
-### A2. SA-from-scratch ★★★ [contrarian sanity]
-30 min CPU. Random init → SA с {move, swap, cycle}. Если final < 0.92 без gradient → pipeline simplification.
+### Time: 8-12h. **Confidence: 7/10** (down from 8/10 due to legalize concern).
 
 ---
 
-## Concrete roadmap v3 (Day-by-day Week 1)
+## Action #5: MOTPE Bayesian HPO Overnight
 
-### Day 1 (Mon): H2 logging
-- Wire BreakdownLogger в 5 sites
-- Commit `diag-h2`
-- Run 1 baseline trial9 with logging on
+### ЧТО
+Optuna MOTPE sweep 25-30 trials over 7 hyperparams Round 23 best pipeline, optimizing (proxy_min, std) Pareto front overnight.
 
-### Day 2 (Tue): H1 + H3 launch
-- Code H1 sign(eig) script (per-macro 2×2 from full loss FD-Hessian)
-- Run on Day-1 final positions
-- Commit `diag-h1`
-- Start nightly: 17×trial9 baseline (H3, 7h GPU)
+### ПОЧЕМУ — Auto-tuning works on any pipeline
+- **Mechanism:** Rounds 14-30 showed individual hyperparam tweaks (cong_w, top_pct, time_budget, K) каждый меняет distribution на Pareto. Manual tuning slow и hits floors. MOTPE — Bayesian — exploits correlations, auto-prunes bad trials.
+- **Evidence:** Round 28 replay 0.8955 showed σ ~0.005-0.01 between runs same config. HPO reduces variance + finds better median.
+- **Why others не address:** Actions 1-4 — single-shot improvements. Action 5 — **stochastic exploitation**. Cheap (overnight GPU).
+- **Theoretical backing:** MOTPE [Watanabe-Tsuruta 2024] dominates random search 5-10x.
 
-### Day 3 (Wed): S1 + S2 + A2
-- S1: implement protobuf→Bookshelf converter (cheapest version, n=246 small)
-- Run S1 against any known-good placement
-- S2: Diag-only Hessian (3-5h)
-- A2: SA-from-scratch (1h)
-- **Decision point** based on H1+H2+H3+S1+S2+A2 results
+**⚠️ Devil's advocate concern:**
+- Single-trial → лучший по N=1 trial может быть lucky outlier. Mitigation: top-3 verified с N=5 paired.
 
-### Day 4-5 (Thu-Fri): M1 + AL or pivot
-**If diagnostics align (continuous path viable):**
-- Day 4: Code M1 joint-loss + unit-test gradcheck. Commit `feat-m1`. Nightly: 17×base + 17×M1.
-- Day 5: Read M1 result. Code AL.
+### КАК
+**Новый script** `scripts/hpo_motpe.py`:
+```python
+import optuna
+sampler = optuna.samplers.MOTPESampler(seed=42)
+study = optuna.create_study(directions=["minimize", "minimize"],
+                             sampler=sampler,
+                             pruner=optuna.pruners.MedianPruner())
 
-**If S1 shows proxy mismatch:**
-- Day 4: M3 DREAMPlace black-box (full integration)
-- Day 5: Continue M3 + analyze
+def objective(trial):
+    overlap_w_max = trial.suggest_float("OVERLAP_W_MAX", 20000, 100000, log=True)
+    overlap_w_growth = trial.suggest_float("OVERLAP_W_GROWTH", 1.002, 1.010, log=True)
+    overflow_target = trial.suggest_float("OVERFLOW_TARGET", 0.08, 0.20)
+    overflow_exp = trial.suggest_float("OVERFLOW_EXP", 0.5, 1.0)
+    cong_w = trial.suggest_float("CONG_W", 5, 25)
+    pair_swap_rounds = trial.suggest_categorical("PAIR_SWAP_ROUNDS", [6, 8, 10, 12])
+    K = trial.suggest_categorical("K", [256, 384, 512])
+    
+    proxy, std = run_gpu_run_one(
+        OVERLAP_W_MAX=overlap_w_max, OVERLAP_W_GROWTH=overlap_w_growth,
+        OVERFLOW_TARGET=overflow_target, OVERFLOW_EXP=overflow_exp,
+        CONG_W=cong_w, PAIR_SWAP_ROUNDS=pair_swap_rounds, K=K,
+        time_budget=1200, bench="ibm01"
+    )
+    return proxy, std  # multi-obj
 
-### Day 6-7 (Sat-Sun): L-BFGS + HPO overnight
-- Code L-BFGS finisher (`lbfgs_finisher.py`, 100-150 lines)
-- Setup MOTPE Optuna sweep (30-50 trials)
-- Sat night: 17×base + 17×L-BFGS
-- Sat night also: MOTPE 30-trial (12h overnight)
-- Sun: read results, plan Week 2
+study.optimize(objective, n_trials=25, timeout=12*3600)  # overnight 12h
+```
+
+**Output:** Pareto front config dump → pick best by `proxy + 0.5·std`.
+
+### Done criterion
+- 25-30 trials complete.
+- Best HPO config `proxy_min ≤ 0.880` paired N=5 (vs Round 23 0.8856 ± 0.01 noise).
+- Repeated best config 5x: std ≤ 0.005 (down from 0.01).
+- Если best HPO config no improvement (paired N=5 median Δ < -0.003) → confirm Pareto floor, escalate to Action #2 retry.
+
+### Risks
+- **HPO finds overfit config** (lucky single trial) → top-3 retest N=5; pick by median.
+- **GPU contention** → dedicated server window.
+
+### Time: 8-12h coding + 12h overnight GPU. **Confidence: 7/10** (down from 8/10 due to single-trial verification concern).
 
 ---
 
-## Decision tree (Phase 0 → Phase 1) — refined
+## 🔀 Execution Flow Diagram
 
 ```
-S1 (loss-floor probe, OUR proxy on known-good placement)
-  ├─ proxy ≈ 0.76: continue improve.md path
-  ├─ proxy ≈ 0.85: partial mismatch — focus M1 + M3
-  └─ proxy ≈ 0.90: PIVOT entirely to M3 + M4 + objective re-engineering
-
-H3 (N=17 baseline runs)
-  └─ measure σ_min, σ_median
-
-H2 (component logging at 5 points)
-  └─ if cong fraction(post-gradient) ≥ 0.55:
-        → loss-formulation root cause; GO M1+M3, SKIP Hessian
-     else:
-        → optimization-side; continue
-
-S2 (Diag-only Hessian, 3-5h)
-  ├─ Δ ≥ 0.005 abs: full Tier 1.1 worth
-  └─ Δ < 0.001 abs: ABANDON Newton track, focus L-BFGS+M1+AL
-
-H1 (eig-sign over 246 hard macros)
-  ├─ saddle_frac ≥ 0.30 AND |λ_min/λ_max|_med ≥ 0.05
-  │     → GO Tier 1.1 (Cubic Newton) + Tier 2.6 (gate)
-  ├─ 0.05 ≤ saddle_frac < 0.30
-  │     → SFN/cubic marginal; GO L-BFGS (2.2) primary
-  └─ saddle_frac < 0.05
-        → no saddles; GO M1 + AL + L-BFGS finisher
-
-A2 (SA-from-scratch)
-  ├─ final < 0.92: simpler paradigm viable, refactor
-  └─ final ≥ 0.95: gradient phase essential, continue
-
-Backup if first deserialized idea fails:
-  Tier 2.2 L-BFGS (highest confidence 8/10) → fallback always
-  If L-BFGS flat → M3 DREAMPlace (paradigm shift)
+START: Day 0
+  │
+  ▼
+[Action #1: H2 + S1 diagnostics]  (5-7h, Day 1-2)
+  │
+  ├─ S1 proxy ≈ 0.76 ──────────────► [continuous path viable]
+  ├─ S1 proxy ≥ 0.85 ──────────────► [proxy ceiling, SKIP Action #2 + #4, GO Action #5 only]
+  └─ cong_fraction ≥ 0.55 ─────────► [SKIP Hessian, GO Action #2 + #3]
+  │
+  ▼ (most likely branch)
+[Action #2: DREAMPlace M3]  (12-18h, Day 3-4)
+  │
+  ├─ ibm01 < 0.88 (NEW BEST) ─────► [refine с our CD+pair-swap → run Action #5 over DREAMPlace baseline]
+  └─ ibm01 ≥ 0.89 (no help) ──────► [continue to Action #3]
+  │
+  ▼
+[Action #3: M1 joint loss p=4]  (4-6h, Day 5)
+  │
+  ├─ pre-CD min ≤ 0.90 paired N=5 ─► [stack with current pipeline → Action #4]
+  └─ no improvement OR breakdown anomaly ─► [revert, GO Action #4 standalone]
+  │
+  ▼
+[Action #4: L-BFGS finisher]  (8-12h, Day 6-7)
+  │
+  ├─ paired N=5 median Δ ≤ -0.003 ──► [stack with M1 if M1 won]
+  └─ no improvement ──────────────► [Adam was optimal, GO Action #5]
+  │
+  ▼
+[Action #5: MOTPE HPO overnight]  (8-12h coding + 12h GPU, Day 8-10)
+  │
+  ├─ best config ibm01 ≤ 0.84 ─────► STOP: GOAL REACHED
+  ├─ ibm01 ∈ [0.85, 0.87] ─────────► [accept, submit, schedule Week 2 paradigm shifts]
+  └─ ibm01 ≥ 0.88 ────────────────► PROVISIONAL DEFEAT: pivot to ML/RL (1-2 month effort)
 ```
+
+### Decision triggers between actions
+- **After Action #1:** breakdown reveals dominant component → routes to optimization (Adam/L-BFGS) vs formulation (M1/M3) vs paradigm (RL).
+- **After Action #2:** binary works/doesn't. Если works — supersedes gradient phase, остальные actions stack on top.
+- **After Action #3:** check breakdown again — knee-seeking moved cong&dens both down? Если yes — keep p=4, stack #4. Если no — revert.
+- **After Action #4:** L-BFGS adds late-stage convergence; combine с M1 если won для cumulative.
+- **After Action #5:** automated final tuning over best stack from #2-#4.
+
+### Stop conditions
+- **Success:** ibm01 ≤ 0.85 paired N≥5 median, std ≤ 0.005 → submit, lock config, move to AVG17 verification.
+- **Provisional defeat:** после всех 5 actions ibm01 > 0.88 → escalate (M4 RL, 1-2 month) или accept current 0.8856 as session ceiling.
+- **Mid-loop pivot:** если Action #1 S1 показывает proxy ≥ 0.90 на reference placement → ceiling fundamental, skip optimization actions, focus only HPO over Round 23 + submit.
 
 ---
 
-## Compute budget breakdown (single T4, ≤30 min/run)
+## Cumulative expected gain (pessimistic / realistic / stretch)
 
-| Phase | Coding | GPU | Wall (calendar) |
+| Action | Pessimistic Δ | Realistic Δ | Stretch Δ |
 |---|---|---|---|
-| Phase 0 (S1+H1+H2+H3+S2+A2) | 8h | 13h (17×base + diags) | 1.5-2 days |
-| Phase 1 (M1+AL+diagH gate) | 22h | 16h (4 paired N=17 + ablations) | 4-5 days |
-| Phase 2 (L-BFGS+ESGD-M+HPO) | 25h | 20h+overnight HPO 12h | 5-6 days |
-| Buffer | — | 8h | 2 days |
-| **Total Week-1+2** | **55h coding** | **~50h GPU** | **12-14 calendar days** |
+| #1 H2+S1 (diagnostic) | 0 | 0 (gates next) | 0 |
+| #2 DREAMPlace M3 | 0 (fail) | -0.02 | -0.06 |
+| #3 M1 joint p=4 | 0 | -0.005 | -0.015 |
+| #4 L-BFGS | -0.001 | -0.005 | -0.010 |
+| #5 MOTPE HPO | -0.003 | -0.008 | -0.015 |
+| **Total from 0.8856** | **0.881** | **0.866** | **0.795** |
+
+**Realistic target after Week 2: ibm01 ≈ 0.85-0.87.** **Stretch: 0.79-0.82** (Action #2 succeeds + #5 finds knee).
 
 ---
 
-## Test design table (mandatory for any Phase-1 idea)
+## Day-by-day execution (Week 1)
 
-| Idea | Acceptance | Time/test | N pairs | Pass/Fail/Inconclusive |
-|---|---|---|---|---|
-| H2 logging | Diagnostic | 25 min | 1 | n/a |
-| H3 variance | σ measurement | 25min × 17 = 7h | n/a | calibration |
-| H1 saddle | %indef computed | 30min × 3 | n/a | n/a |
-| M1 joint p=4 | median Δ ≤ −0.005 (FDR) | 8.5h paired (17×2) | 17 | <−0.003 inconclusive→re-run; ≥0 fail |
-| AL overlap | median Δ ≤ −0.005 | 8.5h | 17 | same |
-| L-BFGS finisher | min over 17 ≤ baseline_min−0.003 | 8.5h | 17 | <−0.001 fail |
-| Diag-Hessian (S2) | median Δ ≤ −0.005 | 8.5h | 17 | gates Tier 1.1 |
-| ESGD-M | median pre-CD ≤ 0.90 | 8.5h | 17 | else fall back to L-BFGS |
-| Bayesian HPO | best ≤ baseline_best−0.005 | overnight 12h | n/a | always commit best config |
+### Day 1 (Mon): H2 logging + Action #2 install kickoff
+- Wire BreakdownLogger в 5 sites (~3h)
+- Run baseline trial9 with logging (25 min)
+- Start DREAMPlace install в Docker on T4 (~2h, possibly continues Day 2)
+- **Add SA-CD acceptance** as cheap experiment (~2h, Tier 2.5 promoted from devil's advocate)
+- Commit `diag-h2`
 
----
+### Day 2 (Tue): S1 + Bookshelf converter
+- Code Bookshelf converter (~3h)
+- Run DREAMPlace on ibm01 → get `.pl` output (~2h)
+- Run S1 (compute proxy on DREAMPlace output) (~30 min)
+- **Decision point** based on H2+S1 results
+- Commit `diag-h1, diag-s1, feat-bookshelf-converter`
 
-## Risk register
+### Day 3 (Wed): Action #2 wrapper integration
+- Code dreamplace_run.py wrapper (~3h)
+- Integration в gpu_run_one.py (~2h)
+- Test full pipeline ibm01 with DREAMPlace input (~30 min)
+- **If WIN (≤ 0.86):** commit, run paired N=5 verification (overnight)
+- **If LOSE:** continue Action #3
 
-| Risk | P | Mitigation |
-|---|---|---|
-| OOM at K=384 with HVP probes | M | gate by env `STRAPLE_BATCH_HVP_PROBES`; chunk over K; first test K=128 |
-| NaN (sqrt at indef λ, /0 in BB) | H | clamp_min(1e-12); `torch.isfinite` early-abort with skip |
-| Integration conflict (AL + overlap_w + overflow_lambda) | H | mutex env-vars: AUGLAG=1 disables `cur_overlap_w_phase`; assert at startup |
-| L-BFGS curvature corruption near legalize | M | drop history (`size=0`) on phase boundary; line-search reject if sy<1e-10 |
-| Wall-time blowup (LBFGS LS 8x evals) | M | max 4 evals; parallel K → amortizes |
-| Bug in joint-loss gradient (M1) | M | unit-test: backward(joint_p=1) ≡ baseline; gradcheck synthetic 4-macro |
-| Density Hessian sign chaos (Tier 1.1) | H | derive from existing ePlace forward; cross-check via FD 1e-3 |
+### Day 4 (Thu): Action #3 M1 joint loss
+- Edit gradient_batch.py:867 (~1h)
+- Unit test gradcheck synthetic (~2h)
+- Run paired N=5 baseline vs p=4 (overnight)
+- Commit `feat-m1-joint-loss-p4`
 
----
+### Day 5 (Fri): Read M1 results, start L-BFGS
+- Analyze paired N=5 from M1
+- If M1 wins → commit result, start L-BFGS
+- If M1 fails → revert, full focus on L-BFGS
+- Code BatchedLBFGS class (~6h, continues into Day 6)
 
-## Pessimistic floor (multi-reviewer alignment)
+### Day 6 (Sat): Finish L-BFGS
+- Complete BatchedLBFGS (~4h)
+- Wolfe LS + Powell damping (~2h)
+- Unit test (~2h)
+- Nightly: paired N=5 baseline vs L-BFGS
 
-- **Без months of work:** 0.870-0.875 на ibm01 (-1% от 0.8856).
-- **Чтобы пробить 0.85:** combo H1+H2+M1+L-BFGS → **0.85-0.86 likely** (1-2 weeks).
-- **0.7644 vmallela:** требует paradigm shift, 1-2 месяца.
-
-**Но contrarian C1:** если S1 покажет proxy formulation mismatch, наш ceiling может быть **0.85 fundamentally**, не 0.8.
-
----
-
-## Pragmatic 1-2 week combo (recommended)
-
-**Week 1:**
-- Day 1-3: ALL Phase 0 diagnostics (S1, H1, H2, H3, S2, A2)
-- Day 4-5: M1 joint loss + AL (если diagnostics good)
-- Day 6: L-BFGS finisher
-- Day 7: MOTPE HPO overnight + Sun analysis
-
-**Week 2 (decision-tree based):**
-- **Path A (saddles + continuous viable):** Per-macro Cubic Newton + ESGD-M
-- **Path B (loss formulation issue):** M3 DREAMPlace + objective re-engineering
-- **Path C (variance dominant):** K=1024 + LHC + multi-run averaging
-
-**Expected after 2 weeks:** ibm01 best 0.85-0.87 high confidence; 0.83-0.85 stretch.
+### Day 7 (Sun): Read L-BFGS, setup HPO
+- Analyze L-BFGS results (commit if wins)
+- Setup MOTPE Optuna sweep (~4h)
+- Saturday night kicks off: MOTPE 25-30 trials (~12h overnight)
+- Sunday morning: read HPO results
 
 ---
 
-## Key sources (v3)
+## Key sources
 
 **Papers:**
-- [Chen ICCAD 2023 — L-BFGS quasi-Newton mixed-size placement](https://yibolin.com/publications/papers/PLACE_ICCAD2023_Chen.pdf)
-- [ePlace TODAES'15 — diagonal Hessian preconditioner](https://cseweb.ucsd.edu/~jlu/papers/eplace-todaes14/paper.pdf)
-- [Dauphin 2014 — SFN (arxiv 1406.2572)](https://arxiv.org/abs/1406.2572)
-- [Dauphin 2015 — Equilibrated learning rates (arxiv 1502.04390)](https://arxiv.org/abs/1502.04390)
-- [Nesterov-Polyak 2006 — Cubic-Regularized Newton](https://link.springer.com/article/10.1007/s10107-006-0706-8)
-- [Cartis-Gould-Toint 2011 — TRACE](https://link.springer.com/article/10.1007/s10107-009-0337-y)
-- [Tripuraneni 2017 — Stochastic Cubic (arxiv 1711.02838)](https://arxiv.org/abs/1711.02838)
-- [Steihaug 1983 — CG truncation for Newton](https://epubs.siam.org/doi/10.1137/0720042)
+- [Chen ICCAD 2023 — L-BFGS quasi-Newton for mixed-size placement](https://yibolin.com/publications/papers/PLACE_ICCAD2023_Chen.pdf)
 - [Liu-Nocedal 1989 — L-BFGS](https://link.springer.com/article/10.1007/BF01589116)
-- [Curtis-Jiang-Robinson 2015 — Adaptive AugLag](https://coral.ise.lehigh.edu/frankecurtis/files/papers/CurtJianRobi15.pdf)
-- Bertsekas 1996 — Constrained optimization
+- [Miettinen 1999 — Multiobjective Optimization (Chebyshev scalarization)]
+- [Watanabe-Tsuruta 2024 — MOTPE (Optuna)]
 
 **Repos:**
 - [limbo018/DREAMPlace](https://github.com/limbo018/DREAMPlace)
-- [crowsonkb/esgd](https://github.com/crowsonkb/esgd)
 - [NVlabs/AutoDMP](https://github.com/NVlabs/AutoDMP)
+- [optuna/optuna](https://github.com/optuna/optuna)
 
 ---
 
-*Document v3.0 — synthesized from 9 agents (6 research + 3 review v2) + 3 review v3 — 2026-05-09.*
+*Document v4.0 — synthesized from 12 agents (6 research + 3 review v2 + 3 review v3 + 4 review v4) — 2026-05-09.*
 
 ## Changelog
 
+**v4 (2026-05-09):**
+- ⭐ **Crystallized to 5 actions** with clear priority + cumulative expected gain table
+- Devil's advocate adjustments: L-BFGS 8/10 → 7/10 (legalize discontinuity); HPO 8/10 → 7/10 (single-trial concern); SA-CD 7/10 → 8/10 (promoted to Day 1 sidecar)
+- S1 access problem identified + DREAMPlace fallback solution
+- Compute budget reality: N=17→5 paired (devil's advocate honest)
+- Calibrated probabilities: P(0.85) = 0.20-0.35, P(0.80) = 0.05-0.15
+- KILL list explicit (5 ideas not to do, with reasoning)
+- Day-by-day Week 1 plan with concrete timestamps
+- Stop conditions + decision triggers between actions
+- Code skeletons (BreakdownLogger, BatchedLBFGS, MOTPE objective)
+
 **v3 (2026-05-09):**
-- ⚠️ **Contrarian challenges (C1-C5):** wrong objective hypothesis, ePlace overkill, saddle obsession, K=384 cargo cult, pipeline lock-in
-- ⚠️ **Phase 0 expanded:** S1 (loss-floor probe), S2 (diag-Hessian gate), A2 (SA-from-scratch) — sanity checks BEFORE Phase 1
-- Statistical rigor: H3 N≥17 (not 5), Cohen's d analysis, FDR Benjamini-Hochberg q=0.10
+- Contrarian challenges (C1-C5)
+- Phase 0 = mandatory diagnostics (S1, H1, H2, H3, S2, A2)
+- Statistical rigor: Cohen's d, FDR Benjamini-Hochberg
 - Convergence-class taxonomy with trust budget
-- Failure modes per Tier-1
-- Density Hessian formula derived (Bell·Gaussian via FFT'd φ)
-- L-BFGS scaling formula confirmed (Shanno-Phua/Nocedal-Wright Eq 7.20)
-- Cubic Newton 2×2 closed form via secular equation
-- Code skeletons: BreakdownLogger, joint loss patch, BatchedLBFGS class
-- Test design table with FDR-corrected acceptance thresholds
-- Risk register with mitigation
-- Day-by-day Week 1 plan
-- Decision tree refined для Phase 0 → Phase 1
-- Compute budget: 55h coding + 50h GPU = 12-14 calendar days
+- Density Hessian formula (Bell·Gaussian via FFT)
+- Cubic Newton 2×2 closed form
 
 **v2 (2026-05-09):**
-- Math correction: ESGD-M Hutchinson formula (E[(Hv)²] not E[v⊙Hv])
-- Math correction: Cross-terms only zero for bbox WL (8% loss)
-- Math correction: SFN Tikhonov damping vs |λ|
-- Math correction: Adaptive Levenberg-Marquardt (not fixed λ=1e-3)
-- Implementation: Effort estimates revised
-- Strategy: Added M1-M5, H1-H3, A2 (joint loss, orient flip, DREAMPlace, net weight, Bayesian HPO, diagnostics, cluster CD)
-- Strategy: Phase 0 = diagnostics BEFORE Newton
+- Math correction: ESGD-M Hutchinson (E[(Hv)²] not E[v⊙Hv])
+- Cross-terms only zero for bbox WL (8% loss)
+- SFN Tikhonov damping vs |λ|
+- Adaptive Levenberg-Marquardt
+- Effort estimates revised
+- Added M1-M5, H1-H3, A2
 
 **v1 (2026-05-09):** Initial synthesis from 6 research agents.
