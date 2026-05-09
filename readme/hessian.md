@@ -621,6 +621,14 @@ STRAPLE_BATCH_PAIR_SWAP_ROUNDS=6
   Без fix triple-cycle accepts moves that introduce overlaps; final TILOS catches → revert.
 - **TODO:** fix intra-triple overlap check, retry. Expected potential: similar -0.003 to -0.005 absolute as pair-swap.
 
+#### Round 22 — Triple-cycle с intra-triple overlap fix — marginal — 2026-05-09
+- **Code fix:** в `triple_cycle_polish_gpu` добавил pairwise overlap check внутри triple перед vs-others check.
+- **Run config:** same as Round 21 + ROUNDS=5.
+- **Result:** Pre-CD 0.9073, CD 0.8960, pair-swap 0.8927, triple-cycle **0.8926** (-0.0001, R1=4 acc, R2=0 acc, converged). Wall 26.1 min.
+- **Verdict:** **NOT NEW BEST** (0.8926 vs Round 16 0.8871 = +0.0055).
+- **Insight:** Triple-cycle fundamentally limited — большинство triples (size-mismatched) invalidated by intra-triple geometric check. На ibm01 dimensions макросов очень разнообразные → swap rarely valid. **Pair-swap dominates** (3-perm not better than 2-perm in practice for this layout).
+- **Conclusion idea #6:** Triple-cycle implementation works (no bugs), но для ibm01 особо не помогает. Best stays Round 16 0.8871.
+
 
 
 **Подтверждённый pattern:** CD polish даёт **-0.010 ± 0.001 absolute** improvement регardless of tweaks. Floor определяется pre-CD (gradient batch outcome). Random tweaks (more dirs, multi-seed top-N, larger sf, restart with jitter, longer gradient) — не пробивают.
