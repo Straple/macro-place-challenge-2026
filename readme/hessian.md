@@ -675,6 +675,40 @@ STRAPLE_BATCH_PAIR_SWAP_ROUNDS=6
   - Diminishing returns — пары converge quickly
 - **Conclusion:** pair-swap rounds=8-10, neighbors=12 — sweet spot. Дальнейшее extension marginal. **Pre-CD start dominates.**
 
+#### Rounds 25-27: Идеи 3, 2, 1 (cong-rank, perturb-relax tuned, Nesterov+clip) — все провалились — 2026-05-09
+
+**Round 25 (Идея 3) — cong-rank pair-swap — fail**
+- **Hypothesis:** rank pair-swap candidates by GPU congestion only (61% of proxy).
+- **Code:** `pair_swap_polish_gpu` теперь имеет `rank_mode` (proxy/cong/blend), env `STRAPLE_BATCH_PAIR_SWAP_RANK_MODE`.
+- **Result:** 0.9028 (NOT new best, +0.017 vs Round 23). Cong wuth GPU rank actually went UP в TILOS (1.098 vs Round 23 1.052).
+- **Why fail:** GPU cong (RUDY-approximate, top 10% hotspots avg) не коррелирует с TILOS cong достаточно. Cong-best per pair locally minimal в GPU, но globally suboptimal в TILOS.
+- **Verdict:** **GPU vs TILOS metric mismatch**. Cong-rank меняет proxy_K на бесполезный сигнал. Need either ranking on actual TILOS (slow ~2s/call), либо better GPU cong approximation.
+
+**Round 26 (Идея 2) — perturb-relax with tuned params (step=0.1, frac=0.05, steps=250) — fail**
+- **Hypothesis:** Round 14 fail (step=0.5, steps=80) был too disruptive. Gentle perturb позволит mini-gradient recover в новый basin.
+- **Run config:** `STRAPLE_BATCH_PR_CYCLES=4 STRAPLE_BATCH_PR_K=4 STRAPLE_BATCH_PR_STEPS=250 STRAPLE_BATCH_PR_PERTURB_FRAC=0.05 STRAPLE_BATCH_PR_PERTURB_STEP=0.1`.
+- **Result:** 0.8907 (NOT new best, all PR cycles failed: pre-CD после perturb 0.95-1.0 vs base 0.89, mini-gradient 250 steps не успевает recover).
+- **Why fail:** Любой perturb на already-converged 0.89 layout даёт pre-CD jump в 0.95-1.0 zone. Mini-gradient compute нужен близко к full gradient phase (1000+ steps, ~10 min) чтобы вернуться. Не помещается в budget.
+- **Verdict:** Perturb-relax fundamentally limited — converged state очень крупкий, mini-recovery дорого.
+
+**Round 27 (Идея 1) — Nesterov SGD + grad_clip=10 + lr=0.01 — KILLED**
+- **Hypothesis:** Round 11 Nesterov exploded (gradient too large). С gradient clip и lower lr должно сходиться. DREAMPlace's optimizer trick.
+- **Run config:** `STRAPLE_BATCH_OPT=nesterov STRAPLE_BATCH_LR=0.01 STRAPLE_BATCH_GRAD_CLIP=10`.
+- **Result:** Killed at step=500. Nesterov + clip:
+  - wl=41651 (vs Adam 27795 = +50% worse)
+  - dpen=8343 (vs Adam 3299 = +153%)
+  - ovrlp=13.07 (vs Adam 0.06 = >200x worse!)
+  - ovf=0.286 (target=0.13, 2x off)
+- **Why fail:** Gradient clip prevents EXPLOSION но не enables proper convergence для loss with massively different gradient scales (WL ~1e3, density ~1e3, overlap ~1e6 в settling phase). Adam normalizes per-parameter — это essential для нашей формулировки. SGD even с clip dominated by largest gradient component, не двигается достаточно in WL direction.
+- **Verdict:** Custom Nesterov needs full DREAMPlace-style implementation (Lipschitz adaptive step + gradient normalization + line search + careful loss formulation). Multi-day effort, не 2-4h. Adam already best for this loss.
+
+**Conclusion после 3 ideas:** All three failed for different fundamental reasons:
+1. GPU≠TILOS metric mismatch (cong-rank)
+2. Compute-cost gap (perturb-relax)
+3. Optimizer-loss interaction (Nesterov)
+
+**Best остаётся Round 23 (0.8856)** — full-stack комбо CD + pair-swap rounds=8 + triple-cycle.
+
 
 
 **Подтверждённый pattern:** CD polish даёт **-0.010 ± 0.001 absolute** improvement регardless of tweaks. Floor определяется pre-CD (gradient batch outcome). Random tweaks (more dirs, multi-seed top-N, larger sf, restart with jitter, longer gradient) — не пробивают.
