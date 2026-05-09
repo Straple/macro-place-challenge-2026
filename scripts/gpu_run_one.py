@@ -185,8 +185,9 @@ def main():
     )
     pos_K_list = []
     stats_list = []
+    seed_base = int(os.environ.get("STRAPLE_BATCH_RUN_SEED_BASE", "42"))
     for run_idx in range(n_grad_runs):
-        run_seed = 42 + run_idx * 1009
+        run_seed = seed_base + run_idx * 1009
         if n_grad_runs > 1:
             print(f"[gpu_run_one] gradient RUN {run_idx+1}/{n_grad_runs} "
                   f"seed={run_seed}", flush=True)
