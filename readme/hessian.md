@@ -440,7 +440,7 @@ scp evyukhnevich@103.76.52.240:macro-place/.remote_runs/stats_ROUND_NAME.json /t
 
 ## Сводка статуса (Round 12 update)
 
-**Best держится Round 16:** **0.8871** (Round 15 schedule + initial CD + pair-swap +0.003 abs). Прорыв через комбинацию idea #2 + idea #3.
+**Best держится Round 23:** **0.8856** (full stack: CD + cluster + pair-swap rounds=8 + triple-cycle). Идея #7 кумулятивна.
 
 **Все остальные runs (5-13):** floor 0.904-0.910 при typical pre-CD=0.91-0.92, или хуже при non-default config.
 
@@ -628,6 +628,40 @@ STRAPLE_BATCH_PAIR_SWAP_ROUNDS=6
 - **Verdict:** **NOT NEW BEST** (0.8926 vs Round 16 0.8871 = +0.0055).
 - **Insight:** Triple-cycle fundamentally limited — большинство triples (size-mismatched) invalidated by intra-triple geometric check. На ibm01 dimensions макросов очень разнообразные → swap rarely valid. **Pair-swap dominates** (3-perm not better than 2-perm in practice for this layout).
 - **Conclusion idea #6:** Triple-cycle implementation works (no bugs), но для ibm01 особо не помогает. Best stays Round 16 0.8871.
+
+#### Round 23 — Идея #7: Full-stack pipeline (CD + cluster + pair-swap rounds=8 + triple-cycle) — **NEW BEST 0.8856** — 2026-05-09
+- **Hypothesis:** Combine all successful operators sequentially. Если ortogonalna — кумулятивно.
+- **Run config:** Round 16 baseline + `STRAPLE_BATCH_CLUSTER_POLISH=1 STRAPLE_BATCH_CLUSTER_N=30 STRAPLE_BATCH_CLUSTER_ROUNDS=5 STRAPLE_BATCH_PAIR_SWAP_ROUNDS=8 STRAPLE_BATCH_TRIPLE_CYCLE=1 STRAPLE_BATCH_TRIPLE_CYCLE_NEIGHBORS=6 STRAPLE_BATCH_TRIPLE_CYCLE_ROUNDS=4`.
+- **Result:**
+  - Pre-CD: 0.9034
+  - CD (8 rounds): 0.9034 → 0.8902 (-0.0132)
+  - Cluster polish (5 rounds): no improvement → revert
+  - Pair-swap (8 rounds, vs Round 16's 6): 0.8902 → 0.8857 (**-0.0045**, vs Round 16's -0.0032 → 50% больше improvement)
+  - Triple-cycle: 0.8857 → **0.8856** (-0.0001 marginal but valid)
+  - Wall 26.3 min total
+- **Verdict:** **NEW BEST 0.8856** (vs Round 16 0.8871 = -0.0015 vs trial9 0.9065 = -0.0209 = -2.3% WIN).
+- **🔑 Breakdown comparison:**
+  - Round 16: WL=? dens=? cong=1.0864 = 0.8871
+  - Round 23: WL=0.0715 dens=0.5765 cong=**1.0520** = 0.8856
+  - Cong DROPPED -3.2% (-0.034 absolute), dens slightly up (+0.020). Net win.
+- **Source of improvement:**
+  1. **Extended pair-swap (8 vs 6 rounds)** — keep finding 5-7 swaps per round even at R7-R8. Major contributor.
+  2. Full stack lets cong/dens trade-off shift naturally
+  3. Pre-CD start luck (0.9034 vs Round 16 0.9015 — actually slightly worse start, but final better)
+- **Cluster polish marginal**: 0/30 clusters shifted in R1, immediate revert. Single-macro CD already absorbed cluster-level moves. (При CD → cluster order: cluster useful только если CD suboptimal.)
+- **Что delivered:** Кумулятивный pipeline:
+  - Гипотеза подтверждена частично: pair-swap extended + triple-cycle ortogonalно дают cumulative -0.0046 поверх CD
+  - Cluster добавляется не дает ROI — CD уже заполняет это пространство
+  - **Best pipeline:** CD → pair-swap (8 rounds) → triple-cycle. Cluster optional, low ROI.
+- **Updated working pipeline (current best 0.8856):**
+  ```
+  STRAPLE_BATCH_OVERLAP_W_MAX=50000 STRAPLE_BATCH_OVERLAP_W_GROWTH=1.004
+  STRAPLE_BATCH_CD_POLISH=1 STRAPLE_BATCH_CD_GPU_FILTER=1 STRAPLE_BATCH_CD_GPU_APPROX=1
+  STRAPLE_BATCH_CD_DIRS=8 STRAPLE_BATCH_CD_ROUNDS=8
+  STRAPLE_BATCH_PAIR_SWAP=1 STRAPLE_BATCH_PAIR_SWAP_NEIGHBORS=12 STRAPLE_BATCH_PAIR_SWAP_ROUNDS=8
+  STRAPLE_BATCH_TRIPLE_CYCLE=1 STRAPLE_BATCH_TRIPLE_CYCLE_NEIGHBORS=6 STRAPLE_BATCH_TRIPLE_CYCLE_ROUNDS=4
+  --time-budget 1200
+  ```
 
 
 
