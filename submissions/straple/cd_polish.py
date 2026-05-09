@@ -687,6 +687,280 @@ def pair_swap_polish_gpu(benchmark, plc, pos_full: np.ndarray,
     return pos, final_proxy
 
 
+def triple_cycle_polish_gpu(benchmark, plc, pos_full: np.ndarray,
+                              proxy_pkgs: dict,
+                              n_neighbors: int = 6,
+                              n_rounds: int = 4,
+                              verbose: bool = False,
+                              time_budget: float = 0.0,
+                              proxy_chunk_n: int = 32,
+                              chunk_triples: int = 256) -> tuple[np.ndarray, float]:
+    """3-cycle swap polish: pos[i] -> pos[j] -> pos[k] -> pos[i].
+
+    Extension of pair_swap_polish_gpu with cyclic permutation of 3 macros.
+    More degrees of freedom -> may find moves that pair-swap misses.
+
+    Pipeline per round:
+      1. Spatial KNN for each macro
+      2. Generate triples (i, j, k) where j, k are near i (and j, k near each other)
+      3. For each triple: candidate = cyclic swap
+      4. Geometric overlap check (vectorized)
+      5. GPU rank batched
+      6. Accept best valid cycle
+      7. Final TILOS verify gates run.
+    """
+    sys_path_added = False
+    try:
+        from gpu_proxy import gpu_proxy_batched
+    except ImportError:
+        from pathlib import Path as _P
+        import sys as _s
+        _s.path.insert(0, str(_P(__file__).resolve().parent))
+        sys_path_added = True
+        from gpu_proxy import gpu_proxy_batched
+    from macro_place.objective import compute_proxy_cost
+
+    device = (torch.device("cuda") if torch.cuda.is_available()
+              else torch.device("cpu"))
+
+    n_hard = int(benchmark.num_hard_macros)
+    n_total = int(benchmark.num_macros)
+    canvas_w = float(benchmark.canvas_width)
+    canvas_h = float(benchmark.canvas_height)
+    grid_rows = int(benchmark.grid_rows)
+    grid_cols = int(benchmark.grid_cols)
+
+    sizes = benchmark.macro_sizes.cpu().numpy().astype(np.float64)
+    fixed = benchmark.macro_fixed.cpu().numpy().astype(bool)
+    half_w = sizes[:, 0] * 0.5
+    half_h = sizes[:, 1] * 0.5
+
+    pos = pos_full.astype(np.float64).copy()
+    pos_orig = pos.copy()
+
+    sizes_t = benchmark.macro_sizes[:n_total].float().to(device)
+    edges_pkg = proxy_pkgs["edges_pkg"]
+    smooth_matrices = proxy_pkgs["smooth_matrices"]
+    routing_consts = proxy_pkgs["routing_consts"]
+    wl_pkg = proxy_pkgs["wl_pkg"]
+
+    from analytical_seed import (_build_net_pin_tensors_full,
+                                  _build_padded_net_tensors)
+    net_macro_idx, net_pin_offsets_lst = _build_net_pin_tensors_full(
+        benchmark, plc)
+    padded = _build_padded_net_tensors(net_macro_idx, net_pin_offsets_lst)
+    if padded is None:
+        macro_idx_p = torch.zeros((1, 1), dtype=torch.long, device=device)
+        offsets_p = torch.zeros((1, 1, 2), dtype=torch.float32, device=device)
+        mask_p = torch.zeros((1, 1), dtype=torch.bool, device=device)
+        num_nets_used = 0
+    else:
+        macro_idx_p, offsets_p, mask_p = padded
+        macro_idx_p = macro_idx_p.to(device)
+        offsets_p = offsets_p.to(device)
+        mask_p = mask_p.to(device)
+        num_nets_used = int(macro_idx_p.shape[0])
+
+    def _proxy_at(p_np: np.ndarray) -> tuple[float, int]:
+        full = torch.tensor(p_np, dtype=torch.float32)
+        c = compute_proxy_cost(full, benchmark, plc)
+        return float(c["proxy_cost"]), int(c["overlap_count"])
+
+    def _gpu_proxy(pos_tensor: torch.Tensor) -> float:
+        with torch.no_grad():
+            single = pos_tensor.unsqueeze(0)
+            p, _ = gpu_proxy_batched(
+                single, sizes_t, macro_idx_p, offsets_p, mask_p,
+                canvas_w, canvas_h, grid_rows, grid_cols, num_nets_used,
+                n_hard=n_hard,
+                edges_pkg=edges_pkg, smooth_matrices=smooth_matrices,
+                routing_consts=routing_consts, wl_pkg=wl_pkg,
+                chunk_n=proxy_chunk_n)
+        return float(p[0].item())
+
+    base_proxy_orig, base_ovrlp = _proxy_at(pos)
+    if verbose:
+        print(f"[triple_cycle] start proxy={base_proxy_orig:.4f} "
+              f"ovrlp={base_ovrlp} (n_hard={n_hard} "
+              f"k_neighbors={n_neighbors} n_rounds={n_rounds})", flush=True)
+
+    movable_mask = ~fixed[:n_hard]
+    movable_idx = np.where(movable_mask)[0]
+    if len(movable_idx) < 3:
+        return pos_orig, base_proxy_orig
+
+    pos_t = torch.tensor(pos, dtype=torch.float32, device=device)
+    base_gpu = _gpu_proxy(pos_t)
+    t_start = time.time()
+
+    for r in range(n_rounds):
+        if time_budget > 0 and (time.time() - t_start) >= time_budget:
+            if verbose:
+                print(f"[triple_cycle] time budget {time_budget:.0f}s "
+                      f"reached at round {r}", flush=True)
+            break
+
+        movable_pos = pos[movable_idx]
+        dists = np.linalg.norm(
+            movable_pos[:, None, :] - movable_pos[None, :, :], axis=2)
+        np.fill_diagonal(dists, np.inf)
+        knn_local = np.argsort(dists, axis=1)[:, :n_neighbors]
+        triples_seen = set()
+        triples = []
+        for li, i in enumerate(movable_idx):
+            i_int = int(i)
+            for j_local in knn_local[li]:
+                j = int(movable_idx[j_local])
+                if j == i_int:
+                    continue
+                lj = j_local
+                for k_local in knn_local[lj]:
+                    k = int(movable_idx[k_local])
+                    if k == i_int or k == j:
+                        continue
+                    key = (i_int, j, k)
+                    if key in triples_seen:
+                        continue
+                    triples_seen.add(key)
+                    triples.append((i_int, j, k))
+        if not triples:
+            break
+        triples = np.array(triples, dtype=np.int64)
+        n_triples = len(triples)
+
+        round_accepts = 0
+        for chunk_start in range(0, n_triples, chunk_triples):
+            if time_budget > 0 and (time.time() - t_start) >= time_budget:
+                break
+            chunk_end = min(chunk_start + chunk_triples, n_triples)
+            chunk = triples[chunk_start:chunk_end]
+            cs = len(chunk)
+
+            cand = pos_t.unsqueeze(0).expand(cs, -1, -1).contiguous()
+            i_idx = chunk[:, 0]
+            j_idx = chunk[:, 1]
+            k_idx = chunk[:, 2]
+            i_t = torch.tensor(i_idx, dtype=torch.long, device=device)
+            j_t = torch.tensor(j_idx, dtype=torch.long, device=device)
+            k_t = torch.tensor(k_idx, dtype=torch.long, device=device)
+            arange = torch.arange(cs, device=device)
+            pos_i_t = pos_t[i_t]
+            pos_j_t = pos_t[j_t]
+            pos_k_t = pos_t[k_t]
+            cand[arange, i_t] = pos_j_t
+            cand[arange, j_t] = pos_k_t
+            cand[arange, k_t] = pos_i_t
+
+            valid = np.ones(cs, dtype=bool)
+            for ci in range(cs):
+                i, j, k = int(chunk[ci, 0]), int(chunk[ci, 1]), int(chunk[ci, 2])
+                pos_i_new = pos[j].copy()
+                pos_j_new = pos[k].copy()
+                pos_k_new = pos[i].copy()
+                triple_set = {i, j, k}
+                bad = False
+                for nm, hw, hh, npos in [
+                    (i, half_w[i], half_h[i], pos_i_new),
+                    (j, half_w[j], half_h[j], pos_j_new),
+                    (k, half_w[k], half_h[k], pos_k_new),
+                ]:
+                    if (npos[0] - hw < -1e-6 or
+                            npos[0] + hw > canvas_w + 1e-6 or
+                            npos[1] - hh < -1e-6 or
+                            npos[1] + hh > canvas_h + 1e-6):
+                        bad = True
+                        break
+                if bad:
+                    valid[ci] = False
+                    continue
+                triple_data = [
+                    (i, half_w[i], half_h[i], pos_i_new),
+                    (j, half_w[j], half_h[j], pos_j_new),
+                    (k, half_w[k], half_h[k], pos_k_new),
+                ]
+                for ai in range(3):
+                    nm_a, hw_a, hh_a, npos_a = triple_data[ai]
+                    for bi in range(ai + 1, 3):
+                        nm_b, hw_b, hh_b, npos_b = triple_data[bi]
+                        if (abs(npos_a[0] - npos_b[0]) < hw_a + hw_b - 1e-9
+                                and abs(npos_a[1] - npos_b[1])
+                                < hh_a + hh_b - 1e-9):
+                            bad = True
+                            break
+                    if bad:
+                        break
+                if bad:
+                    valid[ci] = False
+                    continue
+                for nm, hw, hh, npos in triple_data:
+                    for kk in range(n_hard):
+                        if kk in triple_set:
+                            continue
+                        if (abs(npos[0] - pos[kk, 0]) < hw + half_w[kk] - 1e-9
+                                and abs(npos[1] - pos[kk, 1]) < hh + half_h[kk] - 1e-9):
+                            bad = True
+                            break
+                    if bad:
+                        break
+                if bad:
+                    valid[ci] = False
+            if not valid.any():
+                continue
+
+            with torch.no_grad():
+                proxy_K, _comp = gpu_proxy_batched(
+                    cand, sizes_t, macro_idx_p, offsets_p, mask_p,
+                    canvas_w, canvas_h, grid_rows, grid_cols, num_nets_used,
+                    n_hard=n_hard,
+                    edges_pkg=edges_pkg, smooth_matrices=smooth_matrices,
+                    routing_consts=routing_consts, wl_pkg=wl_pkg,
+                    chunk_n=proxy_chunk_n)
+            arr = proxy_K.cpu().numpy()
+            arr_v = np.where(valid, arr, np.inf)
+            best_ci = int(np.argmin(arr_v))
+            best_val = float(arr_v[best_ci])
+            if best_val >= base_gpu - 1e-6:
+                continue
+            i_b, j_b, k_b = (int(chunk[best_ci, 0]),
+                              int(chunk[best_ci, 1]),
+                              int(chunk[best_ci, 2]))
+            tmp_i = pos[i_b].copy()
+            pos[i_b] = pos[j_b].copy()
+            pos[j_b] = pos[k_b].copy()
+            pos[k_b] = tmp_i
+            for m in (i_b, j_b, k_b):
+                pos_t[m, 0] = float(pos[m, 0])
+                pos_t[m, 1] = float(pos[m, 1])
+            base_gpu = best_val
+            round_accepts += 1
+
+        if verbose:
+            print(f"[triple_cycle] round {r+1}/{n_rounds}: {round_accepts} "
+                  f"cycles accepted; n_triples={n_triples} "
+                  f"gpu_base={base_gpu:.4f} "
+                  f"elapsed={time.time()-t_start:.1f}s", flush=True)
+        if round_accepts == 0:
+            break
+
+    full_t = torch.tensor(pos, dtype=torch.float32)
+    cost_dict = compute_proxy_cost(full_t, benchmark, plc)
+    final_proxy = float(cost_dict["proxy_cost"])
+    final_ovrlp = int(cost_dict["overlap_count"])
+    if verbose:
+        wl_c = float(cost_dict.get("wirelength_cost", 0))
+        d_c = float(cost_dict.get("density_cost", 0))
+        cong_c = float(cost_dict.get("congestion_cost", 0))
+        print(f"[triple_cycle] final TILOS proxy={final_proxy:.4f} "
+              f"ovrlp={final_ovrlp} (WL={wl_c:.4f} dens={d_c:.4f} "
+              f"cong={cong_c:.4f})", flush=True)
+    if final_proxy >= base_proxy_orig - 1e-6 or final_ovrlp > base_ovrlp:
+        if verbose:
+            print(f"[triple_cycle] REVERT: not better than orig "
+                  f"{base_proxy_orig:.4f}", flush=True)
+        return pos_orig, base_proxy_orig
+    return pos, final_proxy
+
+
 def cd_polish_gpu_with_restart(benchmark, plc, pos_full: np.ndarray,
                                 proxy_pkgs: dict,
                                 restart_cycles: int = 0,

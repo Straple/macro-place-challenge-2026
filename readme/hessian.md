@@ -608,6 +608,19 @@ STRAPLE_BATCH_PAIR_SWAP_ROUNDS=6
 --time-budget 1200
 ```
 
+#### Round 21 — Идея #6: Triple-cycle swap — REVERT (bug: intra-triple overlap not checked) — 2026-05-09
+- **Hypothesis:** Pair-swap = 2-perm, triple-cycle = 3-perm: pos[i]→pos[j]→pos[k]→pos[i]. Больше degrees of freedom → может найти moves pair-swap missed.
+- **Code (`submissions/straple/cd_polish.py`):** `triple_cycle_polish_gpu` функция. Per round: spatial KNN (n_neighbors=6), generate triples, geometric overlap check (vs non-triple macros), GPU rank, accept best valid.
+- **Run config:** Round 16 baseline + `STRAPLE_BATCH_TRIPLE_CYCLE=1 STRAPLE_BATCH_TRIPLE_CYCLE_NEIGHBORS=6 STRAPLE_BATCH_TRIPLE_CYCLE_ROUNDS=4`.
+- **Result:** Pre-CD 0.9141, CD 0.9041, pair-swap 0.8992, triple-cycle FAILED with 4 overlaps → revert to pair-swap output. Final **0.8992**.
+- **Verdict:** **NOT NEW BEST** (0.8992 vs Round 16 0.8871 = +0.012 worse).
+- **🐛 BUG в triple_cycle_polish_gpu:** overlap check обходит non-triple макросы только. Не проверяет **intra-triple overlaps**: i_new в pos[j], j_new в pos[k], k_new в pos[i] — может overlap между ними, особенно при разных размерах. Need fix:
+  ```python
+  # Check pairs within triple: i_new vs j_new, i_new vs k_new, j_new vs k_new
+  ```
+  Без fix triple-cycle accepts moves that introduce overlaps; final TILOS catches → revert.
+- **TODO:** fix intra-triple overlap check, retry. Expected potential: similar -0.003 to -0.005 absolute as pair-swap.
+
 
 
 **Подтверждённый pattern:** CD polish даёт **-0.010 ± 0.001 absolute** improvement регardless of tweaks. Floor определяется pre-CD (gradient batch outcome). Random tweaks (more dirs, multi-seed top-N, larger sf, restart with jitter, longer gradient) — не пробивают.

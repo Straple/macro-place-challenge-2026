@@ -467,7 +467,8 @@ def main():
         sys.path.insert(0, str(REPO_ROOT / "submissions" / "straple"))
         if cd_gpu_enable:
             from cd_polish import (cd_polish_gpu, cd_polish_gpu_with_restart,
-                                    cluster_polish_gpu, pair_swap_polish_gpu)
+                                    cluster_polish_gpu, pair_swap_polish_gpu,
+                                    triple_cycle_polish_gpu)
             from gpu_proxy import (build_routing_edges_full,
                                     build_smooth_matrices,
                                     build_routing_consts,
@@ -728,6 +729,46 @@ def main():
         else:
             print(f"[gpu_run_one] PAIR_SWAP: {ps_proxy:.4f} "
                   f"(no improvement vs {best_proxy:.4f}, {ps_dt:.1f}s)",
+                  flush=True)
+
+    tcyc_enable = (os.environ.get("STRAPLE_BATCH_TRIPLE_CYCLE", "0") == "1"
+                    and cd_gpu_enable and best_pos_full is not None)
+    if tcyc_enable:
+        tcyc_neighbors = int(os.environ.get(
+            "STRAPLE_BATCH_TRIPLE_CYCLE_NEIGHBORS", "6"))
+        tcyc_rounds = int(os.environ.get(
+            "STRAPLE_BATCH_TRIPLE_CYCLE_ROUNDS", "4"))
+        tcyc_chunk = int(os.environ.get(
+            "STRAPLE_BATCH_TRIPLE_CYCLE_CHUNK", "256"))
+        tcyc_tb = float(os.environ.get(
+            "STRAPLE_BATCH_TRIPLE_CYCLE_TIME_BUDGET", "0"))
+        if wall_tl > 0:
+            wall_remaining = wall_tl - (time.time() - t0) - wall_reserve
+            if tcyc_tb <= 0 or tcyc_tb > wall_remaining:
+                tcyc_tb = max(1.0, wall_remaining)
+        print(f"[gpu_run_one] TRIPLE_CYCLE: neighbors={tcyc_neighbors} "
+              f"rounds={tcyc_rounds} chunk={tcyc_chunk} "
+              f"budget={tcyc_tb:.0f}s", flush=True)
+        t_tc = time.time()
+        tc_pos, tc_proxy = triple_cycle_polish_gpu(
+            benchmark, plc, best_pos_full,
+            proxy_pkgs=proxy_pkgs_cd,
+            n_neighbors=tcyc_neighbors,
+            n_rounds=tcyc_rounds,
+            verbose=True,
+            time_budget=tcyc_tb,
+            proxy_chunk_n=cd_proxy_chunk_n,
+            chunk_triples=tcyc_chunk)
+        tc_dt = time.time() - t_tc
+        if tc_proxy < best_proxy - 1e-6:
+            print(f"[gpu_run_one] TRIPLE_CYCLE IMPROVED: "
+                  f"{tc_proxy:.4f} < {best_proxy:.4f} ({tc_dt:.1f}s) "
+                  f"[wall_elapsed={time.time()-t0:.1f}s]", flush=True)
+            best_proxy = tc_proxy
+            best_pos_full = tc_pos.astype(np.float32)
+        else:
+            print(f"[gpu_run_one] TRIPLE_CYCLE: {tc_proxy:.4f} "
+                  f"(no improvement vs {best_proxy:.4f}, {tc_dt:.1f}s)",
                   flush=True)
 
     pr_cycles = int(os.environ.get("STRAPLE_BATCH_PR_CYCLES", "0"))
