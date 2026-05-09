@@ -247,6 +247,13 @@ def main():
     best_idx = -1
     best_pos_full = None  # full [n_total, 2] including legalized hard + gradient soft
 
+    # Action #1 (H2): track best raw (pre-legalize) seed for post-gradient
+    # breakdown logging. Independent of best_pos_full which switches between
+    # raw/legalize whichever is lower.
+    best_raw_proxy = float("inf")
+    best_raw_pos_full = None
+    best_raw_idx = -1
+
     t_eval = time.time()
     for k in candidates:
         # 1) try without legalize first
@@ -256,6 +263,10 @@ def main():
             full_raw[n_hard:n_hard + n_soft] = torch.tensor(
                 pos_K[k, n_hard:n_hard + n_soft], dtype=torch.float32)
         c_raw = compute_proxy_cost(full_raw, benchmark, plc)
+        if float(c_raw["proxy_cost"]) < best_raw_proxy:
+            best_raw_proxy = float(c_raw["proxy_cost"])
+            best_raw_pos_full = full_raw.clone().cpu().numpy()
+            best_raw_idx = int(k)
 
         # 2) always run C++ legalize on hard (fixes overlaps without disturbing soft)
         state = _placer_core.PlacerState()
@@ -286,6 +297,14 @@ def main():
     print(f"[gpu_run_one] eval+legalize: {time.time()-t_eval:.1f}s "
           f"[wall_elapsed={time.time()-t0:.1f}s]", flush=True)
     print(f"\n[gpu_run_one] BEST proxy={best_proxy:.4f} (k={best_idx})", flush=True)
+
+    # Action #1 (H2): post-gradient breakdown on best raw (pre-legalize) seed.
+    sys.path.insert(0, str(REPO_ROOT / "submissions" / "straple"))
+    from breakdown_log import breakdown_log, breakdown_enabled
+    _bench_run_id = args.bench
+    if breakdown_enabled() and best_raw_pos_full is not None:
+        breakdown_log("post-gradient", best_raw_pos_full, benchmark, plc,
+                      seed=best_raw_idx, run_id=_bench_run_id)
 
     if best_pos_full is None:
         print(f"[gpu_run_one] no valid solution, exit", flush=True)
@@ -395,6 +414,11 @@ def main():
                     pos_K[leg_best_k, n_hard:n_hard + n_soft],
                     dtype=torch.float32)
             best_pos_full = full_b.cpu().numpy()
+
+    # Action #1 (H2): post-legalize breakdown on current best.
+    if breakdown_enabled() and best_pos_full is not None:
+        breakdown_log("post-legalize", best_pos_full, benchmark, plc,
+                      seed=best_idx, run_id=_bench_run_id)
 
     best_orientations = [0] * n_hard
 
@@ -669,6 +693,11 @@ def main():
                   f"(no improvement vs {best_proxy:.4f}, {cd_dt:.1f}s) "
                   f"[wall_elapsed={time.time()-t0:.1f}s]", flush=True)
 
+        # Action #1 (H2): post-CD breakdown.
+        if breakdown_enabled() and best_pos_full is not None:
+            breakdown_log("post-cd", best_pos_full, benchmark, plc,
+                          seed=best_idx, run_id=_bench_run_id)
+
         cluster_enable = (os.environ.get(
             "STRAPLE_BATCH_CLUSTER_POLISH", "0") == "1"
             and cd_gpu_enable and best_pos_full is not None)
@@ -737,6 +766,8 @@ def main():
             "STRAPLE_BATCH_PAIR_SWAP_RANK_DENS_W", "0.5"))
         pswap_lahc_len = int(os.environ.get(
             "STRAPLE_BATCH_PAIR_SWAP_LAHC_LEN", "0"))
+        pswap_neighbor_mode = os.environ.get(
+            "STRAPLE_BATCH_PAIR_SWAP_NEIGHBOR_MODE", "spatial")
         if wall_tl > 0:
             wall_remaining = wall_tl - (time.time() - t0) - wall_reserve
             if pswap_tb <= 0 or pswap_tb > wall_remaining:
@@ -758,7 +789,8 @@ def main():
             rank_cong_weight=pswap_rank_cw,
             rank_wl_weight=pswap_rank_ww,
             rank_dens_weight=pswap_rank_dw,
-            lahc_length=pswap_lahc_len)
+            lahc_length=pswap_lahc_len,
+            neighbor_mode=pswap_neighbor_mode)
         ps_dt = time.time() - t_ps
         if ps_proxy < best_proxy - 1e-6:
             print(f"[gpu_run_one] PAIR_SWAP IMPROVED: "
@@ -769,6 +801,57 @@ def main():
         else:
             print(f"[gpu_run_one] PAIR_SWAP: {ps_proxy:.4f} "
                   f"(no improvement vs {best_proxy:.4f}, {ps_dt:.1f}s)",
+                  flush=True)
+
+        # Action #1 (H2): post-pair-swap breakdown.
+        if breakdown_enabled() and best_pos_full is not None:
+            breakdown_log("post-pair-swap", best_pos_full, benchmark, plc,
+                          seed=best_idx, run_id=_bench_run_id)
+
+    pswap2_enable = (os.environ.get(
+        "STRAPLE_BATCH_PAIR_SWAP_2ND_PASS", "0") == "1"
+        and cd_gpu_enable and best_pos_full is not None)
+    if pswap2_enable:
+        pswap2_neighbor_mode = os.environ.get(
+            "STRAPLE_BATCH_PAIR_SWAP_2ND_NEIGHBOR_MODE", "graph")
+        pswap2_neighbors = int(os.environ.get(
+            "STRAPLE_BATCH_PAIR_SWAP_2ND_NEIGHBORS", "12"))
+        pswap2_rounds = int(os.environ.get(
+            "STRAPLE_BATCH_PAIR_SWAP_2ND_ROUNDS", "8"))
+        if wall_tl > 0:
+            wall_remaining = wall_tl - (time.time() - t0) - wall_reserve
+            ps2_tb = max(1.0, wall_remaining)
+        else:
+            ps2_tb = 0.0
+        print(f"[gpu_run_one] PAIR_SWAP 2ND PASS: mode={pswap2_neighbor_mode} "
+              f"neighbors={pswap2_neighbors} rounds={pswap2_rounds} "
+              f"budget={ps2_tb:.0f}s", flush=True)
+        t_ps2 = time.time()
+        ps2_pos, ps2_proxy = pair_swap_polish_gpu(
+            benchmark, plc, best_pos_full,
+            proxy_pkgs=proxy_pkgs_cd,
+            n_neighbors=pswap2_neighbors,
+            n_rounds=pswap2_rounds,
+            verbose=True,
+            time_budget=ps2_tb,
+            proxy_chunk_n=cd_proxy_chunk_n,
+            chunk_pairs=pswap_chunk,
+            rank_mode=pswap_rank_mode,
+            rank_cong_weight=pswap_rank_cw,
+            rank_wl_weight=pswap_rank_ww,
+            rank_dens_weight=pswap_rank_dw,
+            lahc_length=0,
+            neighbor_mode=pswap2_neighbor_mode)
+        ps2_dt = time.time() - t_ps2
+        if ps2_proxy < best_proxy - 1e-6:
+            print(f"[gpu_run_one] PAIR_SWAP 2ND IMPROVED: "
+                  f"{ps2_proxy:.4f} < {best_proxy:.4f} ({ps2_dt:.1f}s) "
+                  f"[wall_elapsed={time.time()-t0:.1f}s]", flush=True)
+            best_proxy = ps2_proxy
+            best_pos_full = ps2_pos.astype(np.float32)
+        else:
+            print(f"[gpu_run_one] PAIR_SWAP 2ND: {ps2_proxy:.4f} "
+                  f"(no improvement vs {best_proxy:.4f}, {ps2_dt:.1f}s)",
                   flush=True)
 
     cd_postswap_enable = (os.environ.get(
@@ -855,6 +938,11 @@ def main():
             print(f"[gpu_run_one] TRIPLE_CYCLE: {tc_proxy:.4f} "
                   f"(no improvement vs {best_proxy:.4f}, {tc_dt:.1f}s)",
                   flush=True)
+
+        # Action #1 (H2): post-triple-cycle breakdown.
+        if breakdown_enabled() and best_pos_full is not None:
+            breakdown_log("post-triple-cycle", best_pos_full, benchmark, plc,
+                          seed=best_idx, run_id=_bench_run_id)
 
     pr_cycles = int(os.environ.get("STRAPLE_BATCH_PR_CYCLES", "0"))
     if (pr_cycles > 0 and best_pos_full is not None and cd_polish_enable
