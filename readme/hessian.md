@@ -550,6 +550,18 @@ scp evyukhnevich@103.76.52.240:macro-place/.remote_runs/stats_ROUND_NAME.json /t
   3. Add congestion-aware CD/pair-swap (rank by GPU cong only)
   4. Different congestion formulation (RUDY-based, edge-density)
 
+#### Round 19 — Идея #5a: cong_weight=20 (vs default 10) — wash — 2026-05-09
+- **Hypothesis:** cong = 61% от proxy → boost cong_weight в gradient: shifts gradient toward cong reduction.
+- **Run config:** `STRAPLE_BATCH_CONG_W=20` (rest = Round 16 winning config).
+- **Result:** Pre-CD min=0.9092. CD: 0.9092→0.8969. Pair-swap: 0.8969→**0.8926**. Wall 25.7 min.
+- **Breakdown:** WL=0.0724 dens=0.5633 cong=1.0771 (vs Round 18 cong=1.0864 = **-0.009 ✓**, dens=0.5568 = +0.0065 ✗, WL=0.0715 = +0.0009 ✗).
+- **Verdict:** **NOT NEW BEST** (0.8926 vs Round 16 0.8871 = +0.005 worse). Congestion DID decrease (-0.9%) but density went up (+1.2%) and WL slightly up — net wash.
+- **Insight:** cong target reachable but tradeoff with density. Need joint optimization: cong↓ AND density↓.
+- **Path forward:**
+  - Try cong_top_pct=0.05 (sharper hotspot focus, may help WITHOUT hurting density)
+  - Try cong_w=15 (intermediate) или revert to 10 + smarter cong-aware CD
+  - Custom CD что rank hyperparam mix: WL + 0.3×dens + 0.7×cong внутри (approximate proxy)
+
 
 
 **Подтверждённый pattern:** CD polish даёт **-0.010 ± 0.001 absolute** improvement регardless of tweaks. Floor определяется pre-CD (gradient batch outcome). Random tweaks (more dirs, multi-seed top-N, larger sf, restart with jitter, longer gradient) — не пробивают.
