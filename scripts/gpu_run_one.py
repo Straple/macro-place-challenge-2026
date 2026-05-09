@@ -465,7 +465,7 @@ def main():
         sys.path.insert(0, str(REPO_ROOT / "submissions" / "straple"))
         if cd_gpu_enable:
             from cd_polish import (cd_polish_gpu, cd_polish_gpu_with_restart,
-                                    cluster_polish_gpu)
+                                    cluster_polish_gpu, pair_swap_polish_gpu)
             from gpu_proxy import (build_routing_edges_full,
                                     build_smooth_matrices,
                                     build_routing_consts,
@@ -665,6 +665,46 @@ def main():
                 print(f"[gpu_run_one] CLUSTER polish: {cl_proxy:.4f} "
                       f"(no improvement vs {best_proxy:.4f}, {cl_dt:.1f}s)",
                       flush=True)
+
+    pswap_enable = (os.environ.get("STRAPLE_BATCH_PAIR_SWAP", "0") == "1"
+                     and cd_gpu_enable and best_pos_full is not None)
+    if pswap_enable:
+        pswap_neighbors = int(os.environ.get(
+            "STRAPLE_BATCH_PAIR_SWAP_NEIGHBORS", "10"))
+        pswap_rounds = int(os.environ.get(
+            "STRAPLE_BATCH_PAIR_SWAP_ROUNDS", "5"))
+        pswap_chunk = int(os.environ.get(
+            "STRAPLE_BATCH_PAIR_SWAP_CHUNK", "256"))
+        pswap_tb = float(os.environ.get(
+            "STRAPLE_BATCH_PAIR_SWAP_TIME_BUDGET", "0"))
+        if wall_tl > 0:
+            wall_remaining = wall_tl - (time.time() - t0) - wall_reserve
+            if pswap_tb <= 0 or pswap_tb > wall_remaining:
+                pswap_tb = max(1.0, wall_remaining)
+        print(f"[gpu_run_one] PAIR_SWAP: neighbors={pswap_neighbors} "
+              f"rounds={pswap_rounds} chunk={pswap_chunk} "
+              f"budget={pswap_tb:.0f}s", flush=True)
+        t_ps = time.time()
+        ps_pos, ps_proxy = pair_swap_polish_gpu(
+            benchmark, plc, best_pos_full,
+            proxy_pkgs=proxy_pkgs_cd,
+            n_neighbors=pswap_neighbors,
+            n_rounds=pswap_rounds,
+            verbose=True,
+            time_budget=pswap_tb,
+            proxy_chunk_n=cd_proxy_chunk_n,
+            chunk_pairs=pswap_chunk)
+        ps_dt = time.time() - t_ps
+        if ps_proxy < best_proxy - 1e-6:
+            print(f"[gpu_run_one] PAIR_SWAP IMPROVED: "
+                  f"{ps_proxy:.4f} < {best_proxy:.4f} ({ps_dt:.1f}s) "
+                  f"[wall_elapsed={time.time()-t0:.1f}s]", flush=True)
+            best_proxy = ps_proxy
+            best_pos_full = ps_pos.astype(np.float32)
+        else:
+            print(f"[gpu_run_one] PAIR_SWAP: {ps_proxy:.4f} "
+                  f"(no improvement vs {best_proxy:.4f}, {ps_dt:.1f}s)",
+                  flush=True)
 
     pr_cycles = int(os.environ.get("STRAPLE_BATCH_PR_CYCLES", "0"))
     if (pr_cycles > 0 and best_pos_full is not None and cd_polish_enable

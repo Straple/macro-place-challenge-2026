@@ -440,7 +440,7 @@ scp evyukhnevich@103.76.52.240:macro-place/.remote_runs/stats_ROUND_NAME.json /t
 
 ## Сводка статуса (Round 12 update)
 
-**Best держится Round 14:** **0.8942** (lucky pre-CD=0.9082 + CD signature -0.014). Round 4 был 0.8977, но Round 14 unequivocally beats его.
+**Best держится Round 16:** **0.8871** (Round 15 schedule + initial CD + pair-swap +0.003 abs). Прорыв через комбинацию idea #2 + idea #3.
 
 **Все остальные runs (5-13):** floor 0.904-0.910 при typical pre-CD=0.91-0.92, или хуже при non-default config.
 
@@ -483,6 +483,31 @@ scp evyukhnevich@103.76.52.240:macro-place/.remote_runs/stats_ROUND_NAME.json /t
   - Schedule fix → significantly better distribution
   - Pre-CD min new lower bound 0.9040
   - Improved baseline for all subsequent runs (just use these env vars)
+
+#### Round 16 — Идея #3: Pair-swap CD — **NEW BEST 0.8871** — 2026-05-09
+- **Hypothesis:** После single-macro CD floor, pair-swap (swap pos[i] ↔ pos[j] для k-nearest neighbors) орthogonal к single-macro moves. Может break basin floor.
+- **Code (`submissions/straple/cd_polish.py`):** новая функция `pair_swap_polish_gpu`. Per round:
+  1. Spatial KNN на hard macros (n_neighbors top closest)
+  2. For each pair: candidate = swap pos[i] ↔ pos[j]
+  3. Geometric overlap check: i_at_j vs all others, j_at_i vs all others (skip {i, j})
+  4. GPU rank batched через `gpu_proxy_batched`
+  5. Accept best valid pair-swap if < base GPU proxy
+  6. Iterate until 0 accepts. Final TILOS verify gates whole-run.
+- **Run config:** `STRAPLE_BATCH_PAIR_SWAP=1 STRAPLE_BATCH_PAIR_SWAP_NEIGHBORS=12 STRAPLE_BATCH_PAIR_SWAP_ROUNDS=6` поверх Round 15 baseline (1200s gradient + capped λ_o + CD).
+- **Result:**
+  - Pre-CD min=0.9015 (best yet)
+  - Initial CD: 0.9015 → 0.8903 (-0.0112)
+  - **Pair-swap: 0.8903 → 0.8871** (-0.0032 absolute, 38 swaps в 6 rounds)
+  - Per-round accepts: 7,7,7,7,5,5 (steady decline, ROUND-BASED convergence)
+  - Wall 25.7 min, pair-swap время 14.3s.
+- **Verdict:** **NEW BEST 0.8871** (vs Round 14 0.8942 = -0.0071, vs trial9 0.9065 = -0.0194). **WIN.**
+- **Per-round pair-swap signature:** 6 rounds, 38 swaps total = -0.0032 abs (vs single-macro CD which gives -0.011-0.014 in 8 rounds at start basin). Pair-swap effect smaller per swap но genuinely orthogonal.
+- **Что delivered:** novel algorithm working, additive on top of CD, breaks basin floor. Combine ideas #2 + #3 = 0.8871.
+- **Combined pipeline (current best):**
+  1. Gradient batch K=384, time_budget=1200, OVERLAP_W_MAX=50000, OVERLAP_W_GROWTH=1.004
+  2. Legalize all 384 seeds via C++ pool
+  3. Single-macro CD on best (approx_verify, 8 rounds)
+  4. Pair-swap CD on result (12 neighbors, 6 rounds)
 
 
 

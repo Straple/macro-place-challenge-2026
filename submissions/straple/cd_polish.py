@@ -456,6 +456,230 @@ def cluster_polish_gpu(benchmark, plc, pos_full: np.ndarray,
     return pos, final_proxy
 
 
+def pair_swap_polish_gpu(benchmark, plc, pos_full: np.ndarray,
+                          proxy_pkgs: dict,
+                          n_neighbors: int = 10,
+                          n_rounds: int = 5,
+                          verbose: bool = False,
+                          time_budget: float = 0.0,
+                          proxy_chunk_n: int = 32,
+                          chunk_pairs: int = 256) -> tuple[np.ndarray, float]:
+    """Pair-swap polish: for each macro, try swap with K-nearest neighbors.
+
+    Pipeline per round:
+      1. Build candidate pairs (i, j) — top n_neighbors closest hard macros.
+      2. For each pair: swap pos[i] <-> pos[j], check overlap with
+         non-{i,j} macros (vectorized geometric AABB intersection).
+      3. GPU rank valid swaps via gpu_proxy_batched (batched chunk_pairs).
+      4. Accept best valid swap, commit, iterate.
+      5. Final TILOS verify gates whole-run acceptance.
+    """
+    sys_path_added = False
+    try:
+        from gpu_proxy import gpu_proxy_batched
+    except ImportError:
+        from pathlib import Path as _P
+        import sys as _s
+        _s.path.insert(0, str(_P(__file__).resolve().parent))
+        sys_path_added = True
+        from gpu_proxy import gpu_proxy_batched
+    from macro_place.objective import compute_proxy_cost
+
+    device = (torch.device("cuda") if torch.cuda.is_available()
+              else torch.device("cpu"))
+
+    n_hard = int(benchmark.num_hard_macros)
+    n_total = int(benchmark.num_macros)
+    canvas_w = float(benchmark.canvas_width)
+    canvas_h = float(benchmark.canvas_height)
+    grid_rows = int(benchmark.grid_rows)
+    grid_cols = int(benchmark.grid_cols)
+
+    sizes = benchmark.macro_sizes.cpu().numpy().astype(np.float64)
+    fixed = benchmark.macro_fixed.cpu().numpy().astype(bool)
+    half_w = sizes[:, 0] * 0.5
+    half_h = sizes[:, 1] * 0.5
+
+    pos = pos_full.astype(np.float64).copy()
+    pos_orig = pos.copy()
+
+    sizes_t = benchmark.macro_sizes[:n_total].float().to(device)
+    edges_pkg = proxy_pkgs["edges_pkg"]
+    smooth_matrices = proxy_pkgs["smooth_matrices"]
+    routing_consts = proxy_pkgs["routing_consts"]
+    wl_pkg = proxy_pkgs["wl_pkg"]
+
+    from analytical_seed import (_build_net_pin_tensors_full,
+                                  _build_padded_net_tensors)
+    net_macro_idx, net_pin_offsets_lst = _build_net_pin_tensors_full(
+        benchmark, plc)
+    padded = _build_padded_net_tensors(net_macro_idx, net_pin_offsets_lst)
+    if padded is None:
+        macro_idx_p = torch.zeros((1, 1), dtype=torch.long, device=device)
+        offsets_p = torch.zeros((1, 1, 2), dtype=torch.float32, device=device)
+        mask_p = torch.zeros((1, 1), dtype=torch.bool, device=device)
+        num_nets_used = 0
+    else:
+        macro_idx_p, offsets_p, mask_p = padded
+        macro_idx_p = macro_idx_p.to(device)
+        offsets_p = offsets_p.to(device)
+        mask_p = mask_p.to(device)
+        num_nets_used = int(macro_idx_p.shape[0])
+
+    def _proxy_at(p_np: np.ndarray) -> tuple[float, int]:
+        full = torch.tensor(p_np, dtype=torch.float32)
+        c = compute_proxy_cost(full, benchmark, plc)
+        return float(c["proxy_cost"]), int(c["overlap_count"])
+
+    def _gpu_proxy(pos_tensor: torch.Tensor) -> float:
+        with torch.no_grad():
+            single = pos_tensor.unsqueeze(0)
+            p, _ = gpu_proxy_batched(
+                single, sizes_t, macro_idx_p, offsets_p, mask_p,
+                canvas_w, canvas_h, grid_rows, grid_cols, num_nets_used,
+                n_hard=n_hard,
+                edges_pkg=edges_pkg, smooth_matrices=smooth_matrices,
+                routing_consts=routing_consts, wl_pkg=wl_pkg,
+                chunk_n=proxy_chunk_n)
+        return float(p[0].item())
+
+    base_proxy_orig, base_ovrlp = _proxy_at(pos)
+    if verbose:
+        print(f"[pair_swap] start proxy={base_proxy_orig:.4f} "
+              f"ovrlp={base_ovrlp} (n_hard={n_hard} "
+              f"k_neighbors={n_neighbors} n_rounds={n_rounds})", flush=True)
+
+    movable_mask = ~fixed[:n_hard]
+    movable_idx = np.where(movable_mask)[0]
+    if len(movable_idx) < 2:
+        return pos_orig, base_proxy_orig
+
+    pos_t = torch.tensor(pos, dtype=torch.float32, device=device)
+    base_gpu = _gpu_proxy(pos_t)
+    t_start = time.time()
+
+    for r in range(n_rounds):
+        if time_budget > 0 and (time.time() - t_start) >= time_budget:
+            if verbose:
+                print(f"[pair_swap] time budget {time_budget:.0f}s reached "
+                      f"at round {r}", flush=True)
+            break
+
+        movable_pos = pos[movable_idx]
+        dists = np.linalg.norm(
+            movable_pos[:, None, :] - movable_pos[None, :, :], axis=2)
+        np.fill_diagonal(dists, np.inf)
+        knn_local = np.argsort(dists, axis=1)[:, :n_neighbors]
+        pairs_seen = set()
+        pairs = []
+        for li, i in enumerate(movable_idx):
+            for j_local in knn_local[li]:
+                j = int(movable_idx[j_local])
+                a, b = int(min(i, j)), int(max(i, j))
+                if (a, b) in pairs_seen:
+                    continue
+                pairs_seen.add((a, b))
+                pairs.append((a, b))
+        pairs = np.array(pairs, dtype=np.int64)
+        n_pairs = len(pairs)
+        if n_pairs == 0:
+            break
+
+        round_accepts = 0
+        for chunk_start in range(0, n_pairs, chunk_pairs):
+            if time_budget > 0 and (time.time() - t_start) >= time_budget:
+                break
+            chunk_end = min(chunk_start + chunk_pairs, n_pairs)
+            chunk = pairs[chunk_start:chunk_end]
+            chunk_size = len(chunk)
+
+            cand = pos_t.unsqueeze(0).expand(chunk_size, -1, -1).contiguous()
+            i_idx = chunk[:, 0]
+            j_idx = chunk[:, 1]
+            i_t = torch.tensor(i_idx, dtype=torch.long, device=device)
+            j_t = torch.tensor(j_idx, dtype=torch.long, device=device)
+            arange = torch.arange(chunk_size, device=device)
+            pos_i_t = pos_t[i_t]
+            pos_j_t = pos_t[j_t]
+            cand[arange, i_t] = pos_j_t
+            cand[arange, j_t] = pos_i_t
+
+            valid = np.ones(chunk_size, dtype=bool)
+            for ci in range(chunk_size):
+                i, j = int(chunk[ci, 0]), int(chunk[ci, 1])
+                pos_i_new = pos[j].copy()
+                pos_j_new = pos[i].copy()
+                if (pos_i_new[0] - half_w[i] < -1e-6 or
+                        pos_i_new[0] + half_w[i] > canvas_w + 1e-6 or
+                        pos_i_new[1] - half_h[i] < -1e-6 or
+                        pos_i_new[1] + half_h[i] > canvas_h + 1e-6 or
+                        pos_j_new[0] - half_w[j] < -1e-6 or
+                        pos_j_new[0] + half_w[j] > canvas_w + 1e-6 or
+                        pos_j_new[1] - half_h[j] < -1e-6 or
+                        pos_j_new[1] + half_h[j] > canvas_h + 1e-6):
+                    valid[ci] = False
+                    continue
+                bad = False
+                for k in range(n_hard):
+                    if k == i or k == j:
+                        continue
+                    if (abs(pos_i_new[0] - pos[k, 0]) < half_w[i] + half_w[k] - 1e-9
+                            and abs(pos_i_new[1] - pos[k, 1]) < half_h[i] + half_h[k] - 1e-9):
+                        bad = True
+                        break
+                    if (abs(pos_j_new[0] - pos[k, 0]) < half_w[j] + half_w[k] - 1e-9
+                            and abs(pos_j_new[1] - pos[k, 1]) < half_h[j] + half_h[k] - 1e-9):
+                        bad = True
+                        break
+                if bad:
+                    valid[ci] = False
+            if not valid.any():
+                continue
+
+            with torch.no_grad():
+                proxy_K, _comp = gpu_proxy_batched(
+                    cand, sizes_t, macro_idx_p, offsets_p, mask_p,
+                    canvas_w, canvas_h, grid_rows, grid_cols, num_nets_used,
+                    n_hard=n_hard,
+                    edges_pkg=edges_pkg, smooth_matrices=smooth_matrices,
+                    routing_consts=routing_consts, wl_pkg=wl_pkg,
+                    chunk_n=proxy_chunk_n)
+            arr = proxy_K.cpu().numpy()
+            arr_v = np.where(valid, arr, np.inf)
+            best_ci = int(np.argmin(arr_v))
+            best_val = float(arr_v[best_ci])
+            if best_val >= base_gpu - 1e-6:
+                continue
+            i_best, j_best = int(chunk[best_ci, 0]), int(chunk[best_ci, 1])
+            tmp = pos[i_best].copy()
+            pos[i_best] = pos[j_best].copy()
+            pos[j_best] = tmp
+            pos_t[i_best, 0] = float(pos[i_best, 0])
+            pos_t[i_best, 1] = float(pos[i_best, 1])
+            pos_t[j_best, 0] = float(pos[j_best, 0])
+            pos_t[j_best, 1] = float(pos[j_best, 1])
+            base_gpu = best_val
+            round_accepts += 1
+
+        if verbose:
+            print(f"[pair_swap] round {r+1}/{n_rounds}: {round_accepts} swaps "
+                  f"accepted; n_pairs={n_pairs} gpu_base={base_gpu:.4f} "
+                  f"elapsed={time.time()-t_start:.1f}s", flush=True)
+        if round_accepts == 0:
+            break
+
+    final_proxy, final_ovrlp = _proxy_at(pos)
+    if verbose:
+        print(f"[pair_swap] final TILOS proxy={final_proxy:.4f} "
+              f"ovrlp={final_ovrlp}", flush=True)
+    if final_proxy >= base_proxy_orig - 1e-6 or final_ovrlp > base_ovrlp:
+        if verbose:
+            print(f"[pair_swap] REVERT: not better than orig "
+                  f"{base_proxy_orig:.4f}", flush=True)
+        return pos_orig, base_proxy_orig
+    return pos, final_proxy
+
+
 def cd_polish_gpu_with_restart(benchmark, plc, pos_full: np.ndarray,
                                 proxy_pkgs: dict,
                                 restart_cycles: int = 0,
