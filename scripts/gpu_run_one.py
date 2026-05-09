@@ -159,13 +159,14 @@ def main():
         "STRAPLE_BATCH_OVERLAP_W_MAX", "500000"))
     grad_overlap_w_growth = float(os.environ.get(
         "STRAPLE_BATCH_OVERLAP_W_GROWTH", "1.008"))
-    pos_K, stats = gradient_batch(
-        benchmark, plc, K=args.K,
+    n_grad_runs = int(os.environ.get("STRAPLE_BATCH_GRADIENT_RUNS", "1"))
+    grad_kwargs_common = dict(
+        benchmark=benchmark, plc=plc, K=args.K,
         num_steps=20000,
         time_budget=args.time_budget,
-        seed=42,
         device="cuda" if torch.cuda.is_available() else "cpu",
-        anchor_strategy=os.environ.get("STRAPLE_BATCH_ANCHOR_STRATEGY", "centroid"),
+        anchor_strategy=os.environ.get(
+            "STRAPLE_BATCH_ANCHOR_STRATEGY", "centroid"),
         spawn_radius_frac=0.05,
         spawn_adaptive=True,
         anchor_jitter_frac=0.05,
@@ -182,6 +183,30 @@ def main():
         overlap_w_max=grad_overlap_w_max,
         overlap_w_growth=grad_overlap_w_growth,
     )
+    pos_K_list = []
+    stats_list = []
+    for run_idx in range(n_grad_runs):
+        run_seed = 42 + run_idx * 1009
+        if n_grad_runs > 1:
+            print(f"[gpu_run_one] gradient RUN {run_idx+1}/{n_grad_runs} "
+                  f"seed={run_seed}", flush=True)
+        pos_K_run, stats_run = gradient_batch(seed=run_seed, **grad_kwargs_common)
+        pos_K_list.append(pos_K_run)
+        stats_list.append(stats_run)
+    if n_grad_runs > 1:
+        pos_K = np.concatenate(
+            [p.cpu().numpy() if hasattr(p, "cpu") else p
+             for p in pos_K_list], axis=0)
+        if hasattr(pos_K_list[0], "cpu"):
+            pos_K = torch.tensor(pos_K, dtype=pos_K_list[0].dtype,
+                                  device=pos_K_list[0].device)
+        args.K = int(pos_K.shape[0])
+        stats = stats_list[0]
+        print(f"[gpu_run_one] combined {n_grad_runs} gradient runs -> "
+              f"K_total={args.K}", flush=True)
+    else:
+        pos_K = pos_K_list[0]
+        stats = stats_list[0]
     grad_time = time.time() - t0
     if torch.cuda.is_available():
         peak_mb = torch.cuda.max_memory_allocated() / 1e6
@@ -906,10 +931,13 @@ def main():
         proxy_max_snap = int(os.environ.get("STRAPLE_PROXY_TRAJ_SNAPS", "30"))
         sub_n = min(n_snap, proxy_max_snap)
         sub_indices = np.linspace(0, n_snap - 1, sub_n).astype(int)
-        proxy_arr = np.full((sub_n, args.K), np.nan, dtype=np.float32)
-        wl_arr = np.zeros((sub_n, args.K), dtype=np.float32)
-        den_arr = np.zeros((sub_n, args.K), dtype=np.float32)
-        cong_arr = np.zeros((sub_n, args.K), dtype=np.float32)
+        snap_K = (snapshots_pos_all[sub_indices[0]].shape[0]
+                   if hasattr(snapshots_pos_all[sub_indices[0]], "shape")
+                   else args.K)
+        proxy_arr = np.full((sub_n, snap_K), np.nan, dtype=np.float32)
+        wl_arr = np.zeros((sub_n, snap_K), dtype=np.float32)
+        den_arr = np.zeros((sub_n, snap_K), dtype=np.float32)
+        cong_arr = np.zeros((sub_n, snap_K), dtype=np.float32)
         print(f"[gpu_run_one] gpu_proxy traj: {sub_n} snapshots × "
               f"{args.K} seeds on GPU...", flush=True)
         t_proxy = time.time()
