@@ -735,6 +735,8 @@ def main():
             "STRAPLE_BATCH_PAIR_SWAP_RANK_WL_W", "1.0"))
         pswap_rank_dw = float(os.environ.get(
             "STRAPLE_BATCH_PAIR_SWAP_RANK_DENS_W", "0.5"))
+        pswap_lahc_len = int(os.environ.get(
+            "STRAPLE_BATCH_PAIR_SWAP_LAHC_LEN", "0"))
         if wall_tl > 0:
             wall_remaining = wall_tl - (time.time() - t0) - wall_reserve
             if pswap_tb <= 0 or pswap_tb > wall_remaining:
@@ -755,7 +757,8 @@ def main():
             rank_mode=pswap_rank_mode,
             rank_cong_weight=pswap_rank_cw,
             rank_wl_weight=pswap_rank_ww,
-            rank_dens_weight=pswap_rank_dw)
+            rank_dens_weight=pswap_rank_dw,
+            lahc_length=pswap_lahc_len)
         ps_dt = time.time() - t_ps
         if ps_proxy < best_proxy - 1e-6:
             print(f"[gpu_run_one] PAIR_SWAP IMPROVED: "
@@ -766,6 +769,51 @@ def main():
         else:
             print(f"[gpu_run_one] PAIR_SWAP: {ps_proxy:.4f} "
                   f"(no improvement vs {best_proxy:.4f}, {ps_dt:.1f}s)",
+                  flush=True)
+
+    cd_postswap_enable = (os.environ.get(
+        "STRAPLE_BATCH_CD_POSTSWAP", "0") == "1"
+        and cd_gpu_enable and best_pos_full is not None)
+    if cd_postswap_enable:
+        ps_cd_rounds = int(os.environ.get(
+            "STRAPLE_BATCH_CD_POSTSWAP_ROUNDS", "4"))
+        ps_cd_sf_str = os.environ.get(
+            "STRAPLE_BATCH_CD_POSTSWAP_SF",
+            "0.0625,0.03125,0.015625,0.0078125")
+        ps_cd_sf = tuple(float(x) for x in ps_cd_sf_str.split(",")
+                          if x.strip())
+        ps_cd_tb = float(os.environ.get(
+            "STRAPLE_BATCH_CD_POSTSWAP_TIME_BUDGET", "0"))
+        if wall_tl > 0:
+            wall_remaining = wall_tl - (time.time() - t0) - wall_reserve
+            if ps_cd_tb <= 0 or ps_cd_tb > wall_remaining:
+                ps_cd_tb = max(1.0, wall_remaining)
+        print(f"[gpu_run_one] CD POSTSWAP: rounds={ps_cd_rounds} "
+              f"sf={ps_cd_sf} budget={ps_cd_tb:.0f}s", flush=True)
+        t_pscd = time.time()
+        pscd_pos, pscd_proxy = cd_polish_gpu(
+            benchmark, plc, best_pos_full,
+            proxy_pkgs=proxy_pkgs_cd,
+            rounds=ps_cd_rounds, step_factors=ps_cd_sf,
+            n_directions=cd_dirs, topk_verify=cd_topk,
+            macro_chunk=cd_macro_chunk,
+            time_budget=ps_cd_tb,
+            proxy_chunk_n=cd_proxy_chunk_n,
+            approx_verify=cd_approx_verify,
+            approx_threshold=cd_approx_threshold,
+            approx_refresh_per_accept=cd_approx_refresh,
+            verbose=True)
+        pscd_dt = time.time() - t_pscd
+        if pscd_proxy < best_proxy - 1e-6:
+            print(f"[gpu_run_one] CD POSTSWAP IMPROVED: "
+                  f"{pscd_proxy:.4f} < {best_proxy:.4f} "
+                  f"({pscd_dt:.1f}s) "
+                  f"[wall_elapsed={time.time()-t0:.1f}s]", flush=True)
+            best_proxy = pscd_proxy
+            best_pos_full = pscd_pos.astype(np.float32)
+        else:
+            print(f"[gpu_run_one] CD POSTSWAP: {pscd_proxy:.4f} "
+                  f"(no improvement vs {best_proxy:.4f}, {pscd_dt:.1f}s)",
                   flush=True)
 
     tcyc_enable = (os.environ.get("STRAPLE_BATCH_TRIPLE_CYCLE", "0") == "1"

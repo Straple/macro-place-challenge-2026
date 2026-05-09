@@ -467,7 +467,8 @@ def pair_swap_polish_gpu(benchmark, plc, pos_full: np.ndarray,
                           rank_mode: str = "proxy",
                           rank_cong_weight: float = 1.0,
                           rank_wl_weight: float = 1.0,
-                          rank_dens_weight: float = 0.5) -> tuple[np.ndarray, float]:
+                          rank_dens_weight: float = 0.5,
+                          lahc_length: int = 0) -> tuple[np.ndarray, float]:
     """Pair-swap polish: for each macro, try swap with K-nearest neighbors.
 
     Pipeline per round:
@@ -580,6 +581,13 @@ def pair_swap_polish_gpu(benchmark, plc, pos_full: np.ndarray,
                      + rank_cong_weight * c["congestion"][0].item())
 
     base_rank = _gpu_rank(pos_t)
+    base_proxy_running = base_proxy_orig
+    best_proxy_seen = base_proxy_orig
+    best_pos_seen = pos_orig.copy()
+    lahc_buf: "list[float] | None" = None
+    if lahc_length > 0:
+        lahc_buf = [base_rank] * int(lahc_length)
+    lahc_idx = 0
     t_start = time.time()
 
     for r in range(n_rounds):
@@ -680,8 +688,13 @@ def pair_swap_polish_gpu(benchmark, plc, pos_full: np.ndarray,
             arr_v = np.where(valid, arr, np.inf)
             best_ci = int(np.argmin(arr_v))
             best_val = float(arr_v[best_ci])
-            if best_val >= base_rank - 1e-6:
-                continue
+            if lahc_buf is not None:
+                threshold = lahc_buf[lahc_idx % len(lahc_buf)]
+                if best_val >= threshold - 1e-6:
+                    continue
+            else:
+                if best_val >= base_rank - 1e-6:
+                    continue
             i_best, j_best = int(chunk[best_ci, 0]), int(chunk[best_ci, 1])
             tmp = pos[i_best].copy()
             pos[i_best] = pos[j_best].copy()
@@ -692,6 +705,12 @@ def pair_swap_polish_gpu(benchmark, plc, pos_full: np.ndarray,
             pos_t[j_best, 1] = float(pos[j_best, 1])
             base_rank = best_val
             base_gpu = _gpu_proxy(pos_t) if rank_mode != "proxy" else best_val
+            if lahc_buf is not None:
+                lahc_buf[lahc_idx % len(lahc_buf)] = base_rank
+                lahc_idx += 1
+                if base_gpu < best_proxy_seen - 1e-9:
+                    best_proxy_seen = base_gpu
+                    best_pos_seen = pos.copy()
             round_accepts += 1
 
         if verbose:
@@ -701,8 +720,26 @@ def pair_swap_polish_gpu(benchmark, plc, pos_full: np.ndarray,
         if round_accepts == 0:
             break
 
-    full_t = torch.tensor(pos, dtype=torch.float32)
-    cost_dict = compute_proxy_cost(full_t, benchmark, plc)
+    if lahc_buf is not None:
+        full_seen = torch.tensor(best_pos_seen, dtype=torch.float32)
+        seen_cost = compute_proxy_cost(full_seen, benchmark, plc)
+        seen_proxy = float(seen_cost["proxy_cost"])
+        seen_ovrlp = int(seen_cost["overlap_count"])
+        full_t = torch.tensor(pos, dtype=torch.float32)
+        cur_cost = compute_proxy_cost(full_t, benchmark, plc)
+        cur_proxy = float(cur_cost["proxy_cost"])
+        cur_ovrlp = int(cur_cost["overlap_count"])
+        if seen_ovrlp <= base_ovrlp and seen_proxy <= cur_proxy:
+            pos = best_pos_seen
+            cost_dict = seen_cost
+        else:
+            cost_dict = cur_cost
+        if verbose:
+            print(f"[pair_swap-lahc] best_seen={seen_proxy:.4f} "
+                  f"final_state={cur_proxy:.4f}", flush=True)
+    else:
+        full_t = torch.tensor(pos, dtype=torch.float32)
+        cost_dict = compute_proxy_cost(full_t, benchmark, plc)
     final_proxy = float(cost_dict["proxy_cost"])
     final_ovrlp = int(cost_dict["overlap_count"])
     if verbose:
