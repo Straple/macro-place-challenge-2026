@@ -709,6 +709,45 @@ STRAPLE_BATCH_PAIR_SWAP_ROUNDS=6
 
 **Best остаётся Round 23 (0.8856)** — full-stack комбо CD + pair-swap rounds=8 + triple-cycle.
 
+#### Rounds 28-30: variance + multi-run + B*-tree exploration + wider pair-swap — 2026-05-09
+
+**Round 28 (replay Round 23):** 0.8955. Round 23's 0.8856 was lucky. Variance ±0.005-0.01.
+
+**Round 29 (2x gradient runs, 768 seeds):** 0.8885. Marginal gain from doubled gradient.
+
+**B*-tree implementation (commit 7f7b8df):** abandoned. Builds packed layout from scratch, throws away gradient+CD optimization. Tree placement worse than orig in our pipeline. Not a fit for fixed-canvas WL+density+cong metric (representation designed for floorplanning area minimization).
+
+**GPU cong vs TILOS verification:** GPU `gpu_congestion_google` matches TILOS exactly (1e-7 diff = float precision). Idea 3 cong-rank fail was MYOPIC optimization issue, not metric mismatch.
+
+**Round 30 (pair-swap neighbors=50, rounds=12):** 0.8918. NOT new best. Pair-swap converges at -0.0044 from CD floor regardless of K (12, 16, 50). Diminishing returns confirmed:
+- KNN=12 → -0.0032 to -0.0045
+- KNN=50 → -0.0044
+- Larger K wastes GPU compute on already-tried pairs.
+
+#### Финальный отчёт по всему session pipeline (Rounds 14-30)
+
+**BEST: 0.8856 (Round 23)** — lucky single-shot. Pipeline: gradient(1200s, capped λ_o) → legalize 384 → CD approx 8 rounds → pair-swap KNN=12 rounds=8 → triple-cycle. Median over multiple runs: ~0.890-0.895.
+
+**Confirmed walls:**
+- CD signature: -0.011-0.014 abs from pre-CD (basin-bound)
+- Pre-CD min variance: ±0.005-0.01 (gradient stochastic)
+- Pair-swap delta: -0.003 to -0.005 abs (converges at K=12)
+- Triple-cycle: -0.0001 marginal
+
+**Failed approaches:**
+1. Idea 1 Perturb-relax — too fragile post-CD
+2. Idea 2 Recalibrated schedule — distribution shift but same best
+3. Idea 4 Multi-seed top-N — same basin
+4. Idea 5 Cong-targeted — Pareto wash with density
+5. Cong-rank pair-swap — myopic
+6. Nesterov+grad_clip — Adam already optimal
+7. B*-tree — packed layout incompatible
+
+**Real breakthroughs require multi-day work:**
+- Custom DREAMPlace optimizer (Lipschitz step + line search + grad norm)
+- ML-based macro placement (RL-trained policy)
+- Different objective formulation (joint cong+density beyond Pareto)
+
 
 
 **Подтверждённый pattern:** CD polish даёт **-0.010 ± 0.001 absolute** improvement регardless of tweaks. Floor определяется pre-CD (gradient batch outcome). Random tweaks (more dirs, multi-seed top-N, larger sf, restart with jitter, longer gradient) — не пробивают.
