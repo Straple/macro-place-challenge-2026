@@ -150,6 +150,7 @@ def main():
     use_eplace = os.environ.get("STRAPLE_BATCH_EPLACE", "0") == "1"
     eplace_grid_size = int(os.environ.get("STRAPLE_BATCH_EPLACE_GRID", "256"))
     cong_weight = float(os.environ.get("STRAPLE_BATCH_CONG_W", "0"))
+    cong_top_pct = float(os.environ.get("STRAPLE_BATCH_CONG_TOP_PCT", "0.10"))
     per_k_diversity = os.environ.get("STRAPLE_BATCH_DIVERSITY", "0") == "1"
     cohesion_beta_start = float(os.environ.get("STRAPLE_BATCH_COHESION_START", "0"))
     cohesion_beta_end = float(os.environ.get("STRAPLE_BATCH_COHESION_END", "0"))
@@ -175,6 +176,7 @@ def main():
         use_eplace_density=use_eplace,
         eplace_grid_size=eplace_grid_size,
         cong_weight=cong_weight,
+        cong_top_pct=cong_top_pct,
         per_k_diversity=per_k_diversity,
         lr=grad_lr,
         overlap_w_max=grad_overlap_w_max,

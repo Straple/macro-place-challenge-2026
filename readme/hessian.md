@@ -562,6 +562,52 @@ scp evyukhnevich@103.76.52.240:macro-place/.remote_runs/stats_ROUND_NAME.json /t
   - Try cong_w=15 (intermediate) или revert to 10 + smarter cong-aware CD
   - Custom CD что rank hyperparam mix: WL + 0.3×dens + 0.7×cong внутри (approximate proxy)
 
+#### Round 20 — Идея #5b: cong_w=15 + cong_top_pct=0.05 — wash (cong↓↓ but dens↑↑) — 2026-05-09
+- **Hypothesis:** Sharper hotspot focus (top 5% vs 10%) + intermediate cong_w (15) → reduce cong without hurting density.
+- **Code:** `gpu_run_one.py` — env `STRAPLE_BATCH_CONG_TOP_PCT` проброшен в gradient_batch.
+- **Run config:** `STRAPLE_BATCH_CONG_W=15 STRAPLE_BATCH_CONG_TOP_PCT=0.05`.
+- **Result:** Pre-CD 0.9097, CD 0.9004, pair-swap **0.8962**. Wall 25.7 min.
+- **Breakdown:** WL=0.0744 dens=0.5852 cong=1.0584
+  - vs Round 18 (cong_w=10): WL +0.003, dens **+0.028 ✗✗**, cong **-0.028 ✓✓**
+  - Cong DECREASED dramatically (-2.5%!), но density grew по equal magnitude. **Tradeoff is symmetric.**
+- **Verdict:** **NOT NEW BEST** (0.8962 vs Round 16 0.8871 = +0.009).
+- **Insight: density and congestion compete fundamentally.** Cong reduction routes macros into densely packed regions; spreading them increases congestion. There's a Pareto frontier.
+- **Conclusion idea #5:** Both cong_w=20 and (cong_w=15 + top_pct=0.05) move along Pareto frontier — не improve total proxy. To break the frontier need fundamentally different approach (e.g., joint cong+density penalty, RUDY congestion, или different placement representation).
+
+---
+
+## Финальная сводка после Ideas #1-5
+
+**BEST ON ibm01: 0.8871 (Round 16, commit 13f2fa0)**
+**vs trial9 baseline:** 0.9065 → 0.8871 = **-0.0194 (-2.1%) WIN**
+**vs vmallela record:** 0.7644 → 0.8871 (gap +16% remains).
+
+**Идея #1 Perturb-relax** (Round 14) — implementation works, NEW BEST 0.8942 от lucky pre-CD initial CD; perturb cycles bcoz too disruptive, not useful at current params.
+
+**Идея #2 Recalibrated schedule** (Round 15) — distribution genuinely improved (mean -1.4%, std -9%). Best within noise. **Permanent baseline change** — все subsequent runs use OVERLAP_W_MAX=50000, OVERLAP_W_GROWTH=1.004.
+
+**Идея #3 Pair-swap CD** (Round 16) — **THE BREAKTHROUGH.** -0.0032 absolute on top of CD floor. Genuinely orthogonal to single-macro CD. **Best held by this round.**
+
+**Идея #4 Multi-seed top-N** (Round 17) — confirmed lateral, narrow pre-CD spread → all seeds same basin. Don't use.
+
+**Идея #5 Congestion-targeted** (Rounds 18, 19, 20) — KEY INSIGHT: cong=61% of proxy. Direct cong reduction hits density Pareto frontier. Need different approach to break frontier.
+
+**Working pipeline (current best):**
+```bash
+STRAPLE_BATCH_EPLACE=1 STRAPLE_BATCH_EPLACE_GRID=128 STRAPLE_BATCH_CONG_W=10
+STRAPLE_BATCH_COHESION_START=5 STRAPLE_BATCH_COHESION_END=0.001
+STRAPLE_BATCH_DIVERSITY=1 STRAPLE_BATCH_OVERLAP_FORM=rect_quad
+STRAPLE_BATCH_OVERFLOW_LAMBDA=1 STRAPLE_BATCH_OVERFLOW_TARGET=0.13
+STRAPLE_BATCH_OVERFLOW_EXP=0.7 STRAPLE_BATCH_OVERFLOW_COEF_HI=1.5
+STRAPLE_BATCH_BLOCKAGE_W=50
+STRAPLE_BATCH_OVERLAP_W_MAX=50000 STRAPLE_BATCH_OVERLAP_W_GROWTH=1.004
+STRAPLE_BATCH_CD_POLISH=1 STRAPLE_BATCH_CD_GPU_FILTER=1
+STRAPLE_BATCH_CD_GPU_APPROX=1
+STRAPLE_BATCH_PAIR_SWAP=1 STRAPLE_BATCH_PAIR_SWAP_NEIGHBORS=12
+STRAPLE_BATCH_PAIR_SWAP_ROUNDS=6
+--time-budget 1200
+```
+
 
 
 **Подтверждённый pattern:** CD polish даёт **-0.010 ± 0.001 absolute** improvement регardless of tweaks. Floor определяется pre-CD (gradient batch outcome). Random tweaks (more dirs, multi-seed top-N, larger sf, restart with jitter, longer gradient) — не пробивают.
