@@ -33,6 +33,55 @@
 
 ---
 
+## 🔬 Empirical insights from execution (v5, 2026-05-09/10)
+
+### Action #1 H2 result — cong is gradient-bound
+Single-shot trajectory on ibm01 (trial9 + CD + pair-swap rounds=8 + triple-cycle):
+- post-gradient `cong_frac = 0.609`, post-triple-cycle `cong_frac = 0.596`
+- Cong drops 1.1116 → 1.0655 (−0.046 abs) across full pipeline; pair-swap+triple contribute only −0.005 (~10% of total cong reduction). **Polish operators are essentially noop on cong.**
+- Cong-floor is set by gradient phase. WL is solved by gradient (~0.071 stable). Density spikes post-legalize (+0.024) then CD reverses partially.
+- **→ Decision rule per v4 (`cong_fraction ≥ 0.55`): SKIP L-BFGS / Hessian / any pure gradient finisher.** They optimize WL/density convergence, not cong topology.
+
+### Action #3 M1 joint p-norm — incompatible with dynamic λ_d (FAIL)
+- Plan's `cong_norm = cong / cong.detach()` formula: loss numerically `(cw^p + dw^p)^(1/p)` (constant), gradient scales as `1/x.detach()`.
+- For density (scale ~3000) the gradient gets divided by ~3000 → killed.
+- Density not optimized → overflow stays high → λ_d explodes via overflow update → `dw^p` (e.g. `2000^4 = 1.6e13`) dominates joint_pen → cong gradient also collapses to ~0.
+- Both p=4 and p=2 hit identical pathology at step 100–200 (dpen=260k vs baseline 17k = 15× explosion).
+- **Don't reimplement plan's exact formula.** If knee-seeking is revisited:
+  - fixed-weight joint (don't put dynamic λ_d inside p-norm); keep additive λ_d·dpen separately for overflow control;
+  - target-relative ratios `(cong/cong_target)^p + (dens/dens_target)^p` (no detach);
+  - apply joint_pen only late P3 after λ_d settled;
+  - or constraint formulation (Lagrangian on cong < target ∧ dens < target).
+
+### Cong-only ablation — density is for physical spread, not proxy weight
+Disabled cohesion / anchor / ePlace density / overflow-λ / blockage; kept only WL + overlap (hard) + cong. ibm01 mini run (K=64, 60s gradient + light CD/pair/triple):
+
+| metric           | baseline trial9 | cong-only | Δ |
+|---               |---              |---        |---|
+| proxy (final)    | **0.9219**      | 0.9691    | **+5.1% ⚠**  |
+| WL               | 0.0749          | **0.0716**| −4.4% ✓ |
+| density          | **0.5848**      | 0.7069    | **+20.9% ⚠** |
+| congestion       | 1.1093          | **1.0881**| −1.9% ✓ |
+| post-grad ovl    | 125             | 84        | −33% ✓ |
+
+Surprises:
+- **WL is hurt by cohesion** (−4% when removed). Cohesion makes clusters tight, but WL bbox-LSE finds its own optimum without help.
+- **Cong loss alone DOES reduce cong** (−2%) — direct gradient signal works. Not the bottleneck.
+- **Density penalty's job is physical spread, not proxy improvement.** Without it, layout drifts into denser packing under WL pull → density component (0.5·dens) of proxy alone adds +0.06 → proxy worse despite WL+cong wins.
+- **Layout doesn't collapse** (overlap penalty for hard macros holds it). Earlier prediction was wrong.
+
+→ **Knee idea: smarter density, not joint p-norm.**
+- `STRAPLE_BATCH_DENSITY_TOPK_W>0` + `DENSITY_TOPK_PCT=0.05` already exists — penalizes only top-5% peak density cells. Allows dense zones where cong is fine, slams only true hotspots. Untried with cong-only style minimal loss.
+- Soft-overlap penalty `STRAPLE_BATCH_OVERLAP_SOFT=1` is the documented spread-fix for soft-cluster pile-up (memory: −5% cong on ibm01 vs baseline). Should be default.
+
+### Action #5 HPO partial result (killed before completion)
+Trial 5 (trial9 + `OVERFLOW_TARGET=0.10` + `PAIR_SWAP_ROUNDS=12`, K=384) → 0.8910 single-shot. Within noise of Round 23 0.8856 lucky. TPE was learning around trial9 region but user killed for visualization detour. If revived: re-seed study with trial9 anchor + slightly tighter overflow + 12-round pair-swap as a productive starting basin.
+
+### Visualization infrastructure
+Added `submissions/straple/snapshot_dump.py` (env `STRAPLE_BATCH_DUMP_SNAPSHOTS=1`) — captures per-frame pos + TILOS metrics + density/cong grids + Louvain cluster_ids into `.npz`. Standalone renderer `scripts/render_snapshots.py` builds 4-panel HTML (placement + density turbo + congestion turbo + metrics) from raw arrays — re-rendering is free (no pipeline rerun).
+
+---
+
 ## 🚫 KILL LIST (не делать — low ROI / already debunked)
 
 1. **Tier 1.1 Per-macro 2×2 Newton CD** — paradigm risk (v1-v7 saddle history showed 768 escapes all in noise); density Hessian derivation 12-18h; gated by S2 which is itself inconclusive at -0.002 zone.
@@ -481,6 +530,12 @@ START: Day 0
 *Document v4.0 — synthesized from 12 agents (6 research + 3 review v2 + 3 review v3 + 4 review v4) — 2026-05-09.*
 
 ## Changelog
+
+**v5 (2026-05-09/10):**
+- ⭐ Added "Empirical insights from execution" section: H2 result confirms cong-bound (`cong_frac=0.609`), M1 joint p-norm FAIL (incompatible with dynamic λ_d), cong-only ablation reveals density's job is physical spread (not proxy weight), HPO partial trial 5 = 0.8910 within noise.
+- New direction proposed: top-k density (`DENSITY_TOPK_W`) + soft-overlap penalty (`OVERLAP_SOFT=1`) instead of joint p-norm reformulation.
+- Visualization infra: snapshot_dump.py + render_snapshots.py (4-panel HTML, raw .npz cache).
+- Action #2 (DREAMPlace) vetoed by user — don't revive without re-asking.
 
 **v4 (2026-05-09):**
 - ⭐ **Crystallized to 5 actions** with clear priority + cumulative expected gain table
