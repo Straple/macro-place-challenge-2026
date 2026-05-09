@@ -668,10 +668,17 @@ def pair_swap_polish_gpu(benchmark, plc, pos_full: np.ndarray,
         if round_accepts == 0:
             break
 
-    final_proxy, final_ovrlp = _proxy_at(pos)
+    full_t = torch.tensor(pos, dtype=torch.float32)
+    cost_dict = compute_proxy_cost(full_t, benchmark, plc)
+    final_proxy = float(cost_dict["proxy_cost"])
+    final_ovrlp = int(cost_dict["overlap_count"])
     if verbose:
+        wl_c = float(cost_dict.get("wirelength_cost", 0))
+        d_c = float(cost_dict.get("density_cost", 0))
+        cong_c = float(cost_dict.get("congestion_cost", 0))
         print(f"[pair_swap] final TILOS proxy={final_proxy:.4f} "
-              f"ovrlp={final_ovrlp}", flush=True)
+              f"ovrlp={final_ovrlp} (WL={wl_c:.4f} dens={d_c:.4f} "
+              f"cong={cong_c:.4f})", flush=True)
     if final_proxy >= base_proxy_orig - 1e-6 or final_ovrlp > base_ovrlp:
         if verbose:
             print(f"[pair_swap] REVERT: not better than orig "

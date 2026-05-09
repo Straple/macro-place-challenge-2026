@@ -523,6 +523,33 @@ scp evyukhnevich@103.76.52.240:macro-place/.remote_runs/stats_ROUND_NAME.json /t
 - **Verdict:** **NOT NEW BEST** (vs Round 16 0.8871 = +0.0037 worse). Same pattern as Round 5/9: multi-seed within narrow pre-CD spread (0.91-0.92) каждый seed converges к ~ basin_min - 0.014, best of N still bounded by lowest pre-CD.
 - **Что delivered:** confirms hypothesis "pre-CD start dominates". Multi-seed бесполезен при narrow distribution. Best of top-5 ≈ best of top-1 + variance noise.
 
+#### Round 18 — Extended pair-swap (rounds=12, neighbors=20) + breakdown logging — NOT BEST + KEY INSIGHT — 2026-05-09
+- **Hypothesis:** Round 16 pair-swap не сошёлся (5 acc на R6). Extended rounds + neighbors даст deeper.
+- **Code:** `pair_swap_polish_gpu` финальный лог теперь печатает TILOS breakdown: `WL=... dens=... cong=...`.
+- **Run config:** `STRAPLE_BATCH_PAIR_SWAP_NEIGHBORS=20 STRAPLE_BATCH_PAIR_SWAP_ROUNDS=12`.
+- **Result:** Pre-CD min=0.9089. CD: 0.9089 → 0.8972 (-0.0117). Pair-swap: 0.8972 → **0.8931** (-0.0041 abs in 10 rounds, converged at R10 with 0 acc). Wall 26.2 min.
+- **Verdict:** **NOT NEW BEST** (vs Round 16 0.8871 = +0.006 worse, due to worse pre-CD start: 0.9089 vs 0.9015).
+- **🔑 KEY INSIGHT — TILOS breakdown показывает:**
+  ```
+  WL=0.0715, dens=0.5568, cong=1.0864
+  proxy = WL + 0.5×dens + 0.5×cong = 0.0715 + 0.2784 + 0.5432 = 0.8931
+  ```
+  - **Congestion contribution: 61%** (0.5432 / 0.8931)
+  - Density: 31% (0.2784)
+  - WL: 8% (0.0715)
+- **Conclusion:** Congestion ДОМИНИРУЕТ. Чтобы пробить 0.85, надо снижать **congestion**, не WL или density. Vmallela 0.7644 — у них наверняка значительно ниже cong.
+- **Что delivered:**
+  - Confirmed pair-swap converges (extended params marginal)
+  - Critical breakdown insight для **idea #5**: focus на congestion
+
+#### Идея #5 — Congestion-targeted (вместо component analysis на slack) — pending
+- Из breakdown ясно: cong = 61% от proxy, не WL. Real lever: уменьшать cong.
+- Пути:
+  1. Increase cong_weight в gradient (currently 10): try 20, 30
+  2. Decrease cong_top_pct (sharper hotspot focus): try 0.05, 0.02
+  3. Add congestion-aware CD/pair-swap (rank by GPU cong only)
+  4. Different congestion formulation (RUDY-based, edge-density)
+
 
 
 **Подтверждённый pattern:** CD polish даёт **-0.010 ± 0.001 absolute** improvement регardless of tweaks. Floor определяется pre-CD (gradient batch outcome). Random tweaks (more dirs, multi-seed top-N, larger sf, restart with jitter, longer gradient) — не пробивают.
