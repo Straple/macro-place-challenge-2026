@@ -215,6 +215,72 @@ def main() -> None:
                                   direction="minimize")
     print(f"[hpo] study={args.study_name} storage={storage_url} "
           f"existing_trials={len(study.trials)}", flush=True)
+
+    # Seed TPE with known-good trial9 result + enqueue near-trial9 anchors so
+    # the sampler learns the productive region of the search space instead of
+    # wandering random startup. Trial9 = Round 23 best pipeline with H2
+    # baseline result 0.8938 (seed=42, single shot).
+    distributions = {
+        "OVERLAP_W_MAX": optuna.distributions.FloatDistribution(20000, 100000, log=True),
+        "OVERLAP_W_GROWTH": optuna.distributions.FloatDistribution(1.002, 1.010, log=True),
+        "OVERFLOW_TARGET": optuna.distributions.FloatDistribution(0.08, 0.20),
+        "OVERFLOW_EXP": optuna.distributions.FloatDistribution(0.5, 1.0),
+        "CONG_W": optuna.distributions.FloatDistribution(5.0, 25.0),
+        "PAIR_SWAP_ROUNDS": optuna.distributions.CategoricalDistribution([6, 8, 10, 12]),
+        "K": optuna.distributions.CategoricalDistribution([256, 384]),
+    }
+    trial9_params = {
+        "OVERLAP_W_MAX": 50000.0,
+        "OVERLAP_W_GROWTH": 1.004,
+        "OVERFLOW_TARGET": 0.13,
+        "OVERFLOW_EXP": 0.7,
+        "CONG_W": 10.0,
+        "PAIR_SWAP_ROUNDS": 8,
+        "K": 384,
+    }
+    has_trial9_anchor = any(
+        all(t.params.get(k) == v for k, v in trial9_params.items())
+        for t in study.trials
+        if t.state == optuna.trial.TrialState.COMPLETE
+    )
+    if not has_trial9_anchor:
+        study.add_trial(
+            optuna.trial.create_trial(
+                params=trial9_params,
+                distributions=distributions,
+                value=0.8938,
+            )
+        )
+        print(f"[hpo] seeded trial9 anchor as known result (proxy=0.8938)",
+              flush=True)
+    # Enqueue a couple of explored variants the user has already tested
+    # (Round 16 territory) so TPE has more diverse anchors. These will be
+    # actually run, but they are good starting points.
+    enqueue_anchors = [
+        # Trial9 with K=256 (cheaper, see if K matters)
+        {"OVERLAP_W_MAX": 50000.0, "OVERLAP_W_GROWTH": 1.004,
+         "OVERFLOW_TARGET": 0.13, "OVERFLOW_EXP": 0.7,
+         "CONG_W": 10.0, "PAIR_SWAP_ROUNDS": 8, "K": 256},
+        # Slightly tighter overflow target, more pair-swap rounds
+        {"OVERLAP_W_MAX": 50000.0, "OVERLAP_W_GROWTH": 1.004,
+         "OVERFLOW_TARGET": 0.10, "OVERFLOW_EXP": 0.7,
+         "CONG_W": 10.0, "PAIR_SWAP_ROUNDS": 12, "K": 384},
+    ]
+    enqueued_count = 0
+    for anchor in enqueue_anchors:
+        already = any(
+            all(t.params.get(k) == v for k, v in anchor.items())
+            for t in study.trials
+        )
+        if not already:
+            try:
+                study.enqueue_trial(anchor, skip_if_exists=True)
+                enqueued_count += 1
+            except Exception as exc:
+                print(f"[hpo] enqueue failed for {anchor}: {exc}", flush=True)
+    if enqueued_count:
+        print(f"[hpo] enqueued {enqueued_count} anchor(s) as next trials",
+              flush=True)
     print(f"[hpo] target: n_trials={args.n_trials} timeout_h={args.timeout_h}",
           flush=True)
 

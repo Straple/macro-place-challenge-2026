@@ -7,6 +7,7 @@ Round-robin до сходимости. vmallela-style local refinement.
 
 from __future__ import annotations
 
+import os
 import time
 
 import numpy as np
@@ -468,7 +469,9 @@ def pair_swap_polish_gpu(benchmark, plc, pos_full: np.ndarray,
                           rank_cong_weight: float = 1.0,
                           rank_wl_weight: float = 1.0,
                           rank_dens_weight: float = 0.5,
-                          lahc_length: int = 0) -> tuple[np.ndarray, float]:
+                          lahc_length: int = 0,
+                          neighbor_mode: str = "spatial",
+                          ) -> tuple[np.ndarray, float]:
     """Pair-swap polish: for each macro, try swap with K-nearest neighbors.
 
     Pipeline per round:
@@ -554,10 +557,47 @@ def pair_swap_polish_gpu(benchmark, plc, pos_full: np.ndarray,
               f"ovrlp={base_ovrlp} (n_hard={n_hard} "
               f"k_neighbors={n_neighbors} n_rounds={n_rounds})", flush=True)
 
-    movable_mask = ~fixed[:n_hard]
+    include_soft_swap = os.environ.get(
+        "STRAPLE_BATCH_PAIR_SWAP_SOFT", "0") == "1"
+    swap_search_n = n_total if include_soft_swap else n_hard
+    movable_mask = ~fixed[:swap_search_n]
     movable_idx = np.where(movable_mask)[0]
+    if verbose and include_soft_swap:
+        print(f"[pair_swap] extended to soft macros (search_n={swap_search_n})",
+              flush=True)
     if len(movable_idx) < 2:
         return pos_orig, base_proxy_orig
+
+    connectivity_knn = None
+    if neighbor_mode == "graph":
+        n_mov = len(movable_idx)
+        connectivity = np.zeros((n_mov, n_mov), dtype=np.int32)
+        movable_set = set(int(i) for i in movable_idx)
+        idx_to_local = {int(g): li for li, g in enumerate(movable_idx)}
+        for net_t in benchmark.net_pin_nodes:
+            owners = net_t[:, 0].cpu().numpy()
+            macros_in_net = set()
+            for own in owners:
+                own_int = int(own)
+                if own_int in movable_set:
+                    macros_in_net.add(own_int)
+            macros_list = list(macros_in_net)
+            for i_idx, gi in enumerate(macros_list):
+                li = idx_to_local[gi]
+                for j_idx in range(i_idx + 1, len(macros_list)):
+                    gj = macros_list[j_idx]
+                    lj = idx_to_local[gj]
+                    connectivity[li, lj] += 1
+                    connectivity[lj, li] += 1
+        np.fill_diagonal(connectivity, -1)
+        connectivity_knn = np.argsort(-connectivity, axis=1)[:, :n_neighbors]
+        if verbose:
+            mean_share = connectivity[connectivity > 0].mean() if (
+                connectivity > 0).any() else 0.0
+            n_isolated = int((connectivity.max(axis=1) <= 0).sum())
+            print(f"[pair_swap] graph-KNN built: mean_shared_nets="
+                  f"{mean_share:.2f} isolated_macros={n_isolated}/{n_mov}",
+                  flush=True)
 
     pos_t = torch.tensor(pos, dtype=torch.float32, device=device)
     base_gpu = _gpu_proxy(pos_t)
@@ -597,11 +637,14 @@ def pair_swap_polish_gpu(benchmark, plc, pos_full: np.ndarray,
                       f"at round {r}", flush=True)
             break
 
-        movable_pos = pos[movable_idx]
-        dists = np.linalg.norm(
-            movable_pos[:, None, :] - movable_pos[None, :, :], axis=2)
-        np.fill_diagonal(dists, np.inf)
-        knn_local = np.argsort(dists, axis=1)[:, :n_neighbors]
+        if connectivity_knn is not None:
+            knn_local = connectivity_knn
+        else:
+            movable_pos = pos[movable_idx]
+            dists = np.linalg.norm(
+                movable_pos[:, None, :] - movable_pos[None, :, :], axis=2)
+            np.fill_diagonal(dists, np.inf)
+            knn_local = np.argsort(dists, axis=1)[:, :n_neighbors]
         pairs_seen = set()
         pairs = []
         for li, i in enumerate(movable_idx):

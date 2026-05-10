@@ -351,6 +351,40 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
                   f"beta {cohesion_beta_start}->{cohesion_beta_end}",
                   flush=True)
 
+    # Fluffy cluster: penalty if cluster macros are packed tighter than the
+    # area implied by their own footprint sum. Lower bound on within-cluster
+    # variance keeps the cluster from collapsing to a point. Env:
+    #   STRAPLE_BATCH_FLUFFY_W (default 0 = off)
+    #   STRAPLE_BATCH_FLUFFY_FACTOR (default 1.5 = 50% headroom over packed)
+    fluffy_w_env = float(os.environ.get("STRAPLE_BATCH_FLUFFY_W", "0"))
+    fluffy_factor = float(os.environ.get("STRAPLE_BATCH_FLUFFY_FACTOR", "1.5"))
+    fluffy_active = fluffy_w_env > 0 and cohesion_active
+    if fluffy_active:
+        import math as _math
+        areas_per_macro = sizes_t[:, 0] * sizes_t[:, 1]
+        cluster_area_sum = torch.zeros(num_clusters, dtype=torch.float32,
+                                        device=dev)
+        cluster_area_sum.scatter_add_(0, cluster_id_for_scatter, areas_per_macro)
+        # For N members spread in a circle of radius r equivalent to
+        # bounding area A_circle, sum_of_squared_distances ≈ N·r²/2.
+        # Equivalent area: A_circle = sum_areas × factor → r² = (sum_areas×factor)/π.
+        # → target_sum_sq = N · (sum_areas × factor) / (2π).
+        fluffy_target_sum_sq = (cluster_counts * cluster_area_sum
+                                  * fluffy_factor / (2.0 * _math.pi))
+        if verbose:
+            print(f"[gradient_batch] fluffy-cluster enabled "
+                  f"w={fluffy_w_env} factor={fluffy_factor}", flush=True)
+
+    # Cong-aware cohesion: modulate cohesion strength by current congestion.
+    # When cong is high, ease the cluster pull (let macros breathe).
+    # Env: STRAPLE_BATCH_COHESION_CONG_AWARE (default 0 = off, recommended 1-5).
+    cong_aware_strength = float(os.environ.get(
+        "STRAPLE_BATCH_COHESION_CONG_AWARE", "0"))
+    cong_aware_active = cong_aware_strength > 0 and cohesion_active and cong_weight > 0
+    if cong_aware_active and verbose:
+        print(f"[gradient_batch] cong-aware cohesion ON strength="
+              f"{cong_aware_strength}", flush=True)
+
     # Build padded net tensors
     if verbose:
         print(f"[gradient_batch] building net tensors...", flush=True)
@@ -640,7 +674,9 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
         max_y = gamma_per_K_mul * torch.logsumexp(y_for_max / gamma_per_K_div, dim=2)
         min_y = -gamma_per_K_mul * torch.logsumexp(y_for_min / gamma_per_K_div, dim=2)
         wl_K = ((max_x - min_x) + (max_y - min_y)).sum(dim=1)        # [K]
-        wl_total = wl_K.sum()
+        wl_total_raw = wl_K.sum()
+        wl_w_env = float(os.environ.get("STRAPLE_BATCH_WL_W", "1.0"))
+        wl_total = wl_w_env * wl_total_raw
 
         # Congestion-aware loss: net bbox dimensions (max_x - min_x, max_y - min_y)
         # already computed above. Smooth indicator if cell is inside bbox -> sum
@@ -845,7 +881,27 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
             sq_coh = sq_coh * movable_t_coh[None, :]
             beta_coh_t = cohesion_beta_start * (
                 (cohesion_beta_end / max(cohesion_beta_start, 1e-9)) ** progress)
-            cohesion_loss_total = (beta_coh_t * sq_coh.sum() / cohesion_norm_factor)
+            if cong_aware_active:
+                # detach() = no gradient cycle through cong → cohesion modulator
+                cong_avg = cong_K.detach().mean()
+                cong_modulator = 1.0 / (1.0 + cong_aware_strength * cong_avg)
+            else:
+                cong_modulator = 1.0
+            cohesion_loss_total = (beta_coh_t * sq_coh.sum()
+                                    / cohesion_norm_factor) * cong_modulator
+            if fluffy_active:
+                cluster_sum_sq = pos.new_zeros(K, num_clusters)
+                cluster_sum_sq.scatter_add_(
+                    1,
+                    cluster_id_for_scatter.view(1, -1).expand(K, -1),
+                    sq_coh,
+                )
+                deficit = (fluffy_target_sum_sq[None, :]
+                            - cluster_sum_sq).clamp_min(0.0)
+                fluffy_loss_total = (fluffy_w_env * deficit.pow(2).sum()
+                                       / (cohesion_norm_factor *
+                                          cohesion_norm_factor))
+                cohesion_loss_total = cohesion_loss_total + fluffy_loss_total
         else:
             cohesion_loss_total = pos.new_zeros(())
 

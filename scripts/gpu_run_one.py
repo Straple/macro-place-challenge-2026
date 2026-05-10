@@ -160,6 +160,8 @@ def main():
     grad_overlap_w_growth = float(os.environ.get(
         "STRAPLE_BATCH_OVERLAP_W_GROWTH", "1.008"))
     n_grad_runs = int(os.environ.get("STRAPLE_BATCH_GRADIENT_RUNS", "1"))
+    grad_cluster_target = int(os.environ.get(
+        "STRAPLE_BATCH_CLUSTER_TARGET", "0"))
     grad_kwargs_common = dict(
         benchmark=benchmark, plc=plc, K=args.K,
         num_steps=20000,
@@ -182,6 +184,7 @@ def main():
         lr=grad_lr,
         overlap_w_max=grad_overlap_w_max,
         overlap_w_growth=grad_overlap_w_growth,
+        cluster_target=grad_cluster_target,
     )
     pos_K_list = []
     stats_list = []
@@ -302,10 +305,47 @@ def main():
     # Action #1 (H2): post-gradient breakdown on best raw (pre-legalize) seed.
     sys.path.insert(0, str(REPO_ROOT / "submissions" / "straple"))
     from breakdown_log import breakdown_log, breakdown_enabled
+    from snapshot_dump import SnapshotDumper, dump_enabled
     _bench_run_id = args.bench
     if breakdown_enabled() and best_raw_pos_full is not None:
         breakdown_log("post-gradient", best_raw_pos_full, benchmark, plc,
                       seed=best_raw_idx, run_id=_bench_run_id)
+
+    # Visualization snapshot dumper (env STRAPLE_BATCH_DUMP_SNAPSHOTS=1).
+    # Each frame captures full positions [n_total, 2] + TILOS metrics +
+    # density/congestion grids. Standalone renderer reads the .npz.
+    snapshot_dumper = None
+    if dump_enabled():
+        snapshot_dumper = SnapshotDumper(benchmark, plc, args.bench)
+        # Replay gradient subsampled snapshots tracing best_raw seed. Total
+        # gradient snapshots can be 200+ (snapshot_every=1 default in
+        # gradient_batch). Each TILOS metric eval ~2s, so unbounded would
+        # add many minutes overhead. Cap to STRAPLE_BATCH_DUMP_FRAMES_GRAD
+        # (default 30) frames distributed evenly + always include first/last.
+        snap_pos_arr = stats.get("snapshots_pos", None)
+        snap_step_arr = stats.get("snapshots_step", [])
+        max_grad_frames = int(os.environ.get(
+            "STRAPLE_BATCH_DUMP_FRAMES_GRAD", "30"))
+        if (snap_pos_arr is not None and len(snap_step_arr) > 0
+                and best_raw_idx >= 0):
+            n_snap = len(snap_step_arr)
+            if max_grad_frames > 0 and n_snap > max_grad_frames:
+                idx_keep = np.linspace(
+                    0, n_snap - 1, max_grad_frames).astype(int)
+            else:
+                idx_keep = np.arange(n_snap)
+            print(f"[gpu_run_one] dumping {len(idx_keep)} gradient snapshots "
+                  f"(of {n_snap}, seed k={best_raw_idx})...", flush=True)
+            for i in idx_keep:
+                pos_snap = snap_pos_arr[i]
+                if pos_snap.ndim == 3:
+                    pos_full_seed = pos_snap[best_raw_idx]
+                else:
+                    pos_full_seed = pos_snap
+                snapshot_dumper.add(
+                    pos_full_seed, f"gradient step={snap_step_arr[i]}")
+        if best_raw_pos_full is not None:
+            snapshot_dumper.add(best_raw_pos_full, "post-gradient (raw best)")
 
     if best_pos_full is None:
         print(f"[gpu_run_one] no valid solution, exit", flush=True)
@@ -420,6 +460,8 @@ def main():
     if breakdown_enabled() and best_pos_full is not None:
         breakdown_log("post-legalize", best_pos_full, benchmark, plc,
                       seed=best_idx, run_id=_bench_run_id)
+    if snapshot_dumper is not None and best_pos_full is not None:
+        snapshot_dumper.add(best_pos_full, "post-legalize")
 
     best_orientations = [0] * n_hard
 
@@ -698,6 +740,8 @@ def main():
         if breakdown_enabled() and best_pos_full is not None:
             breakdown_log("post-cd", best_pos_full, benchmark, plc,
                           seed=best_idx, run_id=_bench_run_id)
+        if snapshot_dumper is not None and best_pos_full is not None:
+            snapshot_dumper.add(best_pos_full, "post-cd")
 
         cluster_enable = (os.environ.get(
             "STRAPLE_BATCH_CLUSTER_POLISH", "0") == "1"
@@ -808,6 +852,8 @@ def main():
         if breakdown_enabled() and best_pos_full is not None:
             breakdown_log("post-pair-swap", best_pos_full, benchmark, plc,
                           seed=best_idx, run_id=_bench_run_id)
+        if snapshot_dumper is not None and best_pos_full is not None:
+            snapshot_dumper.add(best_pos_full, "post-pair-swap")
 
     pswap2_enable = (os.environ.get(
         "STRAPLE_BATCH_PAIR_SWAP_2ND_PASS", "0") == "1"
@@ -944,6 +990,8 @@ def main():
         if breakdown_enabled() and best_pos_full is not None:
             breakdown_log("post-triple-cycle", best_pos_full, benchmark, plc,
                           seed=best_idx, run_id=_bench_run_id)
+        if snapshot_dumper is not None and best_pos_full is not None:
+            snapshot_dumper.add(best_pos_full, "post-triple-cycle")
 
     pr_cycles = int(os.environ.get("STRAPLE_BATCH_PR_CYCLES", "0"))
     if (pr_cycles > 0 and best_pos_full is not None and cd_polish_enable
@@ -1219,6 +1267,9 @@ def main():
                 "best_orientations": [int(o) for o in best_orientations],
             }, f, indent=2)
         print(f"[gpu_run_one] stats saved to {stats_path}", flush=True)
+
+    if snapshot_dumper is not None:
+        snapshot_dumper.save()
 
     if args.no_vis:
         return
