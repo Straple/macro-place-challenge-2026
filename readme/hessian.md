@@ -787,6 +787,25 @@ STRAPLE_BATCH_PAIR_SWAP_ROUNDS=6
 
 ---
 
+#### result-action4 — L-BFGS finisher (paired N=5 marginal positive) — 2026-05-10
+- **What:** BatchedLBFGS class with m=10 history, two-loop Liu-Nocedal, Powell damping, fixed step + magnitude clip (no Wolfe LS v1). Wired into gradient_batch.py at `STRAPLE_BATCH_LBFGS_FROM_STEP=N` switching from Adam.
+- **Smoke test (K=64 60s ibm01, from_step=200):** all 4 metrics improved consistently — proxy −0.6%, WL −3.1%, dens −0.6%, cong −0.3%. First positive direction after multiple LOSE rounds (FastPlace fanout, star-net, cong-inflate, L-route bbox-center).
+- **Paired N=5 (K=64 60s, seeds 42-46, baseline trial9 vs +L-BFGS):**
+  | seed | base_min | lbfgs_min | Δmin |
+  |---|---|---|---|
+  | 42 | 0.9429 | 0.9443 | +0.0014 |
+  | 43 | 0.9510 | 0.9372 | −0.0138 |
+  | 44 | 0.9711 | 0.9568 | −0.0142 |
+  | 45 | 0.9707 | 0.9524 | −0.0182 |
+  | 46 | 0.9589 | 0.9650 | +0.0061 |
+  - mean Δmin = **−0.0077** (−0.8%), std=0.0096, t=−1.79, p≈0.07
+  - 3/5 seeds significant improvement, 2/5 noise/regression
+  - Median Δmin = −0.0138 ✓ but median Δmedian = +0.0046 ✗
+- **Verdict:** marginal positive signal in correct direction, NOT conclusive at p<0.10 with N=5. Not breakthrough. Acceptance criterion (Δmedian ≤ −0.005) NOT met on full distribution; min metric meets it.
+- **Next options to converge: (a)** tune from_step lower (100/150), alpha 1.5-2.0, add Wolfe LS; **(b)** verify on full pipeline (K=384 1200s) where signal may amplify; **(c)** stack with HPO Action #5 partial.
+
+---
+
 **Подтверждённый pattern:** CD polish даёт **-0.010 ± 0.001 absolute** improvement регardless of tweaks. Floor определяется pre-CD (gradient batch outcome). Random tweaks (more dirs, multi-seed top-N, larger sf, restart with jitter, longer gradient) — не пробивают.
 
 **Реальные пути для breakthrough:**
