@@ -82,6 +82,35 @@ Added `submissions/straple/snapshot_dump.py` (env `STRAPLE_BATCH_DUMP_SNAPSHOTS=
 
 ---
 
+## 🧪 Round of cong-targeted experiments (2026-05-10) — all LOSE/noise
+
+After L-route diagnose (`scripts/diagnose_lroute.py`) revealed long inter-cluster nets dominate TILOS cong (NOT cluster cliques per RUDY), tried four cong-targeted mechanisms on ibm01 (K=64, 60s gradient):
+
+| config | proxy | WL | dens | cong | verdict |
+|---|---|---|---|---|---|
+| baseline | **0.9219** | 0.0749 | 0.5848 | 1.1093 | reference |
+| net alpha=0.5 (fanout up-weight) | 0.9288 | 0.0745 | 0.5863 | 1.1224 | noise (cong +1.2%) |
+| star_net_thr=4 | 0.9227 | 0.0803 | 0.5914 | 1.0933 | noise (cong −1.4%, WL +7%) |
+| stack alpha=0.5 + star_thr=4 | 1.020 | +10% | +18% | +6.8% | LOSE catastrophic |
+| cong_inflate W=1.0 | overflow | — | — | — | crash |
+| cong_inflate W=0.2 | 1.543 | +127% | +35% | +76% | LOSE catastrophic (positive feedback) |
+| L-route loss W=2.0 (bbox-center proxy) | 0.9416 | +3.8% | −3.9% | +5.1% | LOSE (cong WORSE) |
+
+**Mechanistic conclusions:**
+- **Net-degree weighting (FastPlace 1/(k-1) или fanout up-weight)**: noise on bbox-HPWL because bbox already linear (not quadratic clique decomp). Effect cancels against density.
+- **Star-net for k≥4**: trades WL up for cong down but noise net. Removes bbox-extreme pin domination but doesn't shorten long routes.
+- **Cong inflate (RWCI-style)**: positive feedback loop → catastrophic dispersion. Cong source is **net topology**, not macro density; inflation fights wrong battle.
+- **L-route bbox-center proxy**: fundamentally wrong because TILOS L-route requires per-edge **driver row + sink col**, not net-bbox center. Approximation pushes macros away from net midpoints → longer nets → worse cong.
+
+**What's still on the table:**
+- True per-edge L-route loss (~6h refactor to load `edges_pkg` into gradient_batch and scatter per-edge demand chunked over E~6000 edges).
+- Adam → L-BFGS hybrid late stage (Action #4, was deprioritized after H2 cong-bound finding; now reconsider as the only remaining gradient-finisher angle).
+- Multi-objective HPO over Round 23 best (Action #5 — partial trial 5 = 0.8910 found before HPO killed; can resume).
+
+**Hard floor without paradigm change:** ~0.92 single-shot, ~0.89 best across luck.
+
+---
+
 ## 🚫 KILL LIST (не делать — low ROI / already debunked)
 
 1. **Tier 1.1 Per-macro 2×2 Newton CD** — paradigm risk (v1-v7 saddle history showed 768 escapes all in noise); density Hessian derivation 12-18h; gated by S2 which is itself inconclusive at -0.002 zone.
