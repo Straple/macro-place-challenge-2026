@@ -526,6 +526,27 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
     if verbose:
         print(f"[gradient_batch] starting {num_steps} iters...", flush=True)
     t_loop = time.time()
+
+    # L-BFGS finisher (Action #4): switch from Adam to batched L-BFGS when
+    # step >= LBFGS_FROM_STEP. m=10 history pairs, Powell damping, fixed
+    # step with magnitude clip. Each K seed runs independent L-BFGS.
+    lbfgs_from_step = int(os.environ.get(
+        "STRAPLE_BATCH_LBFGS_FROM_STEP", "0"))
+    lbfgs_alpha = float(os.environ.get(
+        "STRAPLE_BATCH_LBFGS_ALPHA", "1.0"))
+    lbfgs_clip = float(os.environ.get(
+        "STRAPLE_BATCH_LBFGS_CLIP", "0.3"))
+    lbfgs_obj = None
+    lbfgs_prev_pos = None
+    lbfgs_prev_grad = None
+    if lbfgs_from_step > 0:
+        from lbfgs_finisher import BatchedLBFGS
+        lbfgs_obj = BatchedLBFGS(K=K, n_active=n_active, m=10,
+                                  device=dev, dtype=pos.dtype)
+        if verbose:
+            print(f"[gradient_batch] L-BFGS finisher will activate at "
+                  f"step {lbfgs_from_step} (alpha={lbfgs_alpha} "
+                  f"clip={lbfgs_clip})", flush=True)
     # Snapshot pos every snapshot_every steps. We only keep best_idx slice
     # later, but we don't know it now -> save best-overlap-area heuristic:
     # actually save ALL K (memory ~OK), trim later in caller.
@@ -1137,7 +1158,33 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
         grad_clip = float(os.environ.get("STRAPLE_BATCH_GRAD_CLIP", "0"))
         if grad_clip > 0:
             torch.nn.utils.clip_grad_norm_([pos], max_norm=grad_clip)
-        optimizer.step()
+        # L-BFGS quasi-Newton step instead of Adam after warmup converges.
+        if lbfgs_obj is not None and step >= lbfgs_from_step:
+            with torch.no_grad():
+                g_now = pos.grad.detach().clone()
+                pos_now = pos.data.clone()
+                new_pos = lbfgs_obj.step(
+                    pos_now, g_now,
+                    prev_pos=lbfgs_prev_pos,
+                    prev_grad=lbfgs_prev_grad,
+                    alpha=lbfgs_alpha,
+                    max_step_norm=lbfgs_clip,
+                )
+                # Reject step if NaN/inf produced
+                if not torch.isfinite(new_pos).all():
+                    if verbose and (step + 1) % 100 == 0:
+                        print(f"[gradient_batch] L-BFGS step={step+1}: "
+                              f"non-finite output, falling back to Adam",
+                              flush=True)
+                    optimizer.step()
+                    lbfgs_prev_pos = pos.data.clone()
+                    lbfgs_prev_grad = g_now
+                else:
+                    pos.data.copy_(new_pos)
+                    lbfgs_prev_pos = pos_now
+                    lbfgs_prev_grad = g_now
+        else:
+            optimizer.step()
 
         # Clamp pos and zero gradients on fixed
         with torch.no_grad():
