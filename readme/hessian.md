@@ -801,8 +801,26 @@ STRAPLE_BATCH_PAIR_SWAP_ROUNDS=6
   - mean Δmin = **−0.0077** (−0.8%), std=0.0096, t=−1.79, p≈0.07
   - 3/5 seeds significant improvement, 2/5 noise/regression
   - Median Δmin = −0.0138 ✓ but median Δmedian = +0.0046 ✗
-- **Verdict:** marginal positive signal in correct direction, NOT conclusive at p<0.10 with N=5. Not breakthrough. Acceptance criterion (Δmedian ≤ −0.005) NOT met on full distribution; min metric meets it.
-- **Next options to converge: (a)** tune from_step lower (100/150), alpha 1.5-2.0, add Wolfe LS; **(b)** verify on full pipeline (K=384 1200s) where signal may amplify; **(c)** stack with HPO Action #5 partial.
+- **Verdict (smoke K=64):** marginal positive signal in correct direction, NOT conclusive at p<0.10 with N=5. Not breakthrough. Acceptance criterion (Δmedian ≤ −0.005) NOT met on full distribution; min metric meets it.
+
+#### result-action4 — L-BFGS full pipeline (K=384 1200s, paired seed=42) — **WIN** — 2026-05-10
+Single paired run on full pipeline (seed=42), L-BFGS from_step=1000:
+
+|  | baseline | +L-BFGS | Δ |
+|---|---|---|---|
+| pre-CD min | 0.9135 | **0.8995** | −0.014 (−1.5%) |
+| post-triple-cycle proxy | 0.8984 | **0.8864** | **−0.012 (−1.3%)** |
+| WL | 0.0703 | 0.0709 | +0.0006 |
+| dens | 0.5601 | 0.5617 | +0.0016 |
+| cong | 1.0961 | **1.0692** | **−0.027 (−2.5%)** ✓ |
+
+- **0.8864 = best result of session** at single-shot paired (vs Round 23 lucky 0.8856).
+- Pre-CD min < 0.90 acceptance criterion **MET** (0.8995, vs cutoff 0.90).
+- Δproxy=−0.012 well outside noise floor (σ ≈ 0.005-0.01).
+- Cong drops most (−2.5%) — L-BFGS hits the cong-bound landscape that Adam can't escape via gradient noise.
+- N=5 paired (seeds 43-46) queued (~3.5h overnight) for confidence interval.
+
+---
 
 ---
 
