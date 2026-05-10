@@ -527,6 +527,37 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
         print(f"[gradient_batch] starting {num_steps} iters...", flush=True)
     t_loop = time.time()
 
+    # Long-net collapse: at chosen trigger steps, identify top-K nets by bbox
+    # area and pull their pin macros (movable only) toward each net's
+    # centroid. Forces multi-cluster long wires shorter; overlap penalty
+    # in subsequent gradient steps re-spreads physically conflicting macros
+    # (loss tradeoff: temporary overlap, hopefully better cong basin).
+    # Env: STRAPLE_BATCH_LONG_NET_COLLAPSE_STEPS=500,800,1100 (default empty)
+    #      STRAPLE_BATCH_LONG_NET_TOPK=10
+    #      STRAPLE_BATCH_LONG_NET_PULL_FRAC=0.5  (0=noop, 1=collapse to point)
+    lnet_collapse_set = set()
+    _lnet_str = os.environ.get("STRAPLE_BATCH_LONG_NET_COLLAPSE_STEPS", "")
+    if _lnet_str:
+        for tok in _lnet_str.split(","):
+            try:
+                lnet_collapse_set.add(int(tok.strip()))
+            except ValueError:
+                pass
+    lnet_topk = int(os.environ.get("STRAPLE_BATCH_LONG_NET_TOPK", "10"))
+    lnet_pull = float(os.environ.get("STRAPLE_BATCH_LONG_NET_PULL_FRAC", "0.5"))
+    # Mode: "collapse" (current — pull pins toward centroid),
+    #       "teleport" (rigid translate pin-set to random position; preserves
+    #         internal topology so net's own length unchanged, but cong load
+    #         redistributes across canvas), or
+    #       "smart_teleport" (translate to globally lowest-cong region)
+    lnet_mode = os.environ.get("STRAPLE_BATCH_LONG_NET_MODE", "collapse").lower()
+    lnet_jitter_frac = float(os.environ.get(
+        "STRAPLE_BATCH_LONG_NET_JITTER_FRAC", "0.3"))
+    if lnet_collapse_set and verbose:
+        print(f"[gradient_batch] long-net-collapse triggers at steps "
+              f"{sorted(lnet_collapse_set)}, topk={lnet_topk}, "
+              f"pull_frac={lnet_pull}", flush=True)
+
     # L-BFGS finisher (Action #4): switch from Adam to batched L-BFGS when
     # step >= LBFGS_FROM_STEP. m=10 history pairs, Powell damping, fixed
     # step with magnitude clip. Each K seed runs independent L-BFGS.
@@ -695,6 +726,79 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
         max_y = gamma_per_K_mul * torch.logsumexp(y_for_max / gamma_per_K_div, dim=2)
         min_y = -gamma_per_K_mul * torch.logsumexp(y_for_min / gamma_per_K_div, dim=2)
         bbox_wl_per_net = (max_x - min_x) + (max_y - min_y)  # [K, num_nets]
+
+        # Long-net collapse / teleport trigger
+        if step in lnet_collapse_set and lnet_topk > 0:
+            with torch.no_grad():
+                bbox_w_K = (max_x - min_x).detach()  # [K, num_nets]
+                bbox_h_K = (max_y - min_y).detach()
+                avg_area = (bbox_w_K * bbox_h_K).mean(dim=0)
+                K_top = min(lnet_topk, avg_area.shape[0])
+                top_idx = torch.topk(avg_area, K_top).indices
+                n_acted = 0
+
+                # For smart_teleport mode, pre-compute current cong grid
+                # average to pick low-load destinations.
+                if lnet_mode == "smart_teleport":
+                    cong_grid_K = cell_demand.detach()  # [K, GR, GC]
+                    cong_avg = cong_grid_K.mean(dim=0)   # [GR, GC]
+                    # Find argmin (low-cong) cell index globally
+                    flat_low = cong_avg.flatten()
+                    low_idx = torch.argsort(flat_low)[:max(K_top, 5)]
+                    low_cells = []
+                    for li in low_idx.tolist():
+                        r_i, c_i = divmod(li, grid_cols)
+                        low_cells.append(((c_i + 0.5) * cell_w,
+                                            (r_i + 0.5) * cell_h))
+
+                rng_torch = torch.Generator(device=dev)
+                rng_torch.manual_seed(int(step) * 7919)
+                for ti, net_idx in enumerate(top_idx.tolist()):
+                    valid_pins = mask_p[net_idx].nonzero(as_tuple=True)[0]
+                    if len(valid_pins) < 2:
+                        continue
+                    pin_macros = macro_idx_p[net_idx][valid_pins]
+                    active_mask = pin_macros < n_active
+                    pin_macros_active = pin_macros[active_mask]
+                    if pin_macros_active.numel() < 2:
+                        continue
+                    pin_pos = pos.data[:, pin_macros_active, :]   # [K, n, 2]
+                    mov = movable[pin_macros_active].float().view(1, -1, 1)
+
+                    if lnet_mode == "collapse":
+                        centroid = pin_pos.mean(dim=1, keepdim=True)
+                        new_pin_pos = ((1.0 - lnet_pull) * pin_pos
+                                        + lnet_pull * centroid)
+                    elif lnet_mode == "teleport":
+                        # Random translation per K seed within ±jitter_frac canvas
+                        delta = (torch.rand(K, 1, 2, device=dev,
+                                              generator=rng_torch) - 0.5) * 2.0
+                        delta[..., 0] *= lnet_jitter_frac * canvas_w
+                        delta[..., 1] *= lnet_jitter_frac * canvas_h
+                        new_pin_pos = pin_pos + delta
+                    elif lnet_mode == "smart_teleport":
+                        # Translate to a low-cong cell (cycle through top low cells)
+                        target = low_cells[ti % len(low_cells)]
+                        old_centroid = pin_pos.mean(dim=1, keepdim=True)
+                        target_t = torch.tensor(
+                            [[target[0], target[1]]],
+                            device=dev, dtype=pos.dtype).view(1, 1, 2)
+                        delta = target_t - old_centroid  # [K, 1, 2]
+                        new_pin_pos = pin_pos + delta
+                    else:
+                        new_pin_pos = pin_pos
+
+                    # Clamp to canvas
+                    new_pin_pos = torch.stack([
+                        new_pin_pos[..., 0].clamp(0.0, canvas_w),
+                        new_pin_pos[..., 1].clamp(0.0, canvas_h),
+                    ], dim=-1)
+                    pos.data[:, pin_macros_active, :] = (
+                        new_pin_pos * mov + pin_pos * (1.0 - mov))
+                    n_acted += 1
+                if verbose:
+                    print(f"[gradient_batch] long-net-{lnet_mode} @step={step}: "
+                          f"acted {n_acted} nets", flush=True)
 
         # FastPlace-style net handling for L-route congestion control.
         # Long multi-pin nets dominate TILOS L-route cong (driver row + sink
