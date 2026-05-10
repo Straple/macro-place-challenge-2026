@@ -673,7 +673,52 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
         min_x = -gamma_per_K_mul * torch.logsumexp(x_for_min / gamma_per_K_div, dim=2)
         max_y = gamma_per_K_mul * torch.logsumexp(y_for_max / gamma_per_K_div, dim=2)
         min_y = -gamma_per_K_mul * torch.logsumexp(y_for_min / gamma_per_K_div, dim=2)
-        wl_K = ((max_x - min_x) + (max_y - min_y)).sum(dim=1)        # [K]
+        bbox_wl_per_net = (max_x - min_x) + (max_y - min_y)  # [K, num_nets]
+
+        # FastPlace-style net handling for L-route congestion control.
+        # Long multi-pin nets dominate TILOS L-route cong (driver row + sink
+        # col attribution). bbox-HPWL underestimates their actual routing
+        # length. Two knobs:
+        #   STRAPLE_BATCH_NET_WEIGHT_ALPHA — exponent on pin count.
+        #     0 (default): uniform per-net weight = 1.0 (current baseline).
+        #    >0: weight = n_pins^alpha → upweights high-fanout nets so
+        #        gradient pulls them tighter (less L-route demand).
+        #    <0: 1/(n_pins-1) FastPlace-classical (less pull on cliques).
+        #   STRAPLE_BATCH_STAR_NET_THRESHOLD — for nets with n_pins >= K,
+        #     replace bbox-HPWL with star-net WL = sum_i |pin_i - mean|
+        #     (each pin pulled toward virtual hub at mean of pins). Removes
+        #     bbox-extremes domination, gives uniform pull across all pins.
+        #     0 (default off), recommend 4 to enable.
+        net_weight_alpha = float(os.environ.get(
+            "STRAPLE_BATCH_NET_WEIGHT_ALPHA", "0"))
+        star_threshold = int(os.environ.get(
+            "STRAPLE_BATCH_STAR_NET_THRESHOLD", "0"))
+        n_pins_per_net = mask_p.float().sum(dim=1)  # [num_nets]
+        n_pins_safe = n_pins_per_net.clamp_min(2.0)
+
+        if star_threshold >= 2:
+            mask_f = mask_p.float()  # [num_nets, max_pins]
+            x_masked = x * mask_f[None, :, :]
+            y_masked = y * mask_f[None, :, :]
+            n_pins_K = n_pins_safe[None, :]  # [1, num_nets]
+            star_x = x_masked.sum(dim=2) / n_pins_K  # [K, num_nets]
+            star_y = y_masked.sum(dim=2) / n_pins_K
+            dx_abs = (x - star_x[:, :, None]).abs() * mask_f[None, :, :]
+            dy_abs = (y - star_y[:, :, None]).abs() * mask_f[None, :, :]
+            star_wl_per_net = (dx_abs + dy_abs).sum(dim=2)  # [K, num_nets]
+            is_star = (n_pins_per_net >= float(star_threshold))[None, :]
+            wl_per_net = torch.where(is_star, star_wl_per_net, bbox_wl_per_net)
+        else:
+            wl_per_net = bbox_wl_per_net
+
+        if net_weight_alpha != 0.0:
+            if net_weight_alpha > 0:
+                net_weight_t = n_pins_safe ** net_weight_alpha
+            else:
+                net_weight_t = 1.0 / (n_pins_safe - 1.0).clamp_min(1.0)
+            wl_K = (wl_per_net * net_weight_t[None, :]).sum(dim=1)
+        else:
+            wl_K = wl_per_net.sum(dim=1)
         wl_total_raw = wl_K.sum()
         wl_w_env = float(os.environ.get("STRAPLE_BATCH_WL_W", "1.0"))
         wl_total = wl_w_env * wl_total_raw
@@ -734,14 +779,80 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
                         * ov_x_b[:, :, None, :]).sum(dim=1)
                 cell_demand = cell_demand + (blockage_weight
                                               * blockage_grid / cell_capacity)
+            # L-route cong (TILOS attribution): each net deposits H demand on
+            # its driver row, V demand on its sink col. We don't have driver
+            # info per-net here, approximate via bbox-center: H demand spreads
+            # across cols (in_x extent) but is row-concentrated by a Gaussian
+            # peak at the net's vertical center. Symmetric for V. Top-k peaks
+            # of max(V, H) form the route-diversity penalty — direct surrogate
+            # for TILOS routing congestion. Long nets touch many cells along
+            # their main row/col → contribute proportionally to L-route demand.
+            # Env: STRAPLE_BATCH_LROUTE_CONG_W (default 0 = off, recommended 1-3).
+            lroute_w = float(os.environ.get(
+                "STRAPLE_BATCH_LROUTE_CONG_W", "0"))
+            if lroute_w > 0:
+                row_arange_f = (torch.arange(grid_rows, device=dev,
+                                              dtype=pos.dtype) + 0.5)
+                col_arange_f = (torch.arange(grid_cols, device=dev,
+                                              dtype=pos.dtype) + 0.5)
+                y_center = (y_hi + y_lo) * 0.5            # [K, num_nets]
+                x_center = (x_hi + x_lo) * 0.5
+                row_c = y_center / cell_h                  # [K, num_nets]
+                col_c = x_center / cell_w
+                lroute_sigma_r = max(0.5, float(os.environ.get(
+                    "STRAPLE_BATCH_LROUTE_SIGMA", "0.6")))
+                h_row_peak = torch.exp(
+                    -((row_arange_f[None, None, :] - row_c[:, :, None])
+                      ** 2) / (2 * lroute_sigma_r * lroute_sigma_r))
+                v_col_peak = torch.exp(
+                    -((col_arange_f[None, None, :] - col_c[:, :, None])
+                      ** 2) / (2 * lroute_sigma_r * lroute_sigma_r))
+                h_demand_lr = torch.einsum("knr,knc->krc",
+                                             h_row_peak, in_x)
+                v_demand_lr = torch.einsum("knc,knr->krc",
+                                             v_col_peak, in_y)
+                lr_grid = torch.maximum(h_demand_lr, v_demand_lr)
+                lr_flat = lr_grid.reshape(K, -1)
+                top_k_lr = max(1, int(lr_flat.shape[-1] * cong_top_pct))
+                lr_top_vals, _ = torch.topk(lr_flat, top_k_lr, dim=-1)
+                lroute_cong_K = lr_top_vals.mean(dim=-1)
+                lroute_cong_total = lroute_w * lroute_cong_K.sum()
+            else:
+                lroute_cong_K = pos.new_zeros(K)
+                lroute_cong_total = pos.new_zeros(())
+
             flat = cell_demand.reshape(K, -1)
             top_k = max(1, int(flat.shape[-1] * cong_top_pct))
             top_vals, _ = torch.topk(flat, top_k, dim=-1)
             cong_K = top_vals.mean(dim=-1)
-            cong_total = cong_K.sum()
+            cong_total = cong_K.sum() + lroute_cong_total
+            if lroute_w > 0:
+                cong_K = cong_K + lroute_w * lroute_cong_K
         else:
             cong_total = pos.new_zeros(())
             cong_K = pos.new_zeros(K)
+
+        # Cong-aware inflate (RWCI-style): macros sitting in hot cong cells
+        # get an effective area boost so the density penalty pushes them out.
+        # No gradient through the inflate factor (detached).
+        # Env: STRAPLE_BATCH_CONG_INFLATE_W (default 0 = off, recommended 0.5-2)
+        #      STRAPLE_BATCH_CONG_INFLATE_THRESHOLD (default 0 = inflate by raw cong)
+        cong_inflate_w = float(os.environ.get(
+            "STRAPLE_BATCH_CONG_INFLATE_W", "0"))
+        cong_inflate_thr = float(os.environ.get(
+            "STRAPLE_BATCH_CONG_INFLATE_THRESHOLD", "0"))
+        inflate_factor = None
+        if cong_inflate_w > 0 and cong_weight > 0:
+            with torch.no_grad():
+                cx_idx = (pos[..., 0] / cell_w).floor().long().clamp(
+                    0, grid_cols - 1)
+                cy_idx = (pos[..., 1] / cell_h).floor().long().clamp(
+                    0, grid_rows - 1)
+                flat_idx = cy_idx * grid_cols + cx_idx
+                cell_flat = cell_demand.detach().reshape(K, -1)
+                sample_cong = cell_flat.gather(1, flat_idx)
+                excess_cong = (sample_cong - cong_inflate_thr).clamp_min(0.0)
+                inflate_factor = 1.0 + cong_inflate_w * excess_cong  # [K, n_active]
 
         # Density (batched)
         # bell_x [K, n, ncols], bell_y [K, n, nrows]
@@ -752,9 +863,15 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
         norm_x = bell_x / bell_x.sum(dim=2, keepdim=True).clamp_min(1e-12)
         norm_y = bell_y / bell_y.sum(dim=2, keepdim=True).clamp_min(1e-12)
         # cell_density [K, nrows, ncols] = sum macro_areas * norm_y * norm_x over n
-        cell_density = (macro_areas[None, :, None, None]
-                        * norm_y[:, :, :, None]
-                        * norm_x[:, :, None, :]).sum(dim=1)
+        if inflate_factor is not None:
+            area_K = (macro_areas[None, :] * inflate_factor)
+            cell_density = (area_K[:, :, None, None]
+                            * norm_y[:, :, :, None]
+                            * norm_x[:, :, None, :]).sum(dim=1)
+        else:
+            cell_density = (macro_areas[None, :, None, None]
+                            * norm_y[:, :, :, None]
+                            * norm_x[:, :, None, :]).sum(dim=1)
         # DRP-style normalized overflow proxy (per-K). Used for adaptive λ schedule.
         # overflow = (sum over cells of max(0, density_frac - target_util)) * cell_area
         # divided by total macro area. Cheap, no autograd path.
@@ -789,10 +906,17 @@ def gradient_batch(benchmark, plc, K: int = 64, num_steps: int = 400,
                 ep_nx_c = ep_bx_c / ep_bx_c.sum(dim=2, keepdim=True).clamp_min(1e-12)
                 ep_ny_c = ep_by_c / ep_by_c.sum(dim=2, keepdim=True).clamp_min(1e-12)
                 # contribution [K, ep_n, ep_n] = Σ_i area * ep_ny[K,c,r] * ep_nx[K,c,c2]
-                cell_density_ep = cell_density_ep + (
-                    area_c[None, :, None, None]
-                    * ep_ny_c[:, :, :, None]
-                    * ep_nx_c[:, :, None, :]).sum(dim=1)
+                if inflate_factor is not None:
+                    area_c_K = area_c[None, :] * inflate_factor[:, i0:i1]
+                    cell_density_ep = cell_density_ep + (
+                        area_c_K[:, :, None, None]
+                        * ep_ny_c[:, :, :, None]
+                        * ep_nx_c[:, :, None, :]).sum(dim=1)
+                else:
+                    cell_density_ep = cell_density_ep + (
+                        area_c[None, :, None, None]
+                        * ep_ny_c[:, :, :, None]
+                        * ep_nx_c[:, :, None, :]).sum(dim=1)
             rho = cell_density_ep / ep_cell_capacity - target_density_eplace
             rho_fft = torch.fft.fft2(rho, dim=(-2, -1))
             phi_fft = rho_fft * inv_k_sq[None, ...]
