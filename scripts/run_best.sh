@@ -66,19 +66,21 @@ export STRAPLE_BATCH_TRIPLE_CYCLE_ROUNDS=4
 export STRAPLE_BATCH_WALL_TL=1700
 export STRAPLE_BATCH_WALL_RESERVE=30
 
-# Diagnostics.
-export STRAPLE_BATCH_BREAKDOWN_LOG=1
-export STRAPLE_BATCH_DUMP_SNAPSHOTS=1
-export STRAPLE_BATCH_DUMP_DIR=results/snapshots
-export STRAPLE_BATCH_DUMP_FRAMES_GRAD=15
+# Diagnostics. Caller may override (e.g. STRAPLE_BATCH_DUMP_SNAPSHOTS=0
+# bash run_best.sh) — only set defaults if unset.
+export STRAPLE_BATCH_BREAKDOWN_LOG="${STRAPLE_BATCH_BREAKDOWN_LOG:-1}"
+export STRAPLE_BATCH_DUMP_SNAPSHOTS="${STRAPLE_BATCH_DUMP_SNAPSHOTS:-1}"
+export STRAPLE_BATCH_DUMP_DIR="${STRAPLE_BATCH_DUMP_DIR:-results/snapshots}"
+export STRAPLE_BATCH_DUMP_FRAMES_GRAD="${STRAPLE_BATCH_DUMP_FRAMES_GRAD:-15}"
 
 # Best seed found in session.
 export STRAPLE_BATCH_RUN_SEED_BASE=43
 
 BENCH="${1:-ibm01}"
+K="${2:-384}"
 
 uv run python scripts/gpu_run_one.py \
     --bench "$BENCH" \
-    --K 384 \
+    --K "$K" \
     --time-budget 1200 \
     --no-vis

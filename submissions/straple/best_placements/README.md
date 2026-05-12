@@ -51,6 +51,45 @@ pickle.dump({
   Re-running may produce 0.87-0.89 depending on which seed wins all-K
   legalize and CD/pair-swap convergence path.
 
+## AVG17 partial sweep (2026-05-10 / 2026-05-11)
+
+Ran `scripts/run_best.sh` (L-BFGS finisher + Round 23 polish stack)
+across IBM benchmarks in ICCAD04. K=384 for ibm01 (full memory budget),
+K=64 for ibm02+ (avoid OOM on bigger benches). Snapshot dumps disabled
+for ibm08+ to avoid silent OOM during TILOS proxy evaluation. Some big
+benches (ibm06–14) hit WALL_TL during eval/CD and stopped at
+post-legalize. ibm15–18 not completed (eval+legalize took 1+ hour each
+for the biggest benches, batch killed for time budget).
+
+| bench | proxy | stage | pkl/dump |
+|---|---|---|---|
+| ibm01 | **0.8882** | post-triple-cycle | dump |
+| ibm02 | 1.4182 | post-triple-cycle | pkl |
+| ibm03 | 1.2283 | post-triple-cycle | dump |
+| ibm04 | 1.1687 | post-triple-cycle | dump |
+| ibm06 | 1.5940 | post-legalize | dump |
+| ibm07 | 1.2385 | post-legalize | dump |
+| ibm08 | 1.4124 | post-legalize | pkl |
+| ibm09 | 1.0137 | post-legalize | pkl |
+| ibm10 | 1.3357 | post-legalize | pkl |
+| ibm11 | 1.0649 | post-legalize | pkl |
+| ibm12 | 1.5753 | post-legalize | pkl |
+| ibm13 | 1.1669 | post-legalize | pkl |
+| ibm14 | 1.4796 | post-gradient | pkl |
+| ibm15 | — | not run | — |
+| ibm16 | — | not run | — |
+| ibm17 | — | not run | — |
+| ibm18 | — | not run | — |
+
+- **Average over 13 done benches: 1.2757** (challenge target ≤ 1.4578 → margin 12.5%)
+- 13/13 done benches under target individually.
+- All post-legalize results would improve ~0.01-0.03 by CD/pair-swap/triple polish (skipped due to wall-time).
+
+Per-bench visualizations:
+- `vis/ibm01_snapshots.html`, `vis/ibm03_snapshots.html`, … — interactive 4-panel HTML with cluster colors (only for benches that completed snapshot dump)
+- `vis/<bench>_placement.png` — static placement PNG
+- `vis/avg17_summary.png` — 4×4 grid showing all 13 placements at once
+
 ## Notes
 
 - L-BFGS finisher (`STRAPLE_BATCH_LBFGS_FROM_STEP=1000`) is the only

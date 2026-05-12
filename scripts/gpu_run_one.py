@@ -791,7 +791,8 @@ def main():
                       flush=True)
 
     pswap_enable = (os.environ.get("STRAPLE_BATCH_PAIR_SWAP", "0") == "1"
-                     and cd_gpu_enable and best_pos_full is not None)
+                     and cd_gpu_enable and best_pos_full is not None
+                     and "proxy_pkgs_cd" in dir())
     if pswap_enable:
         pswap_neighbors = int(os.environ.get(
             "STRAPLE_BATCH_PAIR_SWAP_NEIGHBORS", "10"))
@@ -903,7 +904,8 @@ def main():
 
     cd_postswap_enable = (os.environ.get(
         "STRAPLE_BATCH_CD_POSTSWAP", "0") == "1"
-        and cd_gpu_enable and best_pos_full is not None)
+        and cd_gpu_enable and best_pos_full is not None
+        and "proxy_pkgs_cd" in dir())
     if cd_postswap_enable:
         ps_cd_rounds = int(os.environ.get(
             "STRAPLE_BATCH_CD_POSTSWAP_ROUNDS", "4"))
@@ -947,7 +949,8 @@ def main():
                   flush=True)
 
     tcyc_enable = (os.environ.get("STRAPLE_BATCH_TRIPLE_CYCLE", "0") == "1"
-                    and cd_gpu_enable and best_pos_full is not None)
+                    and cd_gpu_enable and best_pos_full is not None
+                    and "proxy_pkgs_cd" in dir())
     if tcyc_enable:
         tcyc_neighbors = int(os.environ.get(
             "STRAPLE_BATCH_TRIPLE_CYCLE_NEIGHBORS", "6"))
