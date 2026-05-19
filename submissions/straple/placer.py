@@ -479,6 +479,30 @@ class StraplePlacer:
         os.environ.setdefault("STRAPLE_BATCH_DIVERSITY", "1")
         os.environ.setdefault("STRAPLE_BATCH_OVERLAP_FORM", "rect_quad")
         os.environ.setdefault("STRAPLE_BATCH_OVERLAP_SOFT", "1")
+        # Winning config of 2026-05-09/10/11 exploration: schedule tuning +
+        # L-BFGS finisher + CD/pair-swap/triple-cycle polish. See
+        # submissions/straple/best_placements/README.md.
+        os.environ.setdefault("STRAPLE_BATCH_OVERFLOW_LAMBDA", "1")
+        os.environ.setdefault("STRAPLE_BATCH_OVERFLOW_TARGET", "0.13")
+        os.environ.setdefault("STRAPLE_BATCH_OVERFLOW_EXP", "0.7")
+        os.environ.setdefault("STRAPLE_BATCH_OVERFLOW_COEF_HI", "1.5")
+        os.environ.setdefault("STRAPLE_BATCH_BLOCKAGE_W", "50")
+        os.environ.setdefault("STRAPLE_BATCH_OVERLAP_W_MAX", "50000")
+        os.environ.setdefault("STRAPLE_BATCH_OVERLAP_W_GROWTH", "1.004")
+        os.environ.setdefault("STRAPLE_BATCH_LBFGS_FROM_STEP", "1000")
+        os.environ.setdefault("STRAPLE_BATCH_LBFGS_ALPHA", "1.0")
+        os.environ.setdefault("STRAPLE_BATCH_LBFGS_CLIP", "0.3")
+        os.environ.setdefault("STRAPLE_BATCH_CD_POLISH", "1")
+        os.environ.setdefault("STRAPLE_BATCH_CD_GPU_FILTER", "1")
+        os.environ.setdefault("STRAPLE_BATCH_CD_GPU_APPROX", "1")
+        os.environ.setdefault("STRAPLE_BATCH_CD_DIRS", "8")
+        os.environ.setdefault("STRAPLE_BATCH_CD_ROUNDS", "8")
+        os.environ.setdefault("STRAPLE_BATCH_PAIR_SWAP", "1")
+        os.environ.setdefault("STRAPLE_BATCH_PAIR_SWAP_NEIGHBORS", "12")
+        os.environ.setdefault("STRAPLE_BATCH_PAIR_SWAP_ROUNDS", "8")
+        os.environ.setdefault("STRAPLE_BATCH_TRIPLE_CYCLE", "1")
+        os.environ.setdefault("STRAPLE_BATCH_TRIPLE_CYCLE_NEIGHBORS", "6")
+        os.environ.setdefault("STRAPLE_BATCH_TRIPLE_CYCLE_ROUNDS", "4")
         # Plateau-detect + per-seed crossover OFF by default for submission —
         # plain gradient with multi-start diversity has been more reliable.
         # Re-enable with STRAPLE_BATCH_PLATEAU_OPS=1.
@@ -892,7 +916,125 @@ class StraplePlacer:
             except Exception as e:
                 self._log(f"[{bench_label}] plot skipped: {e}")
 
-        return pos_full_K[best_slot].cpu()
+        # ---- Polish stack: CD + pair-swap + triple-cycle ----
+        # Winning addition from 2026-05-09/10/11 exploration. Operates on
+        # the legalized best seed. Each stage is env-gated; the polish is
+        # incremental and respects STRAPLE_BATCH_WALL_TL.
+        best_pos_full = pos_full_K[best_slot].cpu().numpy()
+        proxy_pkgs_cd = {
+            "edges_pkg": edges_pkg,
+            "smooth_matrices": smooth_matrices,
+            "routing_consts": routing_consts,
+            "wl_pkg": wl_pkg,
+        }
+        try:
+            best_pos_full = self._run_polish_stack(
+                benchmark, plc, best_pos_full, bench_label,
+                t_place_start=t_place_start, proxy_pkgs_cd=proxy_pkgs_cd)
+        except Exception as e:
+            import traceback
+            self._log(f"[{bench_label}] polish stack failed: {e}\n"
+                      f"{traceback.format_exc()}")
+            self._log(f"[{bench_label}] returning unpolished placement")
+        return torch.tensor(best_pos_full, dtype=torch.float32)
+
+    def _run_polish_stack(self, benchmark, plc, best_pos_full, bench_label,
+                           t_place_start: float, proxy_pkgs_cd):
+        """Apply CD + pair-swap + triple-cycle polish to best legalized seed."""
+        import time as _time
+        import numpy as _np
+
+        _STRAPLE_DIR = str(Path(__file__).resolve().parent)
+        if _STRAPLE_DIR not in sys.path:
+            sys.path.insert(0, _STRAPLE_DIR)
+
+        wall_tl = float(os.environ.get("STRAPLE_BATCH_WALL_TL", "3300"))
+        wall_reserve = float(os.environ.get("STRAPLE_BATCH_WALL_RESERVE", "60"))
+
+        def _remaining():
+            return wall_tl - (_time.time() - t_place_start) - wall_reserve
+
+        cd_polish_enable = os.environ.get("STRAPLE_BATCH_CD_POLISH", "0") == "1"
+        cd_gpu_enable = os.environ.get("STRAPLE_BATCH_CD_GPU_FILTER", "0") == "1"
+        pswap_enable = os.environ.get("STRAPLE_BATCH_PAIR_SWAP", "0") == "1" and cd_gpu_enable
+        tcyc_enable = os.environ.get("STRAPLE_BATCH_TRIPLE_CYCLE", "0") == "1" and cd_gpu_enable
+
+        if not (cd_polish_enable or pswap_enable or tcyc_enable):
+            return best_pos_full
+        if _remaining() <= 0:
+            self._log(f"[{bench_label}] polish: wall_remaining<=0 — skipping all")
+            return best_pos_full
+
+        from cd_polish import (cd_polish_gpu, pair_swap_polish_gpu,
+                                triple_cycle_polish_gpu)
+        cd_proxy_chunk_n = int(os.environ.get(
+            "STRAPLE_BATCH_CD_PROXY_CHUNK_N", "32"))
+
+        if cd_polish_enable and _remaining() > 0:
+            t0 = _time.time()
+            cd_rounds = int(os.environ.get("STRAPLE_BATCH_CD_ROUNDS", "8"))
+            cd_dirs = int(os.environ.get("STRAPLE_BATCH_CD_DIRS", "8"))
+            cd_topk = int(os.environ.get("STRAPLE_BATCH_CD_TOPK_VERIFY", "3"))
+            cd_macro_chunk = int(os.environ.get("STRAPLE_BATCH_CD_MACRO_CHUNK", "64"))
+            sf_str = os.environ.get(
+                "STRAPLE_BATCH_CD_SF",
+                "0.5,0.25,0.125,0.0625,0.03125,0.015625,0.0078125,0.00390625")
+            cd_sf = tuple(float(x) for x in sf_str.split(",") if x.strip())
+            cd_budget = max(1.0, _remaining())
+            self._log(f"[{bench_label}] CD polish: rounds={cd_rounds} "
+                      f"dirs={cd_dirs} budget={cd_budget:.0f}s")
+            new_pos, new_proxy = cd_polish_gpu(
+                benchmark, plc, best_pos_full,
+                proxy_pkgs=proxy_pkgs_cd,
+                rounds=cd_rounds, step_factors=cd_sf,
+                n_directions=cd_dirs, topk_verify=cd_topk,
+                macro_chunk=cd_macro_chunk,
+                time_budget=cd_budget,
+                proxy_chunk_n=cd_proxy_chunk_n,
+                approx_verify=True, approx_threshold=1e-5,
+                approx_refresh_per_accept=False,
+                verbose=False)
+            self._log(f"[{bench_label}] CD polish: proxy={new_proxy:.4f} "
+                      f"({_time.time()-t0:.1f}s)")
+            best_pos_full = new_pos.astype(_np.float32)
+
+        if pswap_enable and _remaining() > 0:
+            t0 = _time.time()
+            ps_n = int(os.environ.get("STRAPLE_BATCH_PAIR_SWAP_NEIGHBORS", "12"))
+            ps_r = int(os.environ.get("STRAPLE_BATCH_PAIR_SWAP_ROUNDS", "8"))
+            ps_chunk = int(os.environ.get("STRAPLE_BATCH_PAIR_SWAP_CHUNK", "256"))
+            ps_budget = max(1.0, _remaining())
+            self._log(f"[{bench_label}] PAIR_SWAP: n={ps_n} rounds={ps_r} "
+                      f"budget={ps_budget:.0f}s")
+            new_pos, new_proxy = pair_swap_polish_gpu(
+                benchmark, plc, best_pos_full,
+                proxy_pkgs=proxy_pkgs_cd,
+                n_neighbors=ps_n, n_rounds=ps_r,
+                verbose=False, time_budget=ps_budget,
+                proxy_chunk_n=cd_proxy_chunk_n, chunk_pairs=ps_chunk)
+            self._log(f"[{bench_label}] PAIR_SWAP: proxy={new_proxy:.4f} "
+                      f"({_time.time()-t0:.1f}s)")
+            best_pos_full = new_pos.astype(_np.float32)
+
+        if tcyc_enable and _remaining() > 0:
+            t0 = _time.time()
+            tc_n = int(os.environ.get("STRAPLE_BATCH_TRIPLE_CYCLE_NEIGHBORS", "6"))
+            tc_r = int(os.environ.get("STRAPLE_BATCH_TRIPLE_CYCLE_ROUNDS", "4"))
+            tc_chunk = int(os.environ.get("STRAPLE_BATCH_TRIPLE_CYCLE_CHUNK", "256"))
+            tc_budget = max(1.0, _remaining())
+            self._log(f"[{bench_label}] TRIPLE_CYCLE: n={tc_n} rounds={tc_r} "
+                      f"budget={tc_budget:.0f}s")
+            new_pos, new_proxy = triple_cycle_polish_gpu(
+                benchmark, plc, best_pos_full,
+                proxy_pkgs=proxy_pkgs_cd,
+                n_neighbors=tc_n, n_rounds=tc_r,
+                verbose=False, time_budget=tc_budget,
+                proxy_chunk_n=cd_proxy_chunk_n, chunk_triples=tc_chunk)
+            self._log(f"[{bench_label}] TRIPLE_CYCLE: proxy={new_proxy:.4f} "
+                      f"({_time.time()-t0:.1f}s)")
+            best_pos_full = new_pos.astype(_np.float32)
+
+        return best_pos_full
 
     def _save_evolution_plot(self, benchmark, bench_label, stats,
                               final_proxy_K, final_overlap_K,
