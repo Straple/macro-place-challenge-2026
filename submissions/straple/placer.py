@@ -344,6 +344,45 @@ class StraplePlacer:
                                 build_routing_consts, build_wl_pkg_full)
         from macro_place.objective import compute_proxy_cost
 
+        # Env defaults must be applied BEFORE K probe (which reads
+        # STRAPLE_BATCH_K and STRAPLE_BATCH_NO_PROBE).
+        os.environ.setdefault("STRAPLE_BATCH_EPLACE", "1")
+        os.environ.setdefault("STRAPLE_BATCH_EPLACE_GRID", "128")
+        os.environ.setdefault("STRAPLE_BATCH_CONG_W", "10")
+        os.environ.setdefault("STRAPLE_BATCH_COHESION_START", "5")
+        os.environ.setdefault("STRAPLE_BATCH_COHESION_END", "0.001")
+        os.environ.setdefault("STRAPLE_BATCH_DIVERSITY", "1")
+        os.environ.setdefault("STRAPLE_BATCH_OVERLAP_FORM", "rect_quad")
+        # OVERLAP_SOFT=1 extends pair-table to soft macros (1140 pairs vs 246
+        # hard-only) — 4.6× memory. Without it the trial9 config matches the
+        # measured gpu_run_one K=384 ~10 GB peak. Keep OFF for VRAM safety.
+        os.environ.setdefault("STRAPLE_BATCH_OVERLAP_SOFT", "0")
+        os.environ.setdefault("STRAPLE_BATCH_OVERFLOW_LAMBDA", "1")
+        os.environ.setdefault("STRAPLE_BATCH_OVERFLOW_TARGET", "0.13")
+        os.environ.setdefault("STRAPLE_BATCH_OVERFLOW_EXP", "0.7")
+        os.environ.setdefault("STRAPLE_BATCH_OVERFLOW_COEF_HI", "1.5")
+        os.environ.setdefault("STRAPLE_BATCH_BLOCKAGE_W", "50")
+        os.environ.setdefault("STRAPLE_BATCH_OVERLAP_W_MAX", "50000")
+        os.environ.setdefault("STRAPLE_BATCH_OVERLAP_W_GROWTH", "1.004")
+        os.environ.setdefault("STRAPLE_BATCH_LBFGS_FROM_STEP", "1000")
+        os.environ.setdefault("STRAPLE_BATCH_LBFGS_ALPHA", "1.0")
+        os.environ.setdefault("STRAPLE_BATCH_LBFGS_CLIP", "0.3")
+        os.environ.setdefault("STRAPLE_BATCH_CD_POLISH", "1")
+        os.environ.setdefault("STRAPLE_BATCH_CD_GPU_FILTER", "1")
+        os.environ.setdefault("STRAPLE_BATCH_CD_GPU_APPROX", "1")
+        os.environ.setdefault("STRAPLE_BATCH_CD_DIRS", "8")
+        os.environ.setdefault("STRAPLE_BATCH_CD_ROUNDS", "8")
+        os.environ.setdefault("STRAPLE_BATCH_PAIR_SWAP", "1")
+        os.environ.setdefault("STRAPLE_BATCH_PAIR_SWAP_NEIGHBORS", "12")
+        os.environ.setdefault("STRAPLE_BATCH_PAIR_SWAP_ROUNDS", "8")
+        os.environ.setdefault("STRAPLE_BATCH_TRIPLE_CYCLE", "1")
+        os.environ.setdefault("STRAPLE_BATCH_TRIPLE_CYCLE_NEIGHBORS", "6")
+        os.environ.setdefault("STRAPLE_BATCH_TRIPLE_CYCLE_ROUNDS", "4")
+        # K=384 matches gpu_run_one's measured 10.2 GB peak on T4 (16 GB) —
+        # safe with OVERLAP_SOFT=0 above.
+        os.environ.setdefault("STRAPLE_BATCH_K", "384")
+        os.environ.setdefault("STRAPLE_BATCH_NO_PROBE", "1")
+
         n_hard = benchmark.num_hard_macros
         n_soft = benchmark.num_soft_macros
         n_total = benchmark.num_macros
@@ -425,9 +464,10 @@ class StraplePlacer:
         k_env = os.environ.get("STRAPLE_BATCH_K", "")
         if k_env:
             K_initial = int(k_env)
+            no_probe = os.environ.get("STRAPLE_BATCH_NO_PROBE", "0") == "1"
+            do_probe = bool(cuda_avail) and (free_gb > 0) and not no_probe
             self._log(f"[{bench_label}] K={K_initial} (env override; "
-                      f"probe will validate but not grow)")
-            do_probe = bool(cuda_avail) and (free_gb > 0)
+                      f"probe={'OFF' if no_probe else 'validate-only'})")
             env_override = True
         else:
             env_override = False
@@ -476,44 +516,7 @@ class StraplePlacer:
                   f"(hard={n_hard} soft={n_soft})")
 
         # ---- Gradient batch: K parallel seeds with GPU proxy fitness ----
-        # Default knobs tuned on ibm01 — match best-of submission run.
-        os.environ.setdefault("STRAPLE_BATCH_EPLACE", "1")
-        os.environ.setdefault("STRAPLE_BATCH_EPLACE_GRID", "128")
-        os.environ.setdefault("STRAPLE_BATCH_CONG_W", "10")
-        os.environ.setdefault("STRAPLE_BATCH_COHESION_START", "5")
-        os.environ.setdefault("STRAPLE_BATCH_COHESION_END", "0.001")
-        os.environ.setdefault("STRAPLE_BATCH_DIVERSITY", "1")
-        os.environ.setdefault("STRAPLE_BATCH_OVERLAP_FORM", "rect_quad")
-        os.environ.setdefault("STRAPLE_BATCH_OVERLAP_SOFT", "1")
-        # Winning config of 2026-05-09/10/11 exploration: schedule tuning +
-        # L-BFGS finisher + CD/pair-swap/triple-cycle polish. See
-        # submissions/straple/best_placements/README.md.
-        os.environ.setdefault("STRAPLE_BATCH_OVERFLOW_LAMBDA", "1")
-        os.environ.setdefault("STRAPLE_BATCH_OVERFLOW_TARGET", "0.13")
-        os.environ.setdefault("STRAPLE_BATCH_OVERFLOW_EXP", "0.7")
-        os.environ.setdefault("STRAPLE_BATCH_OVERFLOW_COEF_HI", "1.5")
-        os.environ.setdefault("STRAPLE_BATCH_BLOCKAGE_W", "50")
-        os.environ.setdefault("STRAPLE_BATCH_OVERLAP_W_MAX", "50000")
-        os.environ.setdefault("STRAPLE_BATCH_OVERLAP_W_GROWTH", "1.004")
-        os.environ.setdefault("STRAPLE_BATCH_LBFGS_FROM_STEP", "1000")
-        os.environ.setdefault("STRAPLE_BATCH_LBFGS_ALPHA", "1.0")
-        os.environ.setdefault("STRAPLE_BATCH_LBFGS_CLIP", "0.3")
-        os.environ.setdefault("STRAPLE_BATCH_CD_POLISH", "1")
-        os.environ.setdefault("STRAPLE_BATCH_CD_GPU_FILTER", "1")
-        os.environ.setdefault("STRAPLE_BATCH_CD_GPU_APPROX", "1")
-        os.environ.setdefault("STRAPLE_BATCH_CD_DIRS", "8")
-        os.environ.setdefault("STRAPLE_BATCH_CD_ROUNDS", "8")
-        os.environ.setdefault("STRAPLE_BATCH_PAIR_SWAP", "1")
-        os.environ.setdefault("STRAPLE_BATCH_PAIR_SWAP_NEIGHBORS", "12")
-        os.environ.setdefault("STRAPLE_BATCH_PAIR_SWAP_ROUNDS", "8")
-        os.environ.setdefault("STRAPLE_BATCH_TRIPLE_CYCLE", "1")
-        os.environ.setdefault("STRAPLE_BATCH_TRIPLE_CYCLE_NEIGHBORS", "6")
-        os.environ.setdefault("STRAPLE_BATCH_TRIPLE_CYCLE_ROUNDS", "4")
-        # Match gpu_run_one's K=384 default — adaptive probe sometimes picks
-        # K=128 which gives less basin diversity. Probe will still shrink
-        # K if VRAM tight (on small GPUs).
-        os.environ.setdefault("STRAPLE_BATCH_K", "384")
-        os.environ.setdefault("STRAPLE_BATCH_K_MAX", "384")
+        # Most env defaults applied at top of method (before K probe).
         # Plateau-detect + per-seed crossover OFF by default for submission —
         # plain gradient with multi-start diversity has been more reliable.
         # Re-enable with STRAPLE_BATCH_PLATEAU_OPS=1.
