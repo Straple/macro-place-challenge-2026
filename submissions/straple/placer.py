@@ -348,11 +348,14 @@ class StraplePlacer:
         canvas_h = float(benchmark.canvas_height)
 
         # ---- Adaptive K from free VRAM ----
-        # 55 min default — judging TL is 1 h per bench; we leave 5 min for
-        # probe (~10-30 s), legalize-all (3-30 s), GPU proxy select (1 s)
-        # and the evaluator's own compute_proxy_cost reporting (a few s).
+        # 1h judging limit per bench. Budget split (with margin for slow
+        # benches like ibm14-18 where eval+legalize can take 25+ min):
+        #   - gradient_batch:        30 min (1800 s)
+        #   - eval + legalize-all:   ≤25 min (variable, big benches slow)
+        #   - polish stack (CD/PS/TC): remaining of STRAPLE_BATCH_WALL_TL
+        # WALL_TL=3000 reserves 60 s safety for the grader's own report.
         time_budget = float(os.environ.get(
-            "STRAPLE_BATCH_TIME_BUDGET", "3300"))
+            "STRAPLE_BATCH_TIME_BUDGET", "1800"))
         legalize_topn = int(os.environ.get(
             "STRAPLE_BATCH_LEGALIZE_TOPN", "0"))   # 0 = all
 
@@ -948,8 +951,8 @@ class StraplePlacer:
         if _STRAPLE_DIR not in sys.path:
             sys.path.insert(0, _STRAPLE_DIR)
 
-        wall_tl = float(os.environ.get("STRAPLE_BATCH_WALL_TL", "3300"))
-        wall_reserve = float(os.environ.get("STRAPLE_BATCH_WALL_RESERVE", "60"))
+        wall_tl = float(os.environ.get("STRAPLE_BATCH_WALL_TL", "3000"))
+        wall_reserve = float(os.environ.get("STRAPLE_BATCH_WALL_RESERVE", "120"))
 
         def _remaining():
             return wall_tl - (_time.time() - t_place_start) - wall_reserve
