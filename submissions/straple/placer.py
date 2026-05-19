@@ -312,7 +312,8 @@ class StraplePlacer:
         multiplier = 5.5
         return (bytes_per_K * multiplier) / (1024 ** 2)
 
-    def _place_gradient_batch(self, benchmark, plc, bench_label):
+    def _place_gradient_batch(self, benchmark, plc, bench_label,
+                                t_place_start: float = None):
         """Submission entry: K parallel gradient seeds with GPU proxy fitness.
 
         K is sized from free VRAM and the per-seed memory footprint of
@@ -329,6 +330,8 @@ class StraplePlacer:
         """
         import time as _time
         import multiprocessing as _mp
+        if t_place_start is None:
+            t_place_start = _time.time()
         _STRAPLE_DIR = str(Path(__file__).resolve().parent)
         if _STRAPLE_DIR not in sys.path:
             sys.path.insert(0, _STRAPLE_DIR)
@@ -506,6 +509,11 @@ class StraplePlacer:
         os.environ.setdefault("STRAPLE_BATCH_TRIPLE_CYCLE", "1")
         os.environ.setdefault("STRAPLE_BATCH_TRIPLE_CYCLE_NEIGHBORS", "6")
         os.environ.setdefault("STRAPLE_BATCH_TRIPLE_CYCLE_ROUNDS", "4")
+        # Match gpu_run_one's K=384 default — adaptive probe sometimes picks
+        # K=128 which gives less basin diversity. Probe will still shrink
+        # K if VRAM tight (on small GPUs).
+        os.environ.setdefault("STRAPLE_BATCH_K", "384")
+        os.environ.setdefault("STRAPLE_BATCH_K_MAX", "384")
         # Plateau-detect + per-seed crossover OFF by default for submission —
         # plain gradient with multi-start diversity has been more reliable.
         # Re-enable with STRAPLE_BATCH_PLATEAU_OPS=1.
@@ -555,6 +563,12 @@ class StraplePlacer:
             eplace_grid_size=eplace_grid,
             cong_weight=cong_weight,
             per_k_diversity=per_k_div,
+            overlap_w_max=float(os.environ.get(
+                "STRAPLE_BATCH_OVERLAP_W_MAX", "500000")),
+            overlap_w_growth=float(os.environ.get(
+                "STRAPLE_BATCH_OVERLAP_W_GROWTH", "1.008")),
+            cluster_target=int(os.environ.get(
+                "STRAPLE_BATCH_CLUSTER_TARGET", "0")),
         )
 
         # ---- Probe step: measure real per-seed peak, then size K to
@@ -1253,7 +1267,8 @@ class StraplePlacer:
         gb_preset = (preset == "gradient_batch"
                       or os.environ.get("STRAPLE_BATCH_PRESET", "0") == "1")
         if gb_preset and plc is not None:
-            full = self._place_gradient_batch(benchmark, plc, bench_label)
+            full = self._place_gradient_batch(
+                benchmark, plc, bench_label, t_place_start=t_place_start)
             self._log(f"[{bench_label}] === gradient_batch preset done "
                       f"total={time.time()-t_place_start:.2f}s ===")
             return full
